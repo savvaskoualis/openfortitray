@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -43,7 +44,6 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("saml listener: %w", err)
 	}
-	defer ln.Close()
 	a.mu.Lock()
 	a.addr = ln.Addr().String()
 	a.mu.Unlock()
@@ -64,34 +64,44 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 		cookie, err := a.exchange(ctx, client, id)
 		if err != nil {
 			http.Error(w, "login failed, check hyp-vpn logs", http.StatusBadGateway)
-			done <- result{err: err}
+			select {
+			case done <- result{err: err}:
+			default:
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, "<html><body><h2>Hyperio VPN connected — you can close this tab.</h2></body></html>")
-		done <- result{cookie: cookie}
+		select {
+		case done <- result{cookie: cookie}:
+		default:
+		}
 	})
 	srv := &http.Server{Handler: mux}
 	go srv.Serve(ln)
-	defer srv.Close()
 
 	loginURL := a.GatewayURL + "/remote/saml/start?redirect=1"
 	if err := openBrowser(loginURL); err != nil {
+		srv.Close()
 		return "", fmt.Errorf("open browser: %w", err)
 	}
 
+	var res result
 	select {
-	case r := <-done:
-		return r.cookie, r.err
+	case res = <-done:
 	case <-ctx.Done():
+		srv.Shutdown(context.Background())
 		return "", fmt.Errorf("saml login not completed: %w", ctx.Err())
 	}
+
+	srv.Shutdown(context.Background())
+	return res.cookie, res.err
 }
 
 // exchange trades the browser-delivered auth id for SVPNCOOKIE.
 func (a *Authenticator) exchange(ctx context.Context, client *http.Client, id string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		a.GatewayURL+"/remote/saml/auth_id?id="+id, nil)
+		a.GatewayURL+"/remote/saml/auth_id?id="+url.QueryEscape(id), nil)
 	if err != nil {
 		return "", err
 	}
