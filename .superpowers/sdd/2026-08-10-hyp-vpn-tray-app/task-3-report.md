@@ -122,3 +122,100 @@ process spawned is a deliberately nonexistent binary path (start-failure test).
 - **A `runFn` that ignores its context would leak the loop goroutine.** `RunOpenconnect` honours it
   (`CommandContext` + `WaitDelay`); any future backend must too.
 - Go directive in `go.mod` is `go 1.26.5`; the package is stdlib-only.
+
+---
+
+## Follow-up: review fixes (commit `18da708`, `fix: supervisor loop overlap, re-auth spin, sticky error event`)
+
+All findings relayed by the coordinator were addressed in `internal/tunnel/tunnel.go` (+ tests).
+
+### 1. Overlapping loops on `Disconnect()` → `Connect()` (IMPORTANT)
+
+- `Supervisor` now carries a per-loop `done chan struct{}`. `Connect()` captures the outgoing loop's
+  channel as `prev`, installs a fresh `done`, and passes both to `loop`.
+- `loop` **waits for `prev` (or ctx cancellation) before authenticating**, so the previous
+  openconnect process is fully gone — including its `WaitDelay` grace period — before a new one is
+  spawned. `defer close(done)` is registered first, so it runs last (after `finish` and after the
+  terminal event emit).
+- `emit` is now **generation-aware**: it takes the loop's `gen`, checks `s.gen == gen` while holding
+  the mutex, and drops the event otherwise. A winding-down loop can no longer publish `Connected` or
+  `Disconnected` for a tunnel it no longer owns. The non-blocking send happens under the mutex, so
+  the generation check and the send are atomic (the send can never block, so this cannot deadlock).
+- No deadlock risk in the wait: `Connect()` returns early while a loop is running, so `prev` is
+  always a loop that has already been cancelled.
+
+### 2. Re-auth spin on the connected-then-rejected path (IMPORTANT)
+
+- Replaced the `fresh` flag with `proven`: a cookie is proven only after it has held a connection for
+  at least `minHealthy` (new field, default **30s**, test hook). The first `connected(ip)` timestamp
+  is recorded in an `atomic.Int64`.
+- Immediate (zero-delay) re-auth on `ErrAuthRejected` now requires `proven && immediateReauths < 1`
+  (`maxImmediateReauths = 1`). Otherwise the loop emits `Reconnecting` and waits out the backoff
+  before minting a new cookie. `immediateReauths` resets only after a backoff delay has actually been
+  paid — deliberately *not* on every healthy session, so the cap is a hard "one fast re-auth per
+  backoff", exactly as requested.
+- Net effect: a session killed server-side after hours of uptime still re-authenticates instantly
+  (good UX, one browser window); a gateway that connects-then-rejects in a tight loop costs one SAML
+  window and then backs off 15s → 30s → … → 120s.
+
+### 3. Auth-error path no longer overwritten (IMPORTANT)
+
+- `loop` sets `authFailed` before emitting `Error`, and the deferred terminal emit skips
+  `Disconnected` in that case. `Error` is now the last event of a failed run, so a latest-state UI
+  keeps the message. All other exits still emit `Disconnected`.
+
+### Minors
+
+- **(7)** `RunOpenconnect` now scans the captured tail for the rejection markers **unconditionally**,
+  before looking at the exit status, so an exit-0 rejection maps to `ErrAuthRejected`. Cancellation
+  short-circuits first (`ctx.Err() != nil` → return the wait error as-is).
+- **(6)** `sc.Err()` is captured after the scan loop and reported (wrapped, with the tail) when the
+  process itself exited cleanly — so a `bufio` error surfaces but never masks a real exit reason.
+
+### Test changes (11)
+
+New/updated in `internal/tunnel/tunnel_test.go` — 14 tests total (was 11):
+
+- `TestEventOrderOnConnect` (new): asserts the exact prefix `Authenticating → Connecting → Connected`,
+  and that `Disconnected` is the final event after `Disconnect()`.
+- `TestDisconnectThenConnectRestarts` (rewritten): holds loop 1 inside `runFn` across
+  `Disconnect()`+`Connect()`, then asserts (a) at most **1** backend ran concurrently, via a
+  high-water-mark counter inside `runFn`, and (b) **no `Disconnected` event appears after
+  `Connected`** — closing finding 1's blind spot.
+- `TestAuthRejectedAfterHealthySessionReauthsImmediately` (renamed from
+  `…AfterConnectedReauthsImmediately`): now genuinely healthy (`minHealthy = 20ms`, session sleeps
+  40ms) before rejection, and asserts the immediate re-auth reconnects.
+- `TestShortLivedConnectionRejectedBacksOff` (new): connects then is rejected below `minHealthy` →
+  exactly 1 auth call, no fast re-auth.
+- `TestImmediateReauthIsCapped` (new): every session is healthy and rejected → exactly 2 auth calls
+  (one immediate re-auth, then the backoff stalls further SAML).
+- `TestAuthFailureStopsWithError` (updated): asserts `Error` is the **last** event (no trailing
+  `Disconnected`).
+
+### Verification
+
+```
+$ gofmt -l .
+(no output)
+
+$ go vet ./...
+Go vet: No issues found
+
+$ go test -race ./internal/tunnel/
+Go test: 14 passed in 1 packages
+
+$ go test -race -count=5 ./internal/tunnel/
+Go test: 70 passed in 1 packages
+
+$ go test -race ./...
+Go test: 21 passed in 3 packages
+```
+
+### Remaining notes
+
+- The "no trailing `Disconnected` after `Error`" change means the UI's state machine must treat
+  `Error` as a resting state (Connect re-enabled) — the supervisor loop has stopped at that point.
+- `minHealthy` (30s) is the only new tunable; it also gates how quickly a genuinely stale cookie is
+  refreshed. A tunnel that never stays up 30s is treated as unhealthy and always backs off.
+- After one immediate re-auth, the next stale-cookie rejection waits out the current backoff
+  (15s at worst-case first step). Intentional trade-off for spin safety.
