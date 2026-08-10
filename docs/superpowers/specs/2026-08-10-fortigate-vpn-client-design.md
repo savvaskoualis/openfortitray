@@ -1,19 +1,19 @@
-# FortiGate VPN Client — Cross-Platform Terminal Solution
+# Hyperio VPN — Cross-Platform FortiGate Tray App
 
 **Date:** 2026-08-10
-**Status:** Approved
-**Scope:** macOS + Linux. Windows explicitly out of scope (no Windows machines in team).
+**Status:** Approved (v2 — supersedes terminal-only v1 design)
+**Scope:** macOS, Linux, Windows. Native tray app, single Go binary.
 
 ## Problem
 
-Team (<15 people, all currently on MacBooks, Linux expected) uses the free FortiClient
-to connect to the company FortiGate SSL-VPN. The free tier has no auto-connect and no
-scripting hooks. We need a client that:
+Team (<15 people) uses the free FortiClient to connect to the company FortiGate
+SSL-VPN. The free tier has no auto-connect and no scripting hooks. We need a client
+that:
 
+- Shows a tray icon with status and connect/disconnect on macOS, Windows, and Linux
 - Auto-starts at login and keeps the tunnel up (reconnect on drop)
-- Works on macOS and Linux
 - Handles the FortiGate's SAML/SSO authentication
-- Terminal-only is acceptable (tray icon deferred to a possible phase 2)
+- Is light and dead simple to maintain
 
 ## VPN Facts (extracted from FortiClient config on a team MacBook)
 
@@ -27,115 +27,135 @@ scripting hooks. We need a client that:
 
 Config source on macOS: `/Library/Application Support/Fortinet/FortiClient/conf/vpn.plist`.
 
-## Approach
+## Tech Choice
 
-Glue two maintained open-source tools together; no custom daemon code.
+**Go + `fyne.io/systray`.** Single static binary (~8–12 MB) per OS, no runtime
+dependencies, cross-compiles from macOS, mature tray support on all three platforms.
 
-- **openfortivpn** — Fortinet SSL-VPN client (PPP-based). Installed via Homebrew on
-  macOS, distro package on Linux. Requires root to create the tunnel.
-- **openfortivpn-webview** — opens a browser window for the SAML login, captures
-  `SVPNCOOKIE`, prints it to stdout. Its browser profile persists IdP session cookies,
-  so after the first interactive login, subsequent connects complete silently until the
-  IdP session expires.
+Rejected: Electron/Tauri (heavy; embedded webview is useless because SAML runs in the
+system browser), Python (runtime + packaging pain), Rust (steeper maintenance for the
+team).
 
-Connect pipeline:
+**Tunnel backend: OpenConnect** (`openconnect --protocol=fortinet`) on all three
+platforms — one backend, one flag set. Installed by per-OS install scripts (brew /
+apt / dnf; bundled build + wintun on Windows). The Go app never implements PPP/TLS
+tunneling itself; it supervises openconnect.
 
-```
-openfortivpn-webview securityhub.hyperio.cloud:10443 \
-  | sudo openfortivpn -c <config> --cookie-on-stdin
-```
+## Architecture
 
-Unattended auto-connect is only impossible when the IdP session has expired — then a
-login window pops up once. Accepted limitation of SAML.
-
-## Repository Layout
+One Go binary `hyp-vpn`, four packages:
 
 ```
 hyp-vpn/
-  install.sh                      # one-shot installer (macOS + Linux)
-  bin/vpn                         # user command: up | down | status | logs
-  config/openfortivpn.conf        # host, port, trusted-cert (template)
-  macos/com.hyperio.vpn.plist     # launchd LaunchAgent template
-  linux/hyp-vpn.service           # systemd user unit template
-  docs/superpowers/specs/         # this spec
-  README.md                       # install + usage + FortiClient caveat
+├── cmd/hyp-vpn/main.go        wiring: config → tray → supervisor
+├── internal/auth/             SAML external-browser flow → SVPNCOOKIE
+├── internal/tunnel/           openconnect supervisor (spawn, health, backoff restart)
+├── internal/autostart/        login-item install/remove per OS
+├── internal/tray/             systray menu + status icon
+└── internal/config/           static config (gateway, port) + user prefs file
 ```
 
-## Components
+### `internal/auth` — SAML flow
 
-### `install.sh`
+1. Start HTTP listener on `127.0.0.1:8020` (FortiClient's conventional redirect port).
+2. Open system browser at
+   `https://securityhub.hyperio.cloud:10443/remote/saml/start?redirect=1`.
+3. User authenticates at IdP (silent if session alive); FortiGate redirects browser to
+   `http://127.0.0.1:8020/?id=<auth-id>`.
+4. App exchanges the id at `https://<gateway>/remote/saml/auth_id?id=<auth-id>` and
+   reads `SVPNCOOKIE` from the response.
+5. Returns cookie to caller; listener shuts down. Timeout 5 min → error state in tray.
 
-1. Detect OS (Darwin / Linux + package manager: apt, dnf, pacman).
-2. Install `openfortivpn` (brew / distro package) and `openfortivpn-webview`
-   (download release binary; brew cask not available for it).
-3. Write `/etc/openfortivpn/hyp-vpn.conf` from template (host, port, username).
-4. Probe the gateway TLS certificate; if not publicly trusted, pin its SHA-256 digest
-   into the config as `trusted-cert`.
-5. Add a sudoers drop-in (`/etc/sudoers.d/hyp-vpn`, validated with `visudo -c`):
-   current user, NOPASSWD, exact path of the `openfortivpn` binary only.
-6. Install and load the autostart unit:
-   - macOS: `~/Library/LaunchAgents/com.hyperio.vpn.plist`, `launchctl bootstrap`
-   - Linux: `~/.config/systemd/user/hyp-vpn.service`, `systemctl --user enable --now`
-7. Symlink `bin/vpn` into `/usr/local/bin/vpn` (or `~/.local/bin` on Linux).
+Because the login happens in the user's real browser, the IdP session persists there;
+reconnects are silent until the IdP session expires.
 
-Idempotent: safe to re-run; re-running updates config and units in place.
+### `internal/tunnel` — supervisor
 
-### `bin/vpn`
+- Spawns `openconnect --protocol=fortinet <gateway>:<port> --cookie-on-stdin`,
+  writes the cookie to stdin.
+- Privilege: on macOS/Linux runs `sudo -n openconnect …` (installer added a NOPASSWD
+  sudoers rule scoped to the openconnect binary). On Windows the app itself runs
+  elevated (see autostart), so openconnect inherits.
+- Health: process exit = tunnel down. Auto-reconnect with exponential backoff
+  (15 s → 2 min cap). Cookie rejected (openconnect auth failure exit) → re-run SAML
+  flow; if that needs interaction the browser window appears.
+- States: `Disconnected → Authenticating → Connecting → Connected → Reconnecting`.
+  Exposed as a channel the tray consumes.
+- "Disconnect" from tray = SIGTERM (Windows: process kill) + supervisor stop; no
+  auto-reconnect until user reconnects or next login.
 
-Single POSIX-ish shell script (bash), subcommands:
+### `internal/tray`
 
-- `vpn up` — runs the webview → openfortivpn pipeline in the foreground of the
-  supervising unit; detects already-connected state and exits 0.
-- `vpn down` — stops the unit (`launchctl bootout` / `systemctl --user stop`) which
-  terminates openfortivpn cleanly (SIGTERM → PPP teardown).
-- `vpn status` — reports: unit running?, tunnel interface up (utun*/ppp0 with
-  10.212.134.x address)?, gateway reachable?
-- `vpn logs` — tails `~/Library/Logs/hyp-vpn.log` (macOS) / `journalctl --user -u
-  hyp-vpn` (Linux).
+Menu: status line (`Connected — 10.212.134.x` / `Disconnected` / `Connecting…`),
+Connect, Disconnect, ✓ Auto-connect at login, View logs (opens log file), Quit.
+Icon variants: gray (down), animated/half (connecting), green dot (up), red (error).
 
-### Autostart units
+### `internal/autostart`
 
-- **macOS LaunchAgent:** `RunAtLoad=true`, `KeepAlive.SuccessfulExit=false` with
-  `ThrottleInterval=15` — relaunches the pipeline when openfortivpn exits (network drop,
-  cookie expiry). Runs in the user GUI session so the webview can display.
-- **Linux systemd user unit:** `Restart=on-failure`, `RestartSec=15`. Requires a
-  graphical user session for the webview; documented in README.
+Toggle from tray, default ON at install:
+- macOS: `~/Library/LaunchAgents/com.hyperio.vpn.plist` (`RunAtLoad`, no KeepAlive —
+  the app supervises itself)
+- Linux: `~/.config/autostart/hyp-vpn.desktop` (XDG autostart)
+- Windows: Scheduled Task at logon, "Run with highest privileges" (this is also the
+  elevation mechanism)
 
-Restart loop doubles as reconnect logic: openfortivpn exits on tunnel loss → unit
-restarts it → webview re-auths silently (or shows login if IdP session expired).
+### `internal/config`
+
+Gateway/port compiled in as defaults, overridable by
+`~/.config/hyp-vpn/config.json` (`gateway`, `port`, `saml_port`, `openconnect_path`).
+User prefs (autostart on/off) stored in the same file. Logs to
+`~/.config/hyp-vpn/hyp-vpn.log` (platform-appropriate dir via `os.UserConfigDir`).
+
+## Install & Packaging
+
+- Repo ships `install.sh` (macOS/Linux) and `install.ps1` (Windows):
+  1. Install openconnect (brew / apt / dnf; Windows: download bundled openconnect
+     release + wintun into `%ProgramFiles%\hyp-vpn`).
+  2. Copy the `hyp-vpn` release binary into place.
+  3. macOS/Linux: write `/etc/sudoers.d/hyp-vpn` (NOPASSWD, exact openconnect path,
+     validated with `visudo -c`).
+  4. Register autostart; launch the app.
+- GitHub-style release artifacts built by `make release`: darwin-arm64, darwin-amd64,
+  linux-amd64, windows-amd64.
+- Binaries unsigned for now; README documents macOS Gatekeeper right-click → Open.
 
 ## Error Handling
 
-- Cookie rejected / SAML failure: webview exits non-zero, unit restarts after throttle
-  interval; login window appears for the user. No infinite silent loop — each retry is
-  visible in the log, and the throttle prevents hammering the gateway.
-- Gateway unreachable (no network): openfortivpn exits, unit retries every 15 s until
-  network returns.
-- Cert mismatch: openfortivpn refuses to connect (fail closed); `vpn status` surfaces
-  the last error line from the log.
+- SAML timeout/failure: tray icon red, status shows last error, Connect retries.
+- Gateway unreachable: supervisor retries with backoff; tray shows `Reconnecting…`.
+- openconnect binary missing: tray error state with "openconnect not found — re-run
+  installer" message.
+- Cert validation: openconnect fails closed on untrusted cert; error surfaces in tray
+  status and log.
 
 ## Constraints & Caveats
 
-- **FortiClient conflict:** FortiClient must not hold a connection at the same time.
-  README instructs to quit FortiClient and disable its login item (uninstall optional).
-- **Root:** tunnel creation needs root; scoped sudoers rule keeps it non-interactive
-  without granting broad sudo.
-- **SAML:** first-ever connect and IdP-session-expiry connects require one interactive
-  browser login. No workaround exists by design.
+- **FortiClient conflict:** must not hold a connection simultaneously. README: quit
+  FortiClient, disable its login item.
+- **SAML:** first-ever connect and IdP-session-expiry connects need one interactive
+  browser login. By design; no workaround.
+- **Windows elevation:** app runs elevated via scheduled task; acceptable for a small
+  trusted team, revisit (proper service split) if org-wide rollout happens.
 
-## Testing (manual acceptance)
+## Testing
 
-1. Fresh install via `install.sh` on a clean macOS machine → `vpn status` shows
-   connected; internal resource reachable; tunnel IP in `10.212.134.0/24`.
-2. Toggle Wi-Fi off/on → tunnel re-establishes within ~30 s without user action.
-3. Reboot → tunnel comes up at login without user action (IdP session valid).
-4. Expire/clear IdP session → connect shows exactly one login window, then succeeds.
-5. `vpn down` → tunnel gone, does not auto-restart until `vpn up` or next login.
-6. Repeat 1–3 on Linux (Ubuntu recommended baseline).
+Automated (Go unit tests, `go test ./...`):
+- `auth`: SAML flow against a stub HTTP server (redirect + cookie exchange, timeout).
+- `tunnel`: supervisor state transitions with a fake backend process (exit → backoff
+  restart; auth-failure exit → re-auth; disconnect → no restart).
+- `config`: load/save/defaults round-trip.
+
+Manual acceptance per platform:
+1. Install script → tray icon appears, first Connect shows browser login, tunnel up,
+   internal resource reachable, IP in `10.212.134.0/24`.
+2. Toggle Wi-Fi → `Reconnecting…` → `Connected` without user action.
+3. Reboot → auto-connects at login (IdP session valid), no interaction.
+4. Disconnect from tray → stays down until manual Connect.
+5. Expired IdP session → exactly one browser login window, then connected.
 
 ## Out of Scope (YAGNI)
 
-- Windows support
-- Tray icon / GUI (phase 2 if requested — same plumbing underneath)
-- MDM packaging, code signing
+- MDM packaging, code signing/notarization
+- Split tunneling / route customization (FortiGate pushes routes)
+- Multiple VPN profiles
 - Storing FortiGate credentials (SAML makes them unnecessary)
