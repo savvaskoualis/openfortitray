@@ -33,37 +33,47 @@ func (a *app) AutostartEnabled() bool      { return autostart.IsEnabled() }
 func (a *app) LogPath() string             { return a.logPath }
 func (a *app) Events() <-chan tunnel.Event { return a.events }
 
+// SetAutostart toggles the login item and the saved preference together. If the
+// preference cannot be saved the login item is rolled back to the state it had
+// before the click, so the OS never disagrees with what the menu shows; a failed
+// rollback is logged as a real divergence.
 func (a *app) SetAutostart(on bool) error {
-	var err error
-	if on {
-		exe, e := os.Executable()
-		if e != nil {
-			log.Printf("autostart: %v", e)
-			return e
-		}
-		err = autostart.Enable(exe)
-	} else {
-		err = autostart.Disable()
-	}
-	if err != nil {
+	was := autostart.IsEnabled()
+	if err := setLoginItem(on); err != nil {
 		log.Printf("autostart: %v", err)
 		return err
 	}
 	a.cfg.Autostart = on
 	if err := a.cfg.Save(a.cfgDir); err != nil {
 		log.Printf("config save: %v", err)
+		a.cfg.Autostart = was
+		if rb := setLoginItem(was); rb != nil {
+			log.Printf("autostart: rollback to enabled=%v failed, login item and config now disagree: %v", was, rb)
+		}
 		return err
 	}
 	return nil
+}
+
+// setLoginItem installs or removes the per-user login item for this executable.
+func setLoginItem(on bool) error {
+	if !on {
+		return autostart.Disable()
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return autostart.Enable(exe)
 }
 
 // authTimeout bounds a single SAML login attempt (the user has to click
 // through an external browser).
 const authTimeout = 5 * time.Minute
 
-// shutdownGrace lets openconnect handle SIGINT and restore routing before the
-// process exits.
-const shutdownGrace = 3 * time.Second
+// shutdownWait caps how long we wait for the backend to tear the tunnel down on
+// quit; it has to cover the runner's 10s WaitDelay backstop.
+const shutdownWait = 15 * time.Second
 
 func main() {
 	cfgDir, err := config.DefaultDir()
@@ -120,10 +130,15 @@ func main() {
 	}
 	tray.Run(a)
 
-	// tray.Run returned: the user quit. Give the backend a moment to tear the
-	// tunnel down before the process (and its log file) go away.
+	// tray.Run returned: the user quit. Block until the backend has torn the
+	// tunnel down (routing restored) before the process and its log file go away.
 	a.sup.Disconnect()
-	time.Sleep(shutdownGrace)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+	defer cancel()
+	a.sup.Wait(ctx)
+	if ctx.Err() != nil {
+		log.Printf("hyp-vpn: backend did not stop within %s", shutdownWait)
+	}
 	log.Printf("hyp-vpn: exiting")
 }
 

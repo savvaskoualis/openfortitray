@@ -468,3 +468,78 @@ func TestRunOpenconnectStartFailure(t *testing.T) {
 		t.Fatal("expected an error when the binary does not exist")
 	}
 }
+
+func TestWaitReturnsImmediatelyWhenNeverConnected(t *testing.T) {
+	events := make(chan Event, 4)
+	s := New(
+		func(ctx context.Context) (string, error) { return "C", nil },
+		func(ctx context.Context, cookie string, connected func(string)) error { return nil },
+		events)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	s.Wait(ctx)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Wait blocked %v with no loop ever started, want an immediate return", d)
+	}
+}
+
+func TestWaitBlocksUntilBackendTornDown(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	const teardown = 150 * time.Millisecond
+	var exited atomic.Bool
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.0.0.9")
+		<-ctx.Done()
+		time.Sleep(teardown) // openconnect winding down and restoring routing
+		exited.Store(true)
+		return ctx.Err()
+	}
+	s := New(auth, run, events)
+	s.Connect()
+	c.waitFor(t, Connected, 2*time.Second)
+
+	s.Disconnect()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	s.Wait(ctx)
+	if !exited.Load() {
+		t.Fatal("Wait returned before the backend finished tearing down")
+	}
+	if d := time.Since(start); d < teardown {
+		t.Errorf("Wait returned after %v, want at least the %v teardown", d, teardown)
+	}
+	s.Wait(ctx) // a finished loop must not block a second caller
+}
+
+func TestWaitHonoursContextDeadline(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.0.0.1")
+		<-ctx.Done() // stays up: only the deadline can release Wait
+		return ctx.Err()
+	}
+	s := New(auth, run, events)
+	s.Connect()
+	c.waitFor(t, Connected, 2*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	s.Wait(ctx)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Wait ignored its deadline: blocked %v on a live tunnel", d)
+	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+}

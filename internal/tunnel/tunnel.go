@@ -134,6 +134,23 @@ func (s *Supervisor) Disconnect() {
 	}
 }
 
+// Wait blocks until the supervision loop has fully torn down — including the
+// backend process, whose interrupt-and-exit is what restores routing — or until
+// ctx is done. It returns immediately when no loop has ever started or the last
+// one already finished. Call it after Disconnect to shut down cleanly.
+func (s *Supervisor) Wait(ctx context.Context) {
+	s.mu.Lock()
+	done := s.done
+	s.mu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
 // finish clears the running loop's cancel func when the loop exits on its own.
 // It is a no-op if a newer loop has since been started.
 func (s *Supervisor) finish(gen uint64) {
