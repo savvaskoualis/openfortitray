@@ -6,9 +6,13 @@ import "os/exec"
 const taskName = "HyperioVPN"
 
 // Enable registers an ONLOGON scheduled task running exePath.
+//
+// The /TR value is wrapped in literal double quotes: schtasks stores the action
+// string as given, and Task Scheduler splits it on whitespace at run time, so an
+// unquoted path under %ProgramFiles% would create fine but fail to launch.
 func Enable(exePath string) error {
 	return exec.Command("schtasks", "/Create", "/TN", taskName,
-		"/SC", "ONLOGON", "/RL", "HIGHEST", "/TR", exePath, "/F").Run()
+		"/SC", "ONLOGON", "/RL", "HIGHEST", "/TR", `"`+exePath+`"`, "/F").Run()
 }
 
 // Disable deletes the scheduled task.
