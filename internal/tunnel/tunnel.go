@@ -70,10 +70,12 @@ type Supervisor struct {
 
 	backoffBase time.Duration // exposed for tests
 	backoffMax  time.Duration
+	minHealthy  time.Duration // time connected before a cookie counts as proven
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
-	gen    uint64 // identifies the running loop, so a stale loop cannot cancel a newer one
+	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
+	done   chan struct{} // closed when the current loop has fully torn down
 }
 
 func New(authFn func(ctx context.Context) (string, error),
@@ -85,10 +87,18 @@ func New(authFn func(ctx context.Context) (string, error),
 		events:      events,
 		backoffBase: 15 * time.Second,
 		backoffMax:  2 * time.Minute,
+		minHealthy:  30 * time.Second,
 	}
 }
 
-func (s *Supervisor) emit(st State, detail string) {
+// emit delivers an event unless a newer loop generation has taken over, so a
+// loop that is still winding down cannot report state for the live tunnel.
+func (s *Supervisor) emit(gen uint64, st State, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gen != gen {
+		return
+	}
 	select {
 	case s.events <- Event{State: st, Detail: detail}:
 	default: // never block the loop on a slow UI
@@ -106,8 +116,11 @@ func (s *Supervisor) Connect() {
 	s.cancel = cancel
 	s.gen++
 	gen := s.gen
+	prev := s.done // previous loop, possibly still tearing down
+	done := make(chan struct{})
+	s.done = done
 	s.mu.Unlock()
-	go s.loop(ctx, gen)
+	go s.loop(ctx, gen, prev, done)
 }
 
 // Disconnect stops the loop and the backend. Idempotent.
@@ -137,36 +150,62 @@ func (s *Supervisor) finish(gen uint64) {
 	}
 }
 
-func (s *Supervisor) loop(ctx context.Context, gen uint64) {
-	defer s.emit(Disconnected, "")
+// maxImmediateReauths caps consecutive zero-delay re-authentications, so a
+// gateway that keeps rejecting cookies cannot spin the SAML flow.
+const maxImmediateReauths = 1
+
+func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struct{}) {
+	defer close(done) // runs last: the next loop waits for this
+	authFailed := false
+	defer func() {
+		// Error is the terminal event when login failed; don't overwrite it.
+		if !authFailed {
+			s.emit(gen, Disconnected, "")
+		}
+	}()
 	defer s.finish(gen)
 
+	// Never run two backends at once: wait for the previous loop (and its
+	// openconnect process) to be fully gone before touching the tunnel.
+	if prev != nil {
+		select {
+		case <-prev:
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	cookie := ""
-	fresh := false // cookie was minted by the most recent authFn call
+	proven := false // this cookie carried a healthy connection at some point
+	immediateReauths := 0
 	backoff := s.backoffBase
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		if cookie == "" {
-			s.emit(Authenticating, "")
+			s.emit(gen, Authenticating, "")
 			c, err := s.authFn(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
-					s.emit(Error, "login failed: "+err.Error())
+					authFailed = true
+					s.emit(gen, Error, "login failed: "+err.Error())
 				}
 				return
 			}
-			cookie, fresh = c, true
+			cookie, proven = c, false
 		}
 
-		s.emit(Connecting, "")
-		// up may be set from another goroutine if runFn reports asynchronously.
+		s.emit(gen, Connecting, "")
+		// These may be written from another goroutine if runFn reports
+		// asynchronously, hence the atomics.
 		var up atomic.Bool
+		var connectedAt atomic.Int64 // unix nanos of the first "up" report
 		err := s.runFn(ctx, cookie, func(ip string) {
 			up.Store(true)
+			connectedAt.CompareAndSwap(0, time.Now().UnixNano())
 			if ctx.Err() == nil { // don't report "up" for a tunnel we just cancelled
-				s.emit(Connected, ip)
+				s.emit(gen, Connected, ip)
 			}
 		})
 		if ctx.Err() != nil {
@@ -174,29 +213,35 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64) {
 		}
 		wasConnected := up.Load()
 		if wasConnected {
-			fresh = false // the cookie proved good; a later rejection means it went stale
 			backoff = s.backoffBase
+			if time.Since(time.Unix(0, connectedAt.Load())) >= s.minHealthy {
+				proven = true // the cookie worked for a real session
+			}
 		}
 
 		if errors.Is(err, ErrAuthRejected) {
 			cookie = ""
-			if !fresh {
-				continue // stale cookie: re-authenticate immediately
+			if proven && immediateReauths < maxImmediateReauths {
+				// A cookie that once carried a healthy session has gone stale
+				// (e.g. server-side session kill): re-authenticate at once.
+				immediateReauths++
+				continue
 			}
-			// A brand-new cookie was refused; back off instead of spinning on
-			// the SAML flow.
+			// Otherwise back off before minting another cookie, so a gateway
+			// that refuses fresh cookies cannot spin the SAML browser flow.
 		}
 
 		detail := ""
 		if err != nil {
 			detail = err.Error()
 		}
-		s.emit(Reconnecting, detail)
+		s.emit(gen, Reconnecting, detail)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return
 		}
+		immediateReauths = 0 // a delay was paid; allow one fast re-auth again
 		backoff *= 2
 		if backoff > s.backoffMax {
 			backoff = s.backoffMax
@@ -277,20 +322,29 @@ func RunOpenconnect(binPath, gatewayHostPort string, useSudo bool) func(ctx cont
 				connected(m[1])
 			}
 		}
+		scanErr := sc.Err()
 		// Unblock the process's stdout/stderr writes if we stopped reading
 		// early (e.g. an over-long line), so Wait cannot hang.
 		pr.Close()
 
 		err = <-waitErr
-		if err != nil && ctx.Err() == nil {
-			tail := strings.Join(lastLines, "\n")
-			for _, marker := range authRejectedMarkers {
-				if strings.Contains(tail, marker) {
-					return ErrAuthRejected
-				}
+		if ctx.Err() != nil {
+			return err // we asked it to stop; the exit reason is irrelevant
+		}
+		tail := strings.Join(lastLines, "\n")
+		// Check for rejection regardless of exit status: openconnect can report
+		// a refused cookie and still exit 0.
+		for _, marker := range authRejectedMarkers {
+			if strings.Contains(tail, marker) {
+				return ErrAuthRejected
 			}
+		}
+		if err != nil {
 			return fmt.Errorf("openconnect exited: %w\n%s", err, tail)
 		}
-		return err
+		if scanErr != nil {
+			return fmt.Errorf("reading openconnect output: %w\n%s", scanErr, tail)
+		}
+		return nil
 	}
 }

@@ -190,9 +190,9 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
 
-// A stale cookie rejected mid-session must be replaced without waiting out the
-// reconnect backoff.
-func TestAuthRejectedAfterConnectedReauthsImmediately(t *testing.T) {
+// A cookie that carried a healthy session and is then rejected (server-side
+// session kill) must be replaced without waiting out the reconnect backoff.
+func TestAuthRejectedAfterHealthySessionReauthsImmediately(t *testing.T) {
 	events := make(chan Event, 64)
 	c := collect(events)
 	defer c.close()
@@ -203,6 +203,7 @@ func TestAuthRejectedAfterConnectedReauthsImmediately(t *testing.T) {
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
 		connected("10.212.134.5")
 		if runs.Add(1) == 1 {
+			time.Sleep(40 * time.Millisecond) // healthy session, then rejected
 			return ErrAuthRejected
 		}
 		<-ctx.Done()
@@ -210,6 +211,7 @@ func TestAuthRejectedAfterConnectedReauthsImmediately(t *testing.T) {
 	}
 	s := New(auth, run, events)
 	s.backoffBase = time.Hour // must not be waited out on this path
+	s.minHealthy = 20 * time.Millisecond
 	s.Connect()
 	deadline := time.Now().Add(2 * time.Second)
 	for authCalls.Load() < 2 {
@@ -217,6 +219,60 @@ func TestAuthRejectedAfterConnectedReauthsImmediately(t *testing.T) {
 			t.Fatalf("no immediate re-auth after mid-session rejection, auth calls = %d", authCalls.Load())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	c.waitFor(t, Connected, 2*time.Second)
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+}
+
+// Connecting briefly and then being rejected must not buy a zero-delay re-auth:
+// otherwise a flapping gateway opens one SAML browser window per iteration.
+func TestShortLivedConnectionRejectedBacksOff(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	var authCalls atomic.Int32
+	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.212.134.5")
+		return ErrAuthRejected // never healthy for minHealthy
+	}
+	s := New(auth, run, events)
+	s.backoffBase = time.Hour
+	s.minHealthy = time.Hour
+	s.Connect()
+	c.waitFor(t, Reconnecting, 2*time.Second)
+	time.Sleep(50 * time.Millisecond)
+	if n := authCalls.Load(); n != 1 {
+		t.Errorf("auth calls = %d, want 1 (short-lived connection must not earn a fast re-auth)", n)
+	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+}
+
+// Consecutive zero-delay re-auths are capped: after one fast re-auth the loop
+// must pay the backoff before minting another cookie.
+func TestImmediateReauthIsCapped(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	var authCalls atomic.Int32
+	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.212.134.5")
+		time.Sleep(30 * time.Millisecond) // always "healthy", always rejected
+		return ErrAuthRejected
+	}
+	s := New(auth, run, events)
+	s.backoffBase = time.Hour // second rejection must stall here
+	s.minHealthy = 10 * time.Millisecond
+	s.Connect()
+	c.waitFor(t, Reconnecting, 3*time.Second)
+	time.Sleep(100 * time.Millisecond)
+	if n := authCalls.Load(); n != 2 {
+		t.Errorf("auth calls = %d, want 2 (one immediate re-auth, then backoff)", n)
 	}
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
@@ -267,8 +323,13 @@ func TestAuthFailureStopsWithError(t *testing.T) {
 	if e.Detail == "" {
 		t.Error("Error event must carry a detail")
 	}
-	c.waitFor(t, Disconnected, 2*time.Second)
 	time.Sleep(100 * time.Millisecond)
+	// Error is terminal for this run: a trailing Disconnected would wipe the
+	// error text from a latest-state UI.
+	seen := c.snapshot()
+	if last := seen[len(seen)-1]; last.State != Error {
+		t.Errorf("last event = %v, want Error to be terminal; got %+v", last.State, seen)
+	}
 	if n := authCalls.Load(); n != 1 {
 		t.Errorf("auth calls = %d, want 1 (loop must stop after auth failure)", n)
 	}
@@ -284,7 +345,42 @@ func TestAuthFailureStopsWithError(t *testing.T) {
 	s.Disconnect()
 }
 
-// Disconnect immediately followed by Connect must leave the new loop running.
+// Events must arrive in lifecycle order, with no surprises before Connected.
+func TestEventOrderOnConnect(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.212.134.5")
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s := New(auth, run, events)
+	s.Connect()
+	c.waitFor(t, Connected, 2*time.Second)
+	want := []State{Authenticating, Connecting, Connected}
+	seen := c.snapshot()
+	if len(seen) < len(want) {
+		t.Fatalf("got %+v, want at least %v", seen, want)
+	}
+	for i, w := range want {
+		if seen[i].State != w {
+			t.Fatalf("event %d = %v, want %v (full sequence %+v)", i, seen[i].State, w, seen)
+		}
+	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+	time.Sleep(50 * time.Millisecond)
+	seen = c.snapshot()
+	if last := seen[len(seen)-1]; last.State != Disconnected {
+		t.Errorf("last event = %v, want Disconnected; got %+v", last.State, seen)
+	}
+}
+
+// Disconnect immediately followed by Connect must leave exactly one loop
+// running, with no stale events from the loop that is winding down.
 func TestDisconnectThenConnectRestarts(t *testing.T) {
 	events := make(chan Event, 64)
 	c := collect(events)
@@ -293,7 +389,16 @@ func TestDisconnectThenConnectRestarts(t *testing.T) {
 	release := make(chan struct{})
 	var authCalls atomic.Int32
 	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
+	var inRun, maxInRun atomic.Int32
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		n := inRun.Add(1)
+		for {
+			m := maxInRun.Load()
+			if n <= m || maxInRun.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		defer inRun.Add(-1)
 		<-release // hold the first loop inside runFn so its teardown lags
 		connected("10.212.134.5")
 		<-ctx.Done()
@@ -312,7 +417,27 @@ func TestDisconnectThenConnectRestarts(t *testing.T) {
 	s.Connect() // second loop starts while the first is still winding down
 	close(release)
 	c.waitFor(t, Connected, 3*time.Second)
+	time.Sleep(100 * time.Millisecond) // give any stale event time to land
+
+	if n := maxInRun.Load(); n > 1 {
+		t.Errorf("%d backends ran concurrently, want at most 1", n)
+	}
+	seen := c.snapshot()
+	connectedAt := -1
+	for i, e := range seen {
+		if e.State == Connected {
+			connectedAt = i
+			break
+		}
+	}
+	for _, e := range seen[connectedAt+1:] {
+		if e.State == Disconnected {
+			t.Errorf("stale Disconnected after Connected: %+v", seen)
+			break
+		}
+	}
 	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
 }
 
 // A blocked events channel must never stall the supervisor.
