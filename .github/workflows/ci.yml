@@ -1,11 +1,14 @@
 name: CI
 
 # Runs on every branch push and on pull requests. Two platforms, because the
-# tray layer is the platform-specific part: linux systray is pure Go (D-Bus),
-# macOS systray is cgo/Cocoa, so a green Linux build says nothing about the
-# darwin path. Windows is covered by the release cross-build only — there is no
-# windows runner here because `go test -race` on windows/amd64 needs a gcc
-# toolchain we do not otherwise depend on.
+# tray layer is the platform-specific part. Since the tray moved to fyne v2 it
+# renders through OpenGL/GLFW, so BOTH runners now build with cgo: linux needs
+# GL + X11 dev headers (installed below), macOS uses the system frameworks and
+# Xcode CLT already on the runner. Windows is a special case: fyne makes
+# cmd/openfortitray a cgo+GLFW build that cannot cross-compile from Linux, so the
+# full windows binary is built on a windows-latest runner in the packaging task
+# (see the release.yml TODO). Here we only type-check the windows-specific,
+# non-GUI code (autostart_windows.go), which stays cgo-free.
 on:
   push:
     branches: ['**']
@@ -43,6 +46,17 @@ jobs:
           # go.sum; no separate actions/cache step needed.
           cache: true
 
+      # fyne renders through OpenGL/GLFW, so building or even type-checking the
+      # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
+      # dev headers. `go vet`/`go test -race`/`go build` below all compile
+      # cmd/openfortitray, so these must be present first. This is fyne's
+      # documented Linux build-dependency set. macOS uses system frameworks.
+      - name: Install GL/X11 build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+
       - name: Check gofmt
         # `gofmt -l` first so a failure names the offending files in the log,
         # then the assertion that the list is empty.
@@ -59,15 +73,23 @@ jobs:
       # The windows-only files (internal/autostart/autostart_windows.go, the
       # scheduled-task path) are invisible to the two runners above: build
       # constraints exclude them, so a compile error there would first surface
-      # when release.yml cross-builds at tag time — after the tag exists. This
-      # type-checks them on every push. Build only, no test: `go test` would need
-      # a windows runner to execute anything.
-      - name: Cross-build for windows
+      # at tag time. This type-checks them on every push.
+      #
+      # Scope is ./internal/... , not ./... , because cmd/openfortitray now imports
+      # fyne/v2/app -> GLFW -> OpenGL, a cgo build the go toolchain cannot
+      # cross-compile from Linux (the gl package's files are build-excluded
+      # without cgo). CGO_ENABLED=0 is explicit: none of ./internal/... needs cgo
+      # for windows — the tray imports only fyne core + driver/desktop (pure Go),
+      # not the GL driver. The full windows cgo/GLFW build is covered by the
+      # windows-latest runner added in the packaging task (release.yml TODO).
+      # Build only, no test: `go test` would need a windows runner to execute.
+      - name: Type-check windows-only code
         if: runner.os == 'Linux'
         env:
           GOOS: windows
           GOARCH: amd64
-        run: go build ./...
+          CGO_ENABLED: '0'
+        run: go build ./internal/...
 
       # Shell syntax gate for the installer and the privileged helper. Linux
       # only: these are parse checks, not execution, so one platform suffices.

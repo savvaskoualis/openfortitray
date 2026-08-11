@@ -70,6 +70,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # TODO(fyne5/packaging Task 5): THIS JOB IS BROKEN by the fyne v2 tray migration
+  # and will fail at the next tag. fyne renders via OpenGL/GLFW, so
+  # cmd/openfortitray is now a cgo build on every OS. The CGO_ENABLED=0
+  # cross-builds below can no longer compile it: the linux build fails for want
+  # of a C toolchain/GL, and the windows build fails because the go-gl files are
+  # build-excluded without cgo (cgo windows cannot cross-compile from Linux at
+  # all without a MinGW toolchain). The packaging task rewrites this into two
+  # jobs — build-linux (ubuntu-latest: apt install gcc libgl1-mesa-dev xorg-dev,
+  # CGO_ENABLED=1) and build-windows (windows-latest: CGO_ENABLED=1,
+  # -ldflags="-H=windowsgui", runner's bundled gcc) — plus a macOS .app bundle.
+  # Left as-is here (release.yml is out of scope for the tray task) so the change
+  # is one focused diff; release.yml only fires on tags, so this does not break
+  # branch/PR CI in the meantime.
+  #
   # linux systray is pure Go (D-Bus StatusNotifierItem via godbus) and windows
   # needs no cgo either, so both cross-build from ubuntu with CGO_ENABLED=0.
   # cgo off also keeps the linux binary free of a glibc version floor.
