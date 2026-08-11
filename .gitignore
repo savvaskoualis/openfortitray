@@ -1,3 +1,6 @@
 dist/
 *.log
 /openfortitray
+
+# internal SDD process artifacts — never publish
+.superpowers/
