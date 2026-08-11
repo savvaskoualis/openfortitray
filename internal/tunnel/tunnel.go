@@ -89,8 +89,9 @@ func New(authFn func(ctx context.Context) (string, error),
 		backoffBase: 15 * time.Second,
 		backoffMax:  2 * time.Minute,
 		minHealthy:  30 * time.Second,
-		// Generous enough to cover the runner's own teardown budget (a helper
-		// stop attempt, one retry, then the WaitDelay backstop) and no more.
+		// Must exceed the runner's worst-case teardown (two helper stop attempts
+		// then the WaitDelay backstop = 28s), with margin, and no more: past that
+		// point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
 	}
 }
@@ -355,13 +356,13 @@ const (
 	// helperStopTimeout bounds one privileged teardown call. The helper waits up
 	// to 6s for openconnect to exit cleanly, so allow a little more.
 	helperStopTimeout = 8 * time.Second
-	// helperWaitDelay must exceed every stop attempt put together
-	// (helperStopAttempts * helperStopTimeout). Go starts this timer when the
-	// context is cancelled, not when Cancel returns, so a shorter delay would
-	// kill our sudo child while the retry was still in flight — the exact
-	// outcome the retry exists to avoid, since it leaves the root openconnect
-	// and its routes behind.
-	helperWaitDelay = 20 * time.Second
+	// helperWaitDelay is the backstop *after* teardown has been attempted, and it
+	// needs no headroom for the retry: os/exec's watchCtx calls Cancel to
+	// completion and only then creates the WaitDelay timer, so the two are
+	// consecutive rather than concurrent. Worst case for a cancelled run is
+	// therefore helperStopAttempts*helperStopTimeout + helperWaitDelay, which is
+	// what cmd/hyp-vpn's shutdownWait has to cover — keep them in step.
+	helperWaitDelay = 12 * time.Second
 	// signalWaitDelay backstops the direct path, where we can signal the
 	// process ourselves.
 	signalWaitDelay = 10 * time.Second
@@ -427,10 +428,13 @@ func (o Options) stopArgv() (string, []string, bool) {
 }
 
 // helperStopAttempts is how many times teardown is asked for before giving up.
-// Two, because the failure this retries is worth one more try: the first stop can
-// lose a race with a just-started openconnect that has not written its pidfile
-// yet, and the cost of not tearing the tunnel down is a machine left on the VPN
-// with no way to bring it down short of a reboot.
+//
+// Two, because the cost of not tearing the tunnel down is a machine left on the
+// VPN with a root openconnect the app cannot signal. Note what the retry does and
+// does not buy: the helper's "stop" is idempotent and exits 0 when there is no pid
+// to signal, so a second attempt cannot help with a missing or stale pidfile. It
+// covers the transient failures only — sudo itself failing, or the first attempt
+// exceeding helperStopTimeout while openconnect was still winding down.
 const helperStopAttempts = 2
 
 // runHelperStop asks the privileged helper to interrupt openconnect and waits
@@ -483,8 +487,10 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		if err != nil {
 			return err
 		}
-		// openconnect logs progress to stderr, so merge both streams into one
-		// pipe and scan that.
+		// openconnect splits its output: progress (including the "Configured as
+		// <ip>" line we parse) goes to stdout at default verbosity, while errors
+		// (including the cookie-rejection markers) go to stderr. Both matter, so
+		// merge them into one pipe and scan that.
 		pr, pw := io.Pipe()
 		cmd.Stdout = pw
 		cmd.Stderr = pw

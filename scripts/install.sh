@@ -31,7 +31,10 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_URL="${HYP_VPN_RELEASE_URL:-}"
 BIN_TARGET=/usr/local/bin/hyp-vpn
 HELPER_SRC="$REPO_DIR/scripts/hyp-vpn-tunnel"
-HELPER_DIR=/usr/local/libexec
+# Overridable so a machine whose /usr/local is user-owned (an Intel-mac Homebrew
+# prefix) can put the helper somewhere root-owned instead of loosening the check.
+# Changing it means matching "helper_path" in the app's config.json.
+HELPER_DIR="${HYP_VPN_HELPER_DIR:-/usr/local/libexec}"
 HELPER_TARGET="$HELPER_DIR/hyp-vpn-tunnel"
 SUDOERS_TARGET=/etc/sudoers.d/hyp-vpn
 OS="$(uname -s)"
@@ -44,7 +47,12 @@ die() {
 }
 
 case "$OS" in
-Darwin | Linux) ;;
+Darwin)
+	ROOT_GROUP=wheel
+	;;
+Linux)
+	ROOT_GROUP=root
+	;;
 *) die "unsupported OS: $OS" ;;
 esac
 
@@ -122,19 +130,35 @@ check_chain() {
 	[[ -n "$problems" ]] || return 0
 	if [[ "$enforcement" == abort ]]; then
 		printf 'install: error: %s\n' "$problems" >&2
-		die "anything reachable from a passwordless-root path must be root-owned and not writable by others"
+		printf 'install: error: %s\n' \
+			"anything reachable from a passwordless-root path must be root-owned and not writable by others." \
+			"Remedy: sudo chown root:$ROOT_GROUP $HELPER_DIR && sudo chmod 755 $HELPER_DIR" \
+			"(an Intel-mac Homebrew prefix leaves /usr/local user-owned), or point the helper" \
+			"somewhere already root-owned by setting HYP_VPN_HELPER_DIR=/usr/libexec and matching" \
+			"\"helper_path\" in ~/Library/Application Support/hyp-vpn/config.json." >&2
+		exit 1
 	fi
 	while IFS= read -r problem; do warn "$problem"; done <<<"$problems"
 	return 1
 }
 
-# The helper's own path must be safe on both platforms: unlike openconnect it is
-# not something a package manager owns, so there is no excuse for it to sit
-# anywhere writable.
+# preflight_paths enforces the helper's path and merely warns about the tray
+# binary's, because the two carry different consequences.
+#
+# The helper is what the sudoers rule names, so a writable path to it is a direct
+# passwordless-root hole: fatal, with a remedy in the message. The tray binary runs
+# as the user who already holds that rule, so replacing it escalates nothing they
+# could not already do by calling the helper themselves — a warning is the honest
+# severity, and hard-aborting there would block installs on Intel-mac Homebrew
+# layouts (user-owned /usr/local) for no security gain.
 preflight_paths() {
 	check_chain "$HELPER_TARGET" abort || true
-	check_chain "$BIN_TARGET" abort || true
-	log "verified $HELPER_TARGET and $BIN_TARGET sit on root-owned, non-world-writable paths"
+	if ! check_chain "$BIN_TARGET" warn; then
+		warn "$BIN_TARGET sits on a path others can write; they could replace the tray app."
+		warn "Not fatal (it runs unprivileged, as the user who already holds the sudoers rule),"
+		warn "but on a shared machine install it somewhere root-owned."
+	fi
+	log "checked the paths to $HELPER_TARGET and $BIN_TARGET"
 }
 
 # resolve_principal decides which user the sudoers rule names. Running the whole
