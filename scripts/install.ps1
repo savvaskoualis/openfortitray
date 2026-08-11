@@ -32,8 +32,10 @@ if (Test-Path $configFile) {
         $gateway = Read-Host "VPN gateway as host:port (e.g. vpn.example.com:10443)"
     }
     # Same shape as the POSIX helper's validate_gateway: a value this accepts is
-    # one openconnect will be handed unchanged.
-    if ($gateway -notmatch '^[A-Za-z0-9._-]+:[0-9]+$') {
+    # one openconnect will be handed unchanged. The first character must not be a
+    # dash — "-form-value:443" is a well-formed host:port to a naive pattern and an
+    # openconnect flag to openconnect.
+    if ($gateway -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*:[0-9]+$') {
         throw "gateway must be host:port, got '$gateway'"
     }
     $parts = $gateway.Split(":")
