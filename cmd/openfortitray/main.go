@@ -348,7 +348,15 @@ func main() {
 	// starts the tray during Run and then fires OnStarted (on the UI goroutine),
 	// which is the first moment the native status item exists. tray.SetTooltip is
 	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
-	a.fyneApp.Lifecycle().SetOnStarted(func() { tray.SetTooltip("OpenFortiTray") })
+	a.fyneApp.Lifecycle().SetOnStarted(func() {
+		tray.SetTooltip("OpenFortiTray")
+		// fyne/glfw promotes the process to a Regular (Dock-visible) app when it
+		// initializes NSApp during Run, overriding Info.plist LSUIElement=1. Undo
+		// that here: OnStarted fires on the UI/main goroutine after NSApp exists,
+		// so setting the Accessory activation policy now hides the Dock icon
+		// without racing fyne. No-op on non-darwin.
+		setAccessoryActivationPolicy()
+	})
 
 	// Build the settings window once, hidden. It is never ShowAndRun'd, so it
 	// cannot be the master window whose close quits the app; its close button is
