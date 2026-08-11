@@ -9,7 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
+
+	"fyne.io/fyne/v2"
+	fyneapp "fyne.io/fyne/v2/app"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -25,6 +29,14 @@ type app struct {
 	sup     *tunnel.Supervisor
 	events  chan tunnel.Event
 	logPath string
+
+	fyneApp fyne.App
+	tray    *tray.Controller
+	// quitting stops the event pump touching a tearing-down UI. It is set once,
+	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
+	// drains events without calling fyne.Do — so no fyne.Do is ever queued
+	// against a UI that a.fyneApp.Quit() is about to destroy.
+	quitting atomic.Bool
 }
 
 // Connect starts the tunnel, unless no gateway is configured. The gateway has no
@@ -62,6 +74,42 @@ func (a *app) Disconnect()                 { a.sup.Disconnect() }
 func (a *app) AutostartEnabled() bool      { return autostart.IsEnabled() }
 func (a *app) LogPath() string             { return a.logPath }
 func (a *app) Events() <-chan tunnel.Event { return a.events }
+
+// pump is the one goroutine that reads tunnel events and drives the UI. fyne
+// owns the main thread, so every mutation of a fyne object from here is
+// marshalled onto the UI goroutine with fyne.Do. Once quitting is set the pump
+// keeps draining the channel (so the supervisor's teardown events never block)
+// but stops touching the UI, which a.fyneApp.Quit() is about to destroy.
+func (a *app) pump() {
+	for e := range a.events {
+		if a.quitting.Load() {
+			continue
+		}
+		e := e
+		fyne.Do(func() { a.tray.Apply(e) })
+	}
+}
+
+// Quit is invoked from the tray's Quit item on the UI goroutine. It tears the
+// tunnel down before the process leaves, exactly as the old post-systray.Run
+// block did, but off the UI goroutine: sup.Wait can block for shutdownWait, and
+// blocking the UI goroutine would freeze the menu bar. Once the tunnel is down
+// it marshals a.fyneApp.Quit() back onto the UI goroutine (fyne's own signal
+// handler quits the same way), which unblocks a.fyneApp.Run() in main.
+func (a *app) Quit() {
+	a.quitting.Store(true)
+	go func() {
+		a.sup.Disconnect()
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+		defer cancel()
+		a.sup.Wait(ctx)
+		if ctx.Err() != nil {
+			log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
+		}
+		log.Printf("openfortitray: exiting")
+		fyne.Do(a.fyneApp.Quit)
+	}()
+}
 
 // SetAutostart toggles the login item and the saved preference together. If the
 // preference cannot be saved the login item is rolled back to the state it had
@@ -172,21 +220,40 @@ func main() {
 		logPath: logPath,
 	}
 
+	// fyne owns the main thread: NewWithID (not bare New) so tray/preferences
+	// plumbing has a stable app identity. The tray must be built before Run.
+	//
+	// Migrations["fyneDo"] declares that this app already marshals every
+	// cross-goroutine UI mutation through fyne.Do (the event pump does; menu
+	// Actions run on the UI goroutine). Without it fyne v2.8 logs a standing
+	// "not migrated to the fyne.Do threading model" advisory at Run(). The
+	// thread-safety checks themselves stay active.
+	fyneapp.SetMetadata(fyne.AppMetadata{
+		ID:         "io.github.savvaskoualis.openfortitray",
+		Name:       "OpenFortiTray",
+		Migrations: map[string]bool{"fyneDo": true},
+	})
+	a.fyneApp = fyneapp.NewWithID("io.github.savvaskoualis.openfortitray")
+	ctrl, err := tray.Setup(a.fyneApp, a)
+	if err != nil {
+		log.Fatal(err)
+	}
+	a.tray = ctrl
+
+	// The one event pump. Started before Run so events emitted by the
+	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and
+	// render as soon as Run starts.
+	go a.pump()
+
 	if cfg.Autostart {
 		a.Connect() // launch happens at login, so connect right away
 	}
-	tray.Run(a)
 
-	// tray.Run returned: the user quit. Block until the backend has torn the
-	// tunnel down (routing restored) before the process and its log file go away.
-	a.sup.Disconnect()
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
-	defer cancel()
-	a.sup.Wait(ctx)
-	if ctx.Err() != nil {
-		log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
-	}
-	log.Printf("openfortitray: exiting")
+	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's
+	// Quit item drives only after the tunnel has been torn down (see app.Quit).
+	// A tray-only fyne app (no window ever shown) stays alive here and exits
+	// cleanly on Quit — verified against fyne v2.8's glfw run loop.
+	a.fyneApp.Run()
 }
 
 // loggedRun wraps runFn so every backend exit lands in the log file.

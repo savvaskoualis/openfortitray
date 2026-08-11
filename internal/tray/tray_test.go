@@ -6,8 +6,140 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/test"
+
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
+
+// fakeApp records which App method each menu item invoked, so the wiring from a
+// click to the application can be checked without a live menu bar.
+type fakeApp struct {
+	connects      int
+	disconnects   int
+	quits         int
+	autostartSet  []bool
+	autostartOn   bool
+	setAutostartE error
+}
+
+func (f *fakeApp) Connect()               { f.connects++ }
+func (f *fakeApp) Disconnect()            { f.disconnects++ }
+func (f *fakeApp) Quit()                  { f.quits++ }
+func (f *fakeApp) AutostartEnabled() bool { return f.autostartOn }
+func (f *fakeApp) LogPath() string        { return "" }
+func (f *fakeApp) Events() <-chan tunnel.Event {
+	return make(chan tunnel.Event)
+}
+func (f *fakeApp) SetAutostart(on bool) error {
+	f.autostartSet = append(f.autostartSet, on)
+	if f.setAutostartE != nil {
+		return f.setAutostartE
+	}
+	f.autostartOn = on
+	return nil
+}
+
+func itemByLabel(m *fyne.Menu, label string) *fyne.MenuItem {
+	for _, it := range m.Items {
+		if it.Label == label {
+			return it
+		}
+	}
+	return nil
+}
+
+// A tray click must reach the matching App method. systray used per-item
+// channels; fyne uses per-item Action closures — this asserts each closure calls
+// the method the old channel case used to.
+func TestMenuActionsWireToApp(t *testing.T) {
+	test.NewTempApp(t) // establishes CurrentApp so (*Menu).Refresh() is a safe no-op
+
+	f := &fakeApp{}
+	c := newController(f)
+
+	for _, tc := range []struct {
+		label   string
+		invoke  func()
+		wantErr string
+	}{
+		{label: "Connect"},
+		{label: "Disconnect"},
+		{label: "Quit"},
+	} {
+		it := itemByLabel(c.menu, tc.label)
+		if it == nil {
+			t.Fatalf("menu has no %q item", tc.label)
+		}
+		if it.Action == nil {
+			t.Fatalf("%q item has no action", tc.label)
+		}
+		it.Action()
+	}
+	if f.connects != 1 {
+		t.Errorf("Connect item fired %d connects, want 1", f.connects)
+	}
+	if f.disconnects != 1 {
+		t.Errorf("Disconnect item fired %d disconnects, want 1", f.disconnects)
+	}
+	if f.quits != 1 {
+		t.Errorf("Quit item fired %d quits, want 1 (teardown must run, not fyne's default quit)", f.quits)
+	}
+
+	// The status item exists, is disabled, and carries no action (it is a label).
+	if s := itemByLabel(c.menu, "Disconnected"); s == nil || !s.Disabled || s.Action != nil {
+		t.Errorf("status item = %+v, want a disabled, action-less label", s)
+	}
+	// Disconnect starts disabled: nothing is connected at launch.
+	if d := itemByLabel(c.menu, "Disconnect"); d == nil || !d.Disabled {
+		t.Error("Disconnect should start disabled")
+	}
+	// View logs is present and wired (side-effecting, so not invoked here).
+	if l := itemByLabel(c.menu, "View logs"); l == nil || l.Action == nil {
+		t.Error("View logs item should exist with an action")
+	}
+}
+
+// The auto-connect checkbox toggles the login item and only then flips the
+// checkmark; a failed SetAutostart leaves the mark where it was.
+func TestAutostartToggle(t *testing.T) {
+	test.NewTempApp(t)
+
+	t.Run("success flips the checkmark", func(t *testing.T) {
+		f := &fakeApp{autostartOn: false}
+		c := newController(f)
+		auto := itemByLabel(c.menu, "Auto-connect at login")
+		if auto == nil {
+			t.Fatal("no auto-connect item")
+		}
+		if auto.Checked {
+			t.Fatal("auto-connect should start unchecked (AutostartEnabled=false)")
+		}
+		auto.Action()
+		if len(f.autostartSet) != 1 || f.autostartSet[0] != true {
+			t.Errorf("SetAutostart calls = %v, want [true]", f.autostartSet)
+		}
+		if !auto.Checked {
+			t.Error("checkmark should be set after a successful enable")
+		}
+	})
+
+	t.Run("failure leaves the checkmark unchanged", func(t *testing.T) {
+		f := &fakeApp{autostartOn: false, setAutostartE: errFake}
+		c := newController(f)
+		auto := itemByLabel(c.menu, "Auto-connect at login")
+		auto.Action()
+		if auto.Checked {
+			t.Error("checkmark must not change when SetAutostart fails")
+		}
+	})
+}
+
+var errFake = &fakeErr{}
+
+type fakeErr struct{}
+
+func (*fakeErr) Error() string { return "autostart failed" }
 
 // short() feeds a fixed-width menu item, and its input is process output: many
 // lines, arbitrary length, and — because openconnect reports gateway hostnames
