@@ -456,14 +456,15 @@ type Options struct {
 	UseSudo bool
 
 	// The following mirror the active profile's tunnel-shaping toggles. They are
-	// appended to the DIRECT openconnect argv only (see openconnectFlags /
-	// startArgv). The privileged helper path is deliberately NOT extended with
-	// them: the helper's "start" subcommand takes exactly one argument (the
-	// gateway) and its whole threat model is that a caller cannot smuggle
-	// openconnect options past the NOPASSWD sudoers rule, so threading flags
-	// there needs a coordinated, security-reviewed change to scripts/ (a separate
-	// task). TODO(helper-flags): pass these to the helper once its protocol and
-	// argument validation are extended.
+	// appended to the openconnect argv on BOTH paths (see openconnectFlags /
+	// startArgv). On the direct path they follow the fixed flags directly; on the
+	// privileged path they are passed to the helper's "start" subcommand after the
+	// gateway (`start <gateway> <flags...>`). This does NOT reopen the
+	// arbitrary-option hole: the helper validates every flag against an exact
+	// allowlist (only --no-dtls, --disable-ipv6 and --servercert <fingerprint>,
+	// none of which takes a script/command openconnect could run as root) and
+	// rejects anything else before it reaches openconnect. openconnectFlags only
+	// ever emits members of that allowlist, so the two sides stay in lockstep.
 
 	// DTLS mirrors profile.DTLS. openconnect uses DTLS/ESP by default, so only a
 	// false value emits a flag: --no-dtls.
@@ -490,8 +491,9 @@ const (
 )
 
 // openconnectFlags derives the extra openconnect command-line flags from the
-// profile toggles. See the field docs on Options for why these apply to the
-// direct path only.
+// profile toggles. The same set is used on both the direct and the privileged
+// path (see startArgv). Every flag it can emit is on the helper's allowlist, so
+// the privileged path validates rather than rejects them.
 //
 // Flag choices (verified against openconnect 9.x / GnuTLS):
 //   - DTLS false  → --no-dtls          (openconnect enables DTLS/ESP by default)
@@ -546,9 +548,16 @@ func (o Options) sudo() string {
 // the NOPASSWD sudoers rule can be scoped to one script with validated
 // arguments instead of to openconnect (whose --script/--csd-wrapper options
 // would amount to passwordless root).
+//
+// The tunnel-shaping flags follow the gateway on the privileged path
+// (`start <gateway> <flags...>`) and follow the fixed flags on the direct path.
+// They are the same set; the helper validates each against an exact allowlist,
+// so threading them through sudo does not widen what can run as root.
 func (o Options) startArgv() (string, []string) {
 	if o.UseSudo {
-		return o.sudo(), []string{"-n", o.helperPath(), "start", o.Gateway}
+		args := []string{"-n", o.helperPath(), "start", o.Gateway}
+		args = append(args, o.openconnectFlags()...)
+		return o.sudo(), args
 	}
 	args := []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter"}
 	args = append(args, o.openconnectFlags()...)

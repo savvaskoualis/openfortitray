@@ -929,23 +929,30 @@ func TestStartArgv(t *testing.T) {
 		wantName: "openconnect",
 		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--no-dtls", "--disable-ipv6", "--servercert", "FF", "gw:443"},
 	}, {
-		name:     "helper path is unchanged by the toggles (flags only apply to the direct argv)",
+		name:     "helper path gets the toggles after the gateway (allowlisted flags reach the helper)",
 		opts:     Options{HelperPath: "/opt/h", Gateway: "gw:443", UseSudo: true, DTLS: false, DualStack: false, ServerCertMode: "pin", ServerCertPin: "FF"},
 		wantName: "sudo",
-		wantArgs: []string{"-n", "/opt/h", "start", "gw:443"},
+		wantArgs: []string{"-n", "/opt/h", "start", "gw:443", "--no-dtls", "--disable-ipv6", "--servercert", "FF"},
 	}, {
-		name: "privileged run goes through the helper, never openconnect itself",
+		name:     "helper path, DTLS off only appends --no-dtls after the gateway",
+		opts:     Options{HelperPath: "/opt/h", Gateway: "gw:443", UseSudo: true, DTLS: false, DualStack: true},
+		wantName: "sudo",
+		wantArgs: []string{"-n", "/opt/h", "start", "gw:443", "--no-dtls"},
+	}, {
+		name: "privileged run goes through the helper, never openconnect itself; toggles on emit no flags",
 		opts: Options{
 			OpenconnectPath: "openconnect",
 			HelperPath:      "/opt/custom/openfortitray-tunnel",
 			Gateway:         "gw.example.com:10443",
 			UseSudo:         true,
+			DTLS:            true,
+			DualStack:       true,
 		},
 		wantName: "sudo",
 		wantArgs: []string{"-n", "/opt/custom/openfortitray-tunnel", "start", "gw.example.com:10443"},
 	}, {
-		name:     "empty helper path falls back to the installed location",
-		opts:     Options{Gateway: "gw.example.com:10443", UseSudo: true},
+		name:     "empty helper path falls back to the installed location; toggles on emit no flags",
+		opts:     Options{Gateway: "gw.example.com:10443", UseSudo: true, DTLS: true, DualStack: true},
 		wantName: "sudo",
 		wantArgs: []string{"-n", DefaultHelperPath, "start", "gw.example.com:10443"},
 	}}

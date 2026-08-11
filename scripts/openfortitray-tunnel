@@ -15,15 +15,38 @@
 #     therefore asks for teardown through "stop", which runs as root and can
 #     deliver SIGINT.
 #  2. Attack surface. Everything reachable with NOPASSWD is confined to the two
-#     subcommands below, with the gateway argument validated before it is handed
-#     to openconnect.
+#     subcommands below, with the gateway argument validated, and every extra
+#     openconnect flag checked against a fixed allowlist, before anything is
+#     handed to openconnect.
 #
 # THREAT MODEL — read before widening anything here.
 #
 #   Argument injection: blocked on both platforms. The gateway is validated
-#   against a strict host:port pattern before it reaches openconnect, so a local
-#   caller cannot smuggle --script=/--csd-wrapper= (which openconnect would run
-#   as root) through the NOPASSWD rule.
+#   against a strict host:port pattern, and every remaining argument to "start"
+#   is validated against an EXACT allowlist, before openconnect is reached. A
+#   local caller cannot smuggle --script=/--csd-wrapper= (which openconnect would
+#   run as root) through the NOPASSWD rule.
+#
+#   Flag allowlist: "start" no longer forbids ALL openconnect options — it
+#   forbids all EXCEPT three vetted, argument-validated flags that shape the
+#   tunnel and CANNOT lead to code execution:
+#     --no-dtls        boolean; disables DTLS/ESP. Takes no argument.
+#     --disable-ipv6   boolean; forces IPv4-only. Takes no argument.
+#     --servercert FP  pins the server certificate to fingerprint FP. It takes
+#                      only a fingerprint — never a script, command or path that
+#                      openconnect could execute — and FP itself is validated
+#                      against a strict charset/length (see validate_fingerprint),
+#                      so a value like "--servercert /tmp/evil" or a fingerprint
+#                      that smuggles a shell metacharacter is refused.
+#   Everything else — any other flag, any --script/--csd-wrapper/-o/--, any bare
+#   "-x", a "--servercert" with no valid fingerprint following it — is rejected
+#   (die, non-zero, no exec). None of the three allowlisted flags takes a
+#   payload openconnect runs, which is what keeps the "no arbitrary root code
+#   execution" guarantee intact while letting the Advanced toggles work.
+#   The flags are validated as SEPARATE argv elements (sudo/exec pass them
+#   through without a shell), so a fingerprint value can never be re-parsed as an
+#   option, and the sudoers match is on the helper path only — argv does not
+#   affect it, so no sudoers change was needed to widen "start".
 #
 #   Binary tampering: blocked on Linux, only WARNED ABOUT on macOS. The
 #   openconnect path is baked in at install time rather than resolved through
@@ -41,8 +64,11 @@
 #   installer at it.
 #
 # Usage (as invoked by the app via `sudo -n`):
-#   openfortitray-tunnel start <host:port>   # exec openconnect, cookie on stdin
-#   openfortitray-tunnel stop                # SIGINT the running openconnect
+#   openfortitray-tunnel start <host:port> [flag ...]  # exec openconnect,
+#                                                        cookie on stdin
+#     where each flag is one of the allowlisted:
+#       --no-dtls | --disable-ipv6 | --servercert <fingerprint>
+#   openfortitray-tunnel stop                          # SIGINT the running openconnect
 set -eu
 
 # Fixed PATH for the coreutils this script itself calls (cat, ps, kill, rm,
@@ -87,6 +113,54 @@ validate_gateway() {
 	case "$_port" in
 	'' | *[!0-9]*) die "gateway port must be numeric" ;;
 	esac
+}
+
+# validate_fingerprint rejects anything that is not a plausible certificate
+# fingerprint. It never leads to code execution — --servercert only pins a cert —
+# but a strict charset and length keep the value from being a path or carrying a
+# shell metacharacter. Accepts the forms openconnect (and internal/tunnel's
+# openconnectFlags) emit: a bare hex string, "sha256:AB:CD:…" byte form, or the
+# "pin-sha256:<base64>" pin form (whose base64 may contain + / =). A leading '-'
+# would look like a flag and a leading '/' like a path, so both are refused.
+validate_fingerprint() {
+	_fp=$1
+	case "$_fp" in
+	'') die "--servercert requires a fingerprint" ;;
+	-*) die "--servercert fingerprint must not start with '-'" ;;
+	/*) die "--servercert fingerprint must not look like a path" ;;
+	*[!A-Za-z0-9:+/=._-]*) die "--servercert fingerprint contains invalid characters" ;;
+	esac
+	if [ "${#_fp}" -gt 256 ]; then
+		die "--servercert fingerprint is too long"
+	fi
+}
+
+# validate_flags refuses every "start" argument that is not on the exact
+# allowlist, BEFORE openconnect (or any pidfile side effect) is reached. This is
+# what preserves the "no arbitrary openconnect options" guarantee now that the
+# app threads the Advanced toggles through: only --no-dtls, --disable-ipv6 and
+# --servercert <fingerprint> pass, and none of them takes a script/command
+# openconnect would run as root. Anything else — another flag, --script/
+# --csd-wrapper/-o/--, a bare "-x", or --servercert without a valid fingerprint —
+# dies. Arguments arrive as distinct argv elements (no shell between the app and
+# here), so a fingerprint value can never be re-split into a fresh option.
+validate_flags() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--no-dtls | --disable-ipv6)
+			shift
+			;;
+		--servercert)
+			shift
+			[ $# -ge 1 ] || die "--servercert requires a fingerprint"
+			validate_fingerprint "$1"
+			shift
+			;;
+		*)
+			die "disallowed openconnect option: '$1' (only --no-dtls, --disable-ipv6, --servercert <fingerprint> are permitted)"
+			;;
+		esac
+	done
 }
 
 # running_openconnect_pid echoes the pid from the pidfile if it is a live
@@ -161,8 +235,14 @@ resolve_openconnect() {
 }
 
 cmd_start() {
-	[ $# -eq 1 ] || die "usage: openfortitray-tunnel start <host:port>"
+	[ $# -ge 1 ] || die "usage: openfortitray-tunnel start <host:port> [flag ...]"
 	validate_gateway "$1"
+	gateway=$1
+	shift
+	# Everything after the gateway must be an allowlisted, argument-validated
+	# flag. Do this BEFORE resolve_openconnect / terminate_running / the pidfile
+	# so a rejected argument has no side effect at all.
+	validate_flags "$@"
 	oc=$(resolve_openconnect)
 
 	# Adopt-and-replace: if a previous app instance died without stopping its
@@ -180,8 +260,9 @@ cmd_start() {
 
 	# --non-inter: never prompt (there is no tty); --cookie-on-stdin: the cookie
 	# arrives on stdin, which sudo passes through, so it stays off the argv and
-	# out of the process table.
-	exec "$oc" --protocol=fortinet --cookie-on-stdin --non-inter "$1"
+	# out of the process table. The validated flags ("$@") sit before the gateway,
+	# matching the order internal/tunnel builds for the direct path.
+	exec "$oc" --protocol=fortinet --cookie-on-stdin --non-inter "$@" "$gateway"
 }
 
 cmd_stop() {
