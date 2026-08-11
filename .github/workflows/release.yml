@@ -1,7 +1,13 @@
 name: Release
 
 # Fires on version tags only (v1.2.3, v0.1.0-rc1, ...). Build flags below mirror
-# the Makefile `release` target exactly — if you change one, change both.
+# the Makefile `release` target's per-OS builds — if you change one, change both.
+#
+# Since the fyne v2 tray migration, cmd/openfortitray is a cgo + OpenGL/GLFW
+# build on every OS, so the old "cross-build linux + windows from one ubuntu
+# host with CGO_ENABLED=0" model is dead. Each OS is now built on its own
+# native runner with CGO_ENABLED=1. macOS additionally ships a real .app
+# bundle (fyne menu-bar apps need one), zipped for release.
 on:
   push:
     tags:
@@ -11,15 +17,23 @@ on:
 permissions:
   contents: read
 
+# bash everywhere, including the windows runner (Git Bash), so the checksum
+# steps share one implementation and emit the sha256sum -c format downstream.
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # darwin needs cgo (fyne.io/systray drives the Cocoa status bar), so both
-  # slices must be built on a macOS runner. macos-14 is Apple Silicon: arm64 is
-  # native and the amd64 slice cross-builds because the macOS SDK is a fat SDK.
-  # If a future SDK drops x86_64, delete the amd64 step — it only serves
-  # pre-2020 Intel macs.
+  # darwin needs cgo (fyne drives the Cocoa status bar and renders via OpenGL),
+  # so both slices must be built on a macOS runner. macos-14 is Apple Silicon:
+  # arm64 is native and the amd64 slice cross-builds because the macOS SDK is a
+  # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
+  # guard — it only serves pre-2020 Intel macs.
   build-darwin:
-    name: Build darwin (arm64 + amd64)
+    name: Build darwin (arm64 + amd64 + .app)
     runs-on: macos-14
+    env:
+      CGO_ENABLED: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -30,17 +44,27 @@ jobs:
           go-version: stable
           cache: true
 
-      # NOTE: no -X main.version stamp — cmd/openfortitray declares no `version` var
-      # today. If one is added, append
-      #   -ldflags "-X main.version=${GITHUB_REF_NAME}"
-      # to each build below (and merge it with the windows -H=windowsgui flag).
-      - name: Build
+      # cgo on darwin needs the Xcode Command Line Tools (clang + the macOS
+      # SDK). They ship on the macos-14 runner by default; this fails fast with
+      # a clear message if that ever changes rather than deep inside `go build`.
+      - name: Verify Xcode Command Line Tools
+        run: |
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-path
+
+      # NOTE: no -X main.version stamp — cmd/openfortitray declares no `version`
+      # var today. If one is added, append -X main.version=${GITHUB_REF_NAME}
+      # to the -ldflags below (merging with -s -w, and with -H=windowsgui on the
+      # windows job).
+      - name: Build darwin binaries
+        # -s -w strips the symbol table and DWARF to claw back some of fyne's
+        # size (a fyne binary is ~15-30 MB heavier than the old systray one).
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
+            go build -ldflags="-s -w" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
+            go build -ldflags="-s -w" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
           ls -l dist
 
       - name: Verify architectures
@@ -49,47 +73,53 @@ jobs:
           file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
           file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
 
+      # A fyne menu-bar app needs a real .app bundle (Info.plist + LSUIElement)
+      # to host the status item reliably and stay off the Dock. `make app`
+      # rebuilds the host-arch (arm64) binary and assembles the bundle with the
+      # hand-rolled Info.plist + generated .icns. Then zip it, preserving the
+      # bundle directory, with ditto (the macOS-native, resource-fork-safe zip).
+      - name: Bundle and zip OpenFortiTray.app
+        run: |
+          make app
+          ditto -c -k --keepParent dist/OpenFortiTray.app dist/openfortitray-darwin-arm64.app.zip
+          ls -l dist
+
       # Checksums are computed HERE, on the runner that produced the bytes, so
       # the verification in the release job actually covers the upload/download
       # round trip. `shasum -a 256` rather than `sha256sum`: macOS runners ship
       # BSD tools and have no coreutils sha256sum. The output format is
       # byte-identical to sha256sum's, so `sha256sum -c` consumes it downstream.
-      - name: Checksum darwin binaries
+      - name: Checksum darwin artifacts
         working-directory: dist
         run: |
-          shasum -a 256 openfortitray-darwin-* > SHA256SUMS.darwin
+          shasum -a 256 \
+            openfortitray-darwin-arm64 \
+            openfortitray-darwin-amd64 \
+            openfortitray-darwin-arm64.app.zip > SHA256SUMS.darwin
           cat SHA256SUMS.darwin
 
-      - name: Upload darwin binaries
+      - name: Upload darwin artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-darwin
           path: |
-            dist/openfortitray-darwin-*
+            dist/openfortitray-darwin-arm64
+            dist/openfortitray-darwin-amd64
+            dist/openfortitray-darwin-arm64.app.zip
             dist/SHA256SUMS.darwin
           if-no-files-found: error
           retention-days: 7
 
-  # TODO(fyne5/packaging Task 5): THIS JOB IS BROKEN by the fyne v2 tray migration
-  # and will fail at the next tag. fyne renders via OpenGL/GLFW, so
-  # cmd/openfortitray is now a cgo build on every OS. The CGO_ENABLED=0
-  # cross-builds below can no longer compile it: the linux build fails for want
-  # of a C toolchain/GL, and the windows build fails because the go-gl files are
-  # build-excluded without cgo (cgo windows cannot cross-compile from Linux at
-  # all without a MinGW toolchain). The packaging task rewrites this into two
-  # jobs — build-linux (ubuntu-latest: apt install gcc libgl1-mesa-dev xorg-dev,
-  # CGO_ENABLED=1) and build-windows (windows-latest: CGO_ENABLED=1,
-  # -ldflags="-H=windowsgui", runner's bundled gcc) — plus a macOS .app bundle.
-  # Left as-is here (release.yml is out of scope for the tray task) so the change
-  # is one focused diff; release.yml only fires on tags, so this does not break
-  # branch/PR CI in the meantime.
-  #
-  # linux systray is pure Go (D-Bus StatusNotifierItem via godbus) and windows
-  # needs no cgo either, so both cross-build from ubuntu with CGO_ENABLED=0.
-  # cgo off also keeps the linux binary free of a glibc version floor.
-  build-linux-windows:
-    name: Build linux + windows (amd64)
+  # linux is now a cgo build (fyne -> GLFW -> OpenGL), so it must build on a
+  # linux runner with the GL + X11 dev headers, not cross-compiled with cgo
+  # off. Consequence: the linux binary now carries a glibc version floor from
+  # ubuntu-latest (it no longer runs on arbitrarily old glibc). Runtime still
+  # needs an SNI-capable panel (unchanged) plus a working GL stack.
+  build-linux:
+    name: Build linux (amd64)
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -100,45 +130,95 @@ jobs:
           go-version: stable
           cache: true
 
-      - name: Build
-        # -H=windowsgui on windows only: without it, launching the tray app pops
-        # a console window alongside it.
+      - name: Install GL/X11 build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+
+      - name: Build linux binary
+        # -s -w trims fyne's size. Ships the bare binary: there is no
+        # linux/.desktop asset in the repo, so no .tar.xz is assembled here.
         run: |
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -ldflags="-H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
           ls -l dist
 
-      # See the darwin job: hashed on the producing runner so the release job's
-      # verification spans the artifact round trip.
-      - name: Checksum linux + windows binaries
+      - name: Checksum linux binary
         working-directory: dist
         run: |
-          sha256sum openfortitray-linux-amd64 openfortitray-windows-amd64.exe > SHA256SUMS.linux-windows
-          cat SHA256SUMS.linux-windows
+          sha256sum openfortitray-linux-amd64 > SHA256SUMS.linux
+          cat SHA256SUMS.linux
 
-      - name: Upload linux + windows binaries
+      - name: Upload linux binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: binaries-linux-windows
+          name: binaries-linux
           path: |
             dist/openfortitray-linux-amd64
+            dist/SHA256SUMS.linux
+          if-no-files-found: error
+          retention-days: 7
+
+  # windows is a cgo build too, and cgo windows cannot be cross-compiled from
+  # Linux without a MinGW cross-toolchain, so it gets its own windows-latest
+  # runner. The runner ships MinGW-w64 gcc on PATH; `go build` finds it with no
+  # extra setup. -H=windowsgui keeps the tray app from popping a console window.
+  build-windows:
+    name: Build windows (amd64)
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          cache: true
+
+      # Confirm the bundled C toolchain is on PATH so a cgo failure names the
+      # cause up front rather than surfacing as a cryptic linker error.
+      - name: Verify C toolchain
+        run: gcc --version
+
+      - name: Build windows binary
+        # -s -w trims size; -H=windowsgui suppresses the console window.
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOARCH=amd64 \
+            go build -ldflags="-s -w -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
+          ls -l dist
+
+      - name: Checksum windows binary
+        # Git Bash on the windows runner provides coreutils sha256sum, so the
+        # manifest format matches the other runners' and `sha256sum -c` verifies.
+        working-directory: dist
+        run: |
+          sha256sum openfortitray-windows-amd64.exe > SHA256SUMS.windows
+          cat SHA256SUMS.windows
+
+      - name: Upload windows binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-windows
+          path: |
             dist/openfortitray-windows-amd64.exe
-            dist/SHA256SUMS.linux-windows
+            dist/SHA256SUMS.windows
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish release
-    needs: [build-darwin, build-linux-windows]
+    needs: [build-darwin, build-linux, build-windows]
     runs-on: ubuntu-latest
     # The only job that writes: it creates the release and uploads the assets.
     permissions:
       contents: write
     steps:
-      - name: Download all binaries
+      - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binaries-*
@@ -154,8 +234,8 @@ jobs:
         # dist) keep `sha256sum -c SHA256SUMS` working for users too.
         working-directory: dist
         run: |
-          cat SHA256SUMS.darwin SHA256SUMS.linux-windows > SHA256SUMS
-          rm SHA256SUMS.darwin SHA256SUMS.linux-windows
+          cat SHA256SUMS.darwin SHA256SUMS.linux SHA256SUMS.windows > SHA256SUMS
+          rm SHA256SUMS.darwin SHA256SUMS.linux SHA256SUMS.windows
           cat SHA256SUMS
 
       - name: Verify SHA256SUMS
@@ -168,6 +248,7 @@ jobs:
         # upload-artifact does not preserve the exec bit. Done after
         # verification: chmod changes the mode, not the bytes, so ordering is
         # cosmetic, but verifying the artifacts exactly as received is clearer.
+        # The .app.zip (a bundle) and the .exe are left alone.
         working-directory: dist
         run: chmod +x openfortitray-darwin-arm64 openfortitray-darwin-amd64 openfortitray-linux-amd64
 
@@ -175,8 +256,8 @@ jobs:
         # `gh release create` over softprops/action-gh-release: gh is preinstalled
         # on GitHub-hosted runners, so publishing — the one step holding a
         # contents: write token — runs no third-party code that would need
-        # SHA-pinning and auditing on every bump. Costs us nothing here: the
-        # action's extras (changelog templating, draft flows) are unused.
+        # SHA-pinning and auditing on every bump. --verify-tag refuses to publish
+        # if the tag is not present on the remote.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -187,6 +268,7 @@ jobs:
             --verify-tag \
             dist/openfortitray-darwin-arm64 \
             dist/openfortitray-darwin-amd64 \
+            dist/openfortitray-darwin-arm64.app.zip \
             dist/openfortitray-linux-amd64 \
             dist/openfortitray-windows-amd64.exe \
             dist/SHA256SUMS

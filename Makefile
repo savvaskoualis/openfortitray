@@ -21,21 +21,43 @@ test:
 	go vet ./...
 	go test -race ./...
 
-# Cross-compilation notes:
-#  - darwin needs cgo: fyne.io/systray drives the Cocoa status bar. The amd64
-#    slice cross-builds from an Apple Silicon mac because the macOS SDK is a
-#    fat SDK; if a future SDK drops x86_64 support, drop that line — the amd64
-#    slice only serves pre-2020 Intel macs.
-#  - linux systray is pure Go (D-Bus StatusNotifierItem via godbus), so it
-#    builds with cgo off and stays portable across glibc versions.
-#  - windows needs -H=windowsgui, or launching the tray app pops a console
-#    window alongside it.
+# Size trim for release builds. fyne statically links the GL bindings, a font
+# shaper and the default theme/font, so a release binary is ~15-30 MB heavier
+# than the old systray one; -s -w (strip symbol table + DWARF) claws some back.
+LDFLAGS_TRIM := -s -w
+
+# Build/CI reality since the fyne v2 migration: fyne renders via OpenGL/GLFW, so
+# cmd/openfortitray is a cgo build on EVERY OS. That kills the old pure
+# cross-compile model (CGO_ENABLED=0 for linux/windows from any host). Each OS
+# must now build on its own native toolchain:
+#   - darwin: cgo via the Xcode CLT. The amd64 slice still cross-builds from an
+#     Apple Silicon mac because the macOS SDK is a fat SDK; if a future SDK
+#     drops x86_64, delete that line — it only serves pre-2020 Intel macs.
+#   - linux: cgo needs gcc + GL/X11 dev headers (libgl1-mesa-dev xorg-dev).
+#   - windows: cgo needs a MinGW gcc; -H=windowsgui suppresses the console
+#     window. Cannot be cross-built from a non-windows host without a MinGW
+#     cross-toolchain.
+#
+# Consequently a LOCAL `make release` can only build what THIS host's toolchain
+# supports: on macOS both darwin slices (arm64 native + amd64 via the fat SDK),
+# on linux the linux binary, on windows the windows exe. The full three-OS
+# matrix is produced by CI (.github/workflows/release.yml), one native runner
+# per OS. This target builds the host-appropriate subset and says so.
 release: clean
 	mkdir -p $(DIST)
-	CGO_ENABLED=1 GOOS=darwin  GOARCH=arm64 go build -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
-	CGO_ENABLED=1 GOOS=darwin  GOARCH=amd64 go build -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
-	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+ifeq ($(shell uname -s),Darwin)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
+	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
+	@file $(DIST)/$(BIN)-darwin-amd64 | grep -q 'x86_64'
+	@echo "make release: built darwin arm64 + amd64. linux/windows come from CI (native runners)."
+else ifeq ($(shell uname -s),Linux)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
+	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
+else
+	CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+	@echo "make release: built windows amd64. darwin/linux come from CI (native runners)."
+endif
 	@ls -l $(DIST)
 
 # app assembles a hand-rolled macOS .app bundle (Task 10). A fyne menu-bar app

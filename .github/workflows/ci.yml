@@ -1,14 +1,13 @@
 name: CI
 
-# Runs on every branch push and on pull requests. Two platforms, because the
-# tray layer is the platform-specific part. Since the tray moved to fyne v2 it
-# renders through OpenGL/GLFW, so BOTH runners now build with cgo: linux needs
-# GL + X11 dev headers (installed below), macOS uses the system frameworks and
-# Xcode CLT already on the runner. Windows is a special case: fyne makes
-# cmd/openfortitray a cgo+GLFW build that cannot cross-compile from Linux, so the
-# full windows binary is built on a windows-latest runner in the packaging task
-# (see the release.yml TODO). Here we only type-check the windows-specific,
-# non-GUI code (autostart_windows.go), which stays cgo-free.
+# Runs on every branch push and on pull requests. Since the tray moved to
+# fyne v2 it renders through OpenGL/GLFW, so cmd/openfortitray is now a cgo
+# build on EVERY OS. That kills the old "type-check windows on ubuntu" trick
+# (cgo windows cannot cross-compile from Linux), so the matrix now spans all
+# three real runners: linux needs GL + X11 dev headers (installed below),
+# macOS uses the system frameworks + Xcode CLT already on the runner, and
+# windows uses the runner's bundled MinGW gcc. Each runner does the full
+# gofmt / vet / test -race / build pass against its own native toolchain.
 on:
   push:
     branches: ['**']
@@ -23,14 +22,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# bash everywhere, including the windows runner (Git Bash), so the gofmt /
+# shell-syntax steps below are written once and behave identically.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # cgo is now mandatory on all three OSes (fyne -> GLFW -> OpenGL). Setting
+    # it at the job level covers vet, test -race and build in one place.
+    env:
+      CGO_ENABLED: '1'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       # Third-party actions are pinned to full commit SHAs, not floating tags: a
       # tag can be repointed at new code, so `@v4` is a standing write into every
@@ -50,7 +59,8 @@ jobs:
       # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
       # dev headers. `go vet`/`go test -race`/`go build` below all compile
       # cmd/openfortitray, so these must be present first. This is fyne's
-      # documented Linux build-dependency set. macOS uses system frameworks.
+      # documented Linux build-dependency set. macOS uses system frameworks and
+      # windows uses the runner's bundled MinGW gcc, so neither needs this step.
       - name: Install GL/X11 build deps
         if: runner.os == 'Linux'
         run: |
@@ -70,33 +80,15 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
-      # The windows-only files (internal/autostart/autostart_windows.go, the
-      # scheduled-task path) are invisible to the two runners above: build
-      # constraints exclude them, so a compile error there would first surface
-      # at tag time. This type-checks them on every push.
-      #
-      # Scope is ./internal/... , not ./... , because cmd/openfortitray now imports
-      # fyne/v2/app -> GLFW -> OpenGL, a cgo build the go toolchain cannot
-      # cross-compile from Linux (the gl package's files are build-excluded
-      # without cgo). CGO_ENABLED=0 is explicit: none of ./internal/... needs cgo
-      # for windows — the tray imports only fyne core + driver/desktop (pure Go),
-      # not the GL driver. The full windows cgo/GLFW build is covered by the
-      # windows-latest runner added in the packaging task (release.yml TODO).
-      # Build only, no test: `go test` would need a windows runner to execute.
-      - name: Type-check windows-only code
-        if: runner.os == 'Linux'
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: '0'
-        run: go build ./internal/...
+      - name: go build
+        run: go build ./...
 
       # Shell syntax gate for the installer and the privileged helper. Linux
       # only: these are parse checks, not execution, so one platform suffices.
-      # install.sh is bash (arrays, [[ ]]); openfortitray-tunnel is strict POSIX sh
-      # because it runs from a sudoers rule under an unknown login shell.
+      # install.sh is bash (arrays, [[ ]]); openfortitray-tunnel is strict POSIX
+      # sh because it runs from a sudoers rule under an unknown login shell.
       - name: Shell syntax check
         if: runner.os == 'Linux'
         run: |
-          bash -n scripts/install.sh
+          bash -n scripts/*.sh
           sh -n scripts/openfortitray-tunnel
