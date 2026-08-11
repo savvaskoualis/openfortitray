@@ -266,38 +266,179 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	}
 }
 
-// connectedRe matches openconnect's "Connected as <ip>" progress line.
-var connectedRe = regexp.MustCompile(`Connected as ([0-9a-fA-F.:]+)`)
+// connectedRe matches the openconnect progress line that reports the address
+// assigned to the tunnel. openconnect 8.x/9.x print
+//
+//	Configured as 10.212.134.5, with SSL connected and DTLS connected
+//
+// (verified against the format string in openconnect v9.21:
+// "Configured as %s%s%s, with SSL%s%s %s and %s%s%s %s"). openconnect 7.x used
+// "Connected as <ip>", so both spellings are accepted. Note the deliberate
+// " as ": the earlier "Connected to <gw-ip>:<port>" line carries the *gateway*
+// address and must not be mistaken for ours.
+var connectedRe = regexp.MustCompile(`(?:Configured|Connected) as ([0-9a-fA-F.:]+)`)
 
 // authRejectedMarkers are openconnect log fragments meaning the cookie is no
-// longer accepted by the gateway.
+// longer accepted by the gateway, so a fresh SAML login is required. They are
+// matched case-insensitively and must therefore be written in lower case
+// (TestAuthRejectedMarkersAreLowercase enforces that).
+//
+// Wording verified against openconnect v9.21. Deliberately conservative: a
+// marker that also fires on plain network trouble would open a browser window
+// for a re-login every time Wi-Fi hiccups, so generic connection failures
+// ("Error establishing Fortinet connection") are left out — those are retried
+// with the existing cookie instead.
+//
+// The FortiGate-specific one is the important one in practice. On FortiOS 5+ a
+// dead SVPNCOOKIE does not produce any of the generic "cookie" wordings: the
+// config fetch in fortinet_get_config() returns -EPERM (the gateway answered
+// 401/403) and openconnect prints "Fortinet server is rejecting request for
+// connection options" instead. Without that marker a stale cookie looks like
+// plain link trouble and the supervisor retries it forever with the same dead
+// cookie, leaving the tray stuck on "Reconnecting…" until the user restarts the
+// app. openconnect's own text hedges that this is also "observed after
+// reconnection in some cases" — re-authenticating is the right recovery there
+// too, and the supervisor's backoff for unproven cookies stops a gateway that
+// refuses fresh cookies from spinning the SAML browser flow.
 var authRejectedMarkers = []string{
-	"Failed to obtain WebVPN cookie",
-	"Unexpected 401",
-	"cookie was rejected",
-	"Cookie is no longer valid",
+	"cookie was rejected by server",     // mainloop: gateway refused the cookie
+	"cookie is no longer valid",         // session invalidated server-side
+	"session terminated by server",      // admin/idle kill: cookie is dead
+	"failed to complete authentication", // auth handshake refused
+	"failed to obtain webvpn cookie",    // legacy openconnect 7.x wording
+	// fortinet.c: config request answered 401/403, i.e. the cookie is dead.
+	"rejecting request for connection options",
+	// fortinet.c: the cookie we supplied is not a usable SVPNCOOKIE at all.
+	"no cookie named svpncookie",
 }
 
-// RunOpenconnect returns a runFn spawning openconnect --protocol=fortinet.
-// useSudo prefixes "sudo -n" (macOS/Linux; Windows runs elevated already).
-func RunOpenconnect(binPath, gatewayHostPort string, useSudo bool) func(ctx context.Context, cookie string, connected func(ip string)) error {
+// isAuthRejected reports whether openconnect's output says the cookie was
+// refused rather than the link merely failing.
+func isAuthRejected(output string) bool {
+	lower := strings.ToLower(output)
+	for _, marker := range authRejectedMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultHelperPath is where scripts/install.sh puts the privileged helper.
+const DefaultHelperPath = "/usr/local/libexec/hyp-vpn-tunnel"
+
+const (
+	// helperStopTimeout bounds the privileged teardown call. The helper waits up
+	// to 6s for openconnect to exit cleanly, so allow a little more.
+	helperStopTimeout = 10 * time.Second
+	// helperWaitDelay must exceed helperStopTimeout: killing our sudo child is a
+	// last resort that leaves the root openconnect (and its routes) behind, so
+	// the helper gets its full chance first.
+	helperWaitDelay = 12 * time.Second
+	// signalWaitDelay backstops the direct path, where we can signal the
+	// process ourselves.
+	signalWaitDelay = 10 * time.Second
+)
+
+// Options configures the openconnect runner.
+type Options struct {
+	// Gateway is the FortiGate SSL-VPN endpoint as "host:port".
+	Gateway string
+	// OpenconnectPath is the openconnect binary, used only when the app is
+	// already privileged (Windows) and runs it directly.
+	OpenconnectPath string
+	// HelperPath is the root-owned helper script (scripts/hyp-vpn-tunnel) run
+	// through sudo on macOS/Linux. Empty means DefaultHelperPath.
+	HelperPath string
+	// UseSudo runs the tunnel as root via `sudo -n <HelperPath>`; false runs
+	// openconnect directly (Windows, where the app is already elevated).
+	UseSudo bool
+
+	// sudoPath overrides the sudo binary; tests use it to substitute a stub.
+	sudoPath string
+}
+
+func (o Options) helperPath() string {
+	if o.HelperPath == "" {
+		return DefaultHelperPath
+	}
+	return o.HelperPath
+}
+
+func (o Options) sudo() string {
+	if o.sudoPath == "" {
+		return "sudo"
+	}
+	return o.sudoPath
+}
+
+// startArgv returns the command that brings the tunnel up. Privileged runs go
+// through the helper's "start" subcommand rather than openconnect directly, so
+// the NOPASSWD sudoers rule can be scoped to one script with validated
+// arguments instead of to openconnect (whose --script/--csd-wrapper options
+// would amount to passwordless root).
+func (o Options) startArgv() (string, []string) {
+	if o.UseSudo {
+		return o.sudo(), []string{"-n", o.helperPath(), "start", o.Gateway}
+	}
+	return o.OpenconnectPath, []string{
+		"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", o.Gateway,
+	}
+}
+
+// stopArgv returns the command that tears the tunnel down, and whether one is
+// needed. It is: an unprivileged parent cannot signal a root openconnect —
+// kill(2) fails with EPERM — so teardown has to be asked for through the
+// helper, which runs as root. Killing our own child (sudo) instead would leave
+// the tunnel and its routes in place. On the direct path we signal the process
+// ourselves and no stop command is needed.
+func (o Options) stopArgv() (string, []string, bool) {
+	if !o.UseSudo {
+		return "", nil, false
+	}
+	return o.sudo(), []string{"-n", o.helperPath(), "stop"}, true
+}
+
+// runHelperStop asks the privileged helper to interrupt openconnect and waits
+// for it to finish. It runs on its own timeout because the caller's context is
+// already cancelled by the time Cancel is invoked.
+//
+// If the helper cannot be reached (not installed, sudoers rule missing) there is
+// no way to signal the root process, so we kill our sudo child to avoid hanging
+// Wait and return a loud error: the tunnel may still be up, and that has to
+// reach the log.
+func runHelperStop(cmd *exec.Cmd, name string, args []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), helperStopTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	killErr := cmd.Process.Kill()
+	return fmt.Errorf("tunnel teardown via %s failed: %w: %s (killed sudo: %v); "+
+		"the tunnel may still be up", name, err, strings.TrimSpace(string(out)), killErr)
+}
+
+// RunOpenconnect returns a runFn that runs openconnect --protocol=fortinet,
+// directly or through the privileged helper (see Options).
+func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, connected func(ip string)) error {
 	return func(ctx context.Context, cookie string, connected func(ip string)) error {
-		args := []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", gatewayHostPort}
-		var cmd *exec.Cmd
-		if useSudo {
-			cmd = exec.CommandContext(ctx, "sudo", append([]string{"-n", binPath}, args...)...)
+		name, args := opts.startArgv()
+		cmd := exec.CommandContext(ctx, name, args...)
+		if stopName, stopArgs, viaHelper := opts.stopArgv(); viaHelper {
+			cmd.Cancel = func() error { return runHelperStop(cmd, stopName, stopArgs) }
+			cmd.WaitDelay = helperWaitDelay
 		} else {
-			cmd = exec.CommandContext(ctx, binPath, args...)
-		}
-		// Interrupt rather than kill so openconnect tears the tunnel down and
-		// restores routing; WaitDelay is the hard backstop.
-		cmd.Cancel = func() error {
-			if err := cmd.Process.Signal(os.Interrupt); err != nil {
-				return cmd.Process.Kill()
+			// Interrupt rather than kill so openconnect tears the tunnel down
+			// and restores routing; WaitDelay is the hard backstop.
+			cmd.Cancel = func() error {
+				if err := cmd.Process.Signal(os.Interrupt); err != nil {
+					return cmd.Process.Kill()
+				}
+				return nil
 			}
-			return nil
+			cmd.WaitDelay = signalWaitDelay
 		}
-		cmd.WaitDelay = 10 * time.Second
 
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -351,10 +492,8 @@ func RunOpenconnect(binPath, gatewayHostPort string, useSudo bool) func(ctx cont
 		tail := strings.Join(lastLines, "\n")
 		// Check for rejection regardless of exit status: openconnect can report
 		// a refused cookie and still exit 0.
-		for _, marker := range authRejectedMarkers {
-			if strings.Contains(tail, marker) {
-				return ErrAuthRejected
-			}
+		if isAuthRejected(tail) {
+			return ErrAuthRejected
 		}
 		if err != nil {
 			return fmt.Errorf("openconnect exited: %w\n%s", err, tail)

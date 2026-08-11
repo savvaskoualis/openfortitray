@@ -20,6 +20,24 @@ func TestLoadDefaults(t *testing.T) {
 	if !c.Autostart {
 		t.Fatal("autostart should default to true")
 	}
+	// The sudoers rule written by scripts/install.sh is scoped to exactly this
+	// path; a mismatch means sudo asks for a password and the tunnel never
+	// starts.
+	if c.HelperPath != "/usr/local/libexec/hyp-vpn-tunnel" {
+		t.Fatalf("default helper path must match the install location, got %q", c.HelperPath)
+	}
+}
+
+func TestLoadOverridesHelperPath(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"helper_path":"/opt/hyp/tunnel"}`), 0o600)
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HelperPath != "/opt/hyp/tunnel" {
+		t.Fatalf("helper_path not honoured: %+v", c)
+	}
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {

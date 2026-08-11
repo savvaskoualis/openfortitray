@@ -9,11 +9,19 @@ import (
 )
 
 type Config struct {
-	Gateway         string `json:"gateway"`
-	Port            int    `json:"port"`
-	SAMLPort        int    `json:"saml_port"`
+	Gateway  string `json:"gateway"`
+	Port     int    `json:"port"`
+	SAMLPort int    `json:"saml_port"`
+	// OpenconnectPath is only used where the app is already privileged
+	// (Windows). On macOS/Linux the tunnel goes through HelperPath, which
+	// resolves openconnect itself from a fixed PATH.
 	OpenconnectPath string `json:"openconnect_path"`
-	Autostart       bool   `json:"autostart"`
+	// HelperPath is the root-owned privileged helper installed by
+	// scripts/install.sh; the sudoers rule is scoped to exactly this path, so
+	// changing it here without reinstalling will make sudo ask for a password
+	// and the tunnel will fail to start.
+	HelperPath string `json:"helper_path"`
+	Autostart  bool   `json:"autostart"`
 }
 
 func defaults() *Config {
@@ -22,6 +30,7 @@ func defaults() *Config {
 		Port:            10443,
 		SAMLPort:        8020,
 		OpenconnectPath: "openconnect",
+		HelperPath:      "/usr/local/libexec/hyp-vpn-tunnel",
 		Autostart:       true,
 	}
 }

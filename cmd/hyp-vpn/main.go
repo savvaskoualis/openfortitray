@@ -72,7 +72,7 @@ func setLoginItem(on bool) error {
 const authTimeout = 5 * time.Minute
 
 // shutdownWait caps how long we wait for the backend to tear the tunnel down on
-// quit; it has to cover the runner's 10s WaitDelay backstop.
+// quit; it has to cover the runner's 12s WaitDelay backstop.
 const shutdownWait = 15 * time.Second
 
 func main() {
@@ -112,9 +112,15 @@ func main() {
 		return cookie, nil
 	})
 
-	useSudo := runtime.GOOS != "windows"
-	runFn := loggedRun(tunnel.RunOpenconnect(cfg.OpenconnectPath,
-		fmt.Sprintf("%s:%d", cfg.Gateway, cfg.Port), useSudo))
+	// macOS/Linux go through the root-owned helper installed by
+	// scripts/install.sh (see internal/tunnel.Options); on Windows the app is
+	// already elevated and runs openconnect itself.
+	runFn := loggedRun(tunnel.RunOpenconnect(tunnel.Options{
+		Gateway:         fmt.Sprintf("%s:%d", cfg.Gateway, cfg.Port),
+		OpenconnectPath: cfg.OpenconnectPath,
+		HelperPath:      cfg.HelperPath,
+		UseSudo:         runtime.GOOS != "windows",
+	}))
 
 	events := make(chan tunnel.Event, 16)
 	a := &app{

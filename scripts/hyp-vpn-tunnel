@@ -1,0 +1,137 @@
+#!/bin/sh
+# hyp-vpn-tunnel — root-owned privileged helper for the hyp-vpn tray app.
+#
+# Installed by scripts/install.sh as /usr/local/libexec/hyp-vpn-tunnel
+# (owner root, mode 0755, in a root-owned directory). The sudoers rule written by
+# the installer grants NOPASSWD for *this path only*, never for openconnect
+# itself: a bare NOPASSWD on openconnect would let any local process run
+# arbitrary code as root via openconnect's own --script/--csd-wrapper options.
+#
+# Two reasons this helper exists at all:
+#
+#  1. Teardown. openconnect must run as root, so the unprivileged tray app
+#     cannot signal it (kill(2) returns EPERM) — the tunnel and its routes would
+#     leak until something killed sudo, which does not restore routing. The app
+#     therefore asks for teardown through "stop", which runs as root and can
+#     deliver SIGINT.
+#  2. Attack surface. Everything reachable with NOPASSWD is confined to the two
+#     subcommands below, with the gateway argument validated before it is handed
+#     to openconnect.
+#
+# Usage (as invoked by the app via `sudo -n`):
+#   hyp-vpn-tunnel start <host:port>   # exec openconnect, cookie on stdin
+#   hyp-vpn-tunnel stop                # SIGINT the running openconnect
+set -eu
+
+# Fixed PATH: the openconnect location must never be influenced by the caller's
+# environment, or the scoped sudoers rule would buy us nothing.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+PIDFILE=/var/run/hyp-vpn-openconnect.pid
+# Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
+# internal/tunnel allows a little more than this before giving up on us.
+STOP_TIMEOUT=6
+
+die() {
+	echo "hyp-vpn-tunnel: $1" >&2
+	exit 1
+}
+
+# validate_gateway rejects anything that is not a plain host:port. Without this,
+# a caller could smuggle openconnect options (--script=..., --csd-wrapper=...)
+# into the argument list and get arbitrary root code execution.
+validate_gateway() {
+	case "$1" in
+	-*) die "gateway must not start with '-'" ;;
+	*[!A-Za-z0-9.:_-]*) die "gateway contains invalid characters" ;;
+	*:*) ;;
+	*) die "gateway must be host:port" ;;
+	esac
+	_host=${1%:*}
+	_port=${1##*:}
+	case "$_host" in
+	'' | *:*) die "gateway must be host:port" ;;
+	esac
+	case "$_port" in
+	'' | *[!0-9]*) die "gateway port must be numeric" ;;
+	esac
+}
+
+# running_openconnect_pid echoes the pid from the pidfile if it is a live
+# openconnect process, and nothing otherwise (missing, stale or recycled pid).
+running_openconnect_pid() {
+	[ -f "$PIDFILE" ] || return 0
+	pid=$(cat "$PIDFILE" 2>/dev/null) || return 0
+	case "$pid" in
+	'' | *[!0-9]*) return 0 ;;
+	esac
+	[ "$pid" -gt 1 ] 2>/dev/null || return 0
+	# Never signal a pid the kernel has since handed to something else.
+	comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 0
+	case "$comm" in
+	*openconnect*) echo "$pid" ;;
+	esac
+}
+
+# terminate_running interrupts the recorded openconnect, if any, and waits for it
+# to go away. Always succeeds: "no tunnel running" is the desired end state.
+terminate_running() {
+	pid=$(running_openconnect_pid)
+	if [ -n "$pid" ]; then
+		# SIGINT, not SIGKILL: openconnect only tears the tunnel down and
+		# restores the routing table on a clean shutdown.
+		kill -INT "$pid" 2>/dev/null || true
+		i=0
+		while [ "$i" -lt "$STOP_TIMEOUT" ]; do
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 1
+			i=$((i + 1))
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			# Wedged past the grace period; routing may stay broken, but a live
+			# tunnel nobody can control is worse.
+			kill -KILL "$pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$PIDFILE"
+}
+
+cmd_start() {
+	[ $# -eq 1 ] || die "usage: hyp-vpn-tunnel start <host:port>"
+	validate_gateway "$1"
+	oc=$(command -v openconnect) || die "openconnect not found in $PATH"
+
+	# Adopt-and-replace: if a previous app instance died without stopping its
+	# tunnel, that root openconnect is orphaned and unreachable from the tray.
+	# Clear it before starting ours, so a crash cannot leave the machine with a
+	# tunnel and no way to bring it down.
+	terminate_running
+
+	# Record the pid *before* exec: exec replaces this shell in place, so $$
+	# becomes openconnect's pid. openconnect's own --pid-file only writes the
+	# file when it daemonises (--background), and we deliberately keep it in the
+	# foreground so the supervisor can read its progress output and reap it.
+	umask 022
+	echo $$ >"$PIDFILE" || die "cannot write $PIDFILE"
+
+	# --non-inter: never prompt (there is no tty); --cookie-on-stdin: the cookie
+	# arrives on stdin, which sudo passes through, so it stays off the argv and
+	# out of the process table.
+	exec "$oc" --protocol=fortinet --cookie-on-stdin --non-inter "$1"
+}
+
+cmd_stop() {
+	[ $# -eq 0 ] || die "usage: hyp-vpn-tunnel stop"
+	terminate_running
+	exit 0 # stop is idempotent: "already gone" is success
+}
+
+[ $# -ge 1 ] || die "usage: hyp-vpn-tunnel {start <host:port>|stop}"
+sub=$1
+shift
+case "$sub" in
+start) cmd_start "$@" ;;
+stop) cmd_stop "$@" ;;
+*) die "unknown subcommand: $sub" ;;
+esac

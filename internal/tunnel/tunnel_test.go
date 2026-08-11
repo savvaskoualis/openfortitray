@@ -3,6 +3,11 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -462,10 +467,359 @@ func TestEmitDoesNotBlockOnFullChannel(t *testing.T) {
 }
 
 func TestRunOpenconnectStartFailure(t *testing.T) {
-	run := RunOpenconnect("/nonexistent/openconnect-hyp-vpn-test", "vpn.example.com:443", false)
+	run := RunOpenconnect(Options{
+		OpenconnectPath: "/nonexistent/openconnect-hyp-vpn-test",
+		Gateway:         "vpn.example.com:443",
+	})
 	err := run(context.Background(), "COOKIE", func(string) { t.Error("connected must not be called") })
 	if err == nil {
 		t.Fatal("expected an error when the binary does not exist")
+	}
+}
+
+// The IP is scraped out of openconnect's progress output, so the pattern is
+// pinned to wording taken from real openconnect format strings. Getting this
+// wrong means the tunnel never reports Connected: the UI stays yellow and the
+// supervisor never counts the cookie as proven.
+func TestConnectedRegex(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{{
+		name: "openconnect 9.x IPv4",
+		line: "Configured as 10.212.134.5, with SSL connected and DTLS connected",
+		want: "10.212.134.5",
+	}, {
+		name: "openconnect 9.x ESP disabled",
+		line: "Configured as 10.212.134.5, with SSL connected and ESP disabled",
+		want: "10.212.134.5",
+	}, {
+		name: "openconnect 9.x dual stack reports the legacy IP first",
+		line: "Configured as 10.0.0.5 + 2001:db8::5, with SSL connected and ESP in progress",
+		want: "10.0.0.5",
+	}, {
+		name: "openconnect 7.x wording",
+		line: "Connected as 10.212.134.9, using SSL + LZ4",
+		want: "10.212.134.9",
+	}, {
+		// This line carries the *gateway* address; reporting it as the tunnel
+		// address would show the user a bogus IP and mark a dead cookie proven.
+		name: "gateway connection line must not match",
+		line: "Connected to 203.0.113.7:10443",
+		want: "",
+	}, {
+		name: "unrelated progress line",
+		line: "SSL negotiation with securityhub.hyperio.cloud",
+		want: "",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ""
+			if m := connectedRe.FindStringSubmatch(tc.line); m != nil {
+				got = m[1]
+			}
+			if got != tc.want {
+				t.Errorf("parsed %q from %q, want %q", got, tc.line, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsAuthRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		tail string
+		want bool
+	}{{
+		name: "openconnect 9.x rejection, capitalised as printed",
+		tail: "Cookie was rejected by server; exiting.",
+		want: true,
+	}, {
+		name: "session invalidated mid-run",
+		tail: "Cookie is no longer valid, ending session\n",
+		want: true,
+	}, {
+		name: "server killed the session",
+		tail: "Session terminated by server; exiting.",
+		want: true,
+	}, {
+		name: "auth handshake refused",
+		tail: "Failed to complete authentication\n",
+		want: true,
+	}, {
+		// The one that actually fires on a stale SVPNCOOKIE against FortiOS 5+:
+		// the config fetch gets 401/403 and openconnect prints this instead of
+		// anything mentioning a cookie. Missing it means retrying a dead cookie
+		// forever.
+		name: "fortigate refused the config request (dead SVPNCOOKIE)",
+		tail: "Fortinet server is rejecting request for connection options. This\n" +
+			"has been observed after reconnection in some cases. Please report to\n",
+		want: true,
+	}, {
+		name: "cookie supplied is not a usable SVPNCOOKIE",
+		tail: "No cookie named SVPNCOOKIE.\n",
+		want: true,
+	}, {
+		// Plain link trouble must be retried with the existing cookie: treating
+		// it as a rejection would pop a SAML browser window on every hiccup.
+		name: "network failure is not a rejection",
+		tail: "Failed to connect to host securityhub.hyperio.cloud\nError establishing Fortinet connection\n",
+		want: false,
+	}, {
+		name: "clean output",
+		tail: "Configured as 10.212.134.5, with SSL connected and ESP disabled",
+		want: false,
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAuthRejected(tc.tail); got != tc.want {
+				t.Errorf("isAuthRejected(%q) = %v, want %v", tc.tail, got, tc.want)
+			}
+		})
+	}
+}
+
+// Matching lowercases the output, so an upper-case marker could never match.
+func TestAuthRejectedMarkersAreLowercase(t *testing.T) {
+	for _, m := range authRejectedMarkers {
+		if m != strings.ToLower(m) {
+			t.Errorf("marker %q must be lower case: matching is done against lowercased output", m)
+		}
+	}
+}
+
+func TestStartArgv(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     Options
+		wantName string
+		wantArgs []string
+	}{{
+		name:     "direct run (Windows: already elevated)",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw.example.com:10443"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw.example.com:10443"},
+	}, {
+		name: "privileged run goes through the helper, never openconnect itself",
+		opts: Options{
+			OpenconnectPath: "openconnect",
+			HelperPath:      "/opt/hyp/hyp-vpn-tunnel",
+			Gateway:         "gw.example.com:10443",
+			UseSudo:         true,
+		},
+		wantName: "sudo",
+		wantArgs: []string{"-n", "/opt/hyp/hyp-vpn-tunnel", "start", "gw.example.com:10443"},
+	}, {
+		name:     "empty helper path falls back to the installed location",
+		opts:     Options{Gateway: "gw.example.com:10443", UseSudo: true},
+		wantName: "sudo",
+		wantArgs: []string{"-n", DefaultHelperPath, "start", "gw.example.com:10443"},
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			name, args := tc.opts.startArgv()
+			if name != tc.wantName {
+				t.Errorf("command = %q, want %q", name, tc.wantName)
+			}
+			if !slices.Equal(args, tc.wantArgs) {
+				t.Errorf("args = %q, want %q", args, tc.wantArgs)
+			}
+			// The cookie must never reach the argv: it would be world-readable
+			// in the process table.
+			for _, a := range args {
+				if strings.Contains(a, "cookie=") {
+					t.Errorf("argv leaks a cookie value: %q", a)
+				}
+			}
+		})
+	}
+}
+
+func TestStopArgv(t *testing.T) {
+	// Direct runs are signalled, so there is nothing to shell out to.
+	if _, _, viaHelper := (Options{OpenconnectPath: "openconnect"}).stopArgv(); viaHelper {
+		t.Error("direct path must be torn down by signal, not by a stop command")
+	}
+	name, args, viaHelper := (Options{HelperPath: "/opt/hyp/h", UseSudo: true}).stopArgv()
+	if !viaHelper {
+		t.Fatal("privileged path must tear down via the helper: a root process cannot be signalled")
+	}
+	if name != "sudo" || !slices.Equal(args, []string{"-n", "/opt/hyp/h", "stop"}) {
+		t.Errorf("stop command = %q %q, want sudo -n /opt/hyp/h stop", name, args)
+	}
+}
+
+// writeScript writes an executable shell script and returns its path.
+func writeScript(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The privileged path is what ships on macOS/Linux, and its teardown cannot be
+// tested with signals — the whole point is that the child ignores them (it
+// stands in for a root process an unprivileged parent may not signal). A stub
+// sudo lets us verify the real wiring end to end: argv, cookie on stdin, IP
+// parsing, and teardown through the helper's "stop" subcommand.
+func TestRunOpenconnectViaHelperStopsThroughHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stubs: POSIX only (the helper path is macOS/Linux anyway)")
+	}
+	dir := t.TempDir()
+	argvLog := filepath.Join(dir, "argv.log")
+	cookieFile := filepath.Join(dir, "cookie")
+	stopFile := filepath.Join(dir, "stopped")
+
+	// Stands in for sudo: logs its arguments, then behaves like the helper.
+	// "start" ignores SIGINT/SIGTERM, so the only way out is "stop".
+	sudo := writeScript(t, dir, "sudo", `#!/bin/sh
+echo "$@" >> `+argvLog+`
+case "$3" in
+start)
+	trap '' INT TERM
+	cat > `+cookieFile+`
+	echo "Connected to 203.0.113.7:10443"
+	echo "Configured as 10.212.134.5, with SSL connected and ESP disabled"
+	while [ ! -f `+stopFile+` ]; do sleep 0.05; done
+	exit 0
+	;;
+stop)
+	: > `+stopFile+`
+	exit 0
+	;;
+esac
+exit 64
+`)
+
+	opts := Options{
+		Gateway:    "gw.example.com:10443",
+		HelperPath: "/opt/hyp/hyp-vpn-tunnel",
+		UseSudo:    true,
+		sudoPath:   sudo,
+	}
+	run := RunOpenconnect(opts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	gotIP := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, "COOKIE-VALUE", func(ip string) {
+			select {
+			case gotIP <- ip:
+			default:
+			}
+		})
+	}()
+
+	select {
+	case ip := <-gotIP:
+		if ip != "10.212.134.5" {
+			t.Errorf("connected IP = %q, want the tunnel address 10.212.134.5", ip)
+		}
+	case err := <-done:
+		t.Fatalf("run exited before reporting Connected: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("never reported Connected")
+	}
+
+	cancel() // Disconnect: teardown must go through the helper
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after cancel: teardown did not reach the helper")
+	}
+
+	cookie, err := os.ReadFile(cookieFile)
+	if err != nil {
+		t.Fatalf("cookie was never written to the backend's stdin: %v", err)
+	}
+	if got := strings.TrimSpace(string(cookie)); got != "COOKIE-VALUE" {
+		t.Errorf("backend received cookie %q, want COOKIE-VALUE", got)
+	}
+	if _, err := os.Stat(stopFile); err != nil {
+		t.Errorf("helper stop was never invoked: %v", err)
+	}
+	logged, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLines := []string{
+		"-n /opt/hyp/hyp-vpn-tunnel start gw.example.com:10443",
+		"-n /opt/hyp/hyp-vpn-tunnel stop",
+	}
+	for _, want := range wantLines {
+		if !strings.Contains(string(logged), want) {
+			t.Errorf("sudo argv log missing %q; got:\n%s", want, logged)
+		}
+	}
+}
+
+// On the direct path (Windows) nothing changed: the process is interrupted so it
+// can restore routing itself.
+func TestRunOpenconnectDirectPathIsSignalled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	dir := t.TempDir()
+	interrupted := filepath.Join(dir, "interrupted")
+	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
+trap 'touch `+interrupted+`; exit 0' INT
+echo "Configured as 10.212.134.7, with SSL connected and ESP disabled"
+while :; do sleep 0.05; done
+`)
+
+	run := RunOpenconnect(Options{OpenconnectPath: fake, Gateway: "gw.example.com:10443"})
+	ctx, cancel := context.WithCancel(context.Background())
+	gotIP := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, "COOKIE", func(ip string) {
+			select {
+			case gotIP <- ip:
+			default:
+			}
+		})
+	}()
+	select {
+	case ip := <-gotIP:
+		if ip != "10.212.134.7" {
+			t.Errorf("connected IP = %q", ip)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("never reported Connected")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("run did not return after cancel")
+	}
+	if _, err := os.Stat(interrupted); err != nil {
+		t.Errorf("backend was not interrupted, so it could not restore routing: %v", err)
+	}
+}
+
+// A rejected cookie has to be reported as ErrAuthRejected even when openconnect
+// exits successfully, or the supervisor would retry forever with a dead cookie.
+func TestRunOpenconnectReportsRejectionOnCleanExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	fake := writeScript(t, t.TempDir(), "openconnect", `#!/bin/sh
+cat > /dev/null
+echo "Cookie was rejected by server; exiting."
+exit 0
+`)
+	run := RunOpenconnect(Options{OpenconnectPath: fake, Gateway: "gw.example.com:10443"})
+	err := run(context.Background(), "STALE", func(string) {
+		t.Error("must not report Connected on a rejected cookie")
+	})
+	if !errors.Is(err, ErrAuthRejected) {
+		t.Fatalf("err = %v, want ErrAuthRejected", err)
 	}
 }
 
