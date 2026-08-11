@@ -990,6 +990,74 @@ func TestStopArgv(t *testing.T) {
 	}
 }
 
+// ReapStale is the startup self-heal for an orphaned root openconnect. It cannot
+// be tested against a real root process, so these assert the wiring: the correct
+// helper "stop" argv, the fallback path, the direct-path no-op, and that a runner
+// error is surfaced for logging.
+func TestReapStale(t *testing.T) {
+	t.Run("privileged path invokes the helper stop with the correct argv", func(t *testing.T) {
+		var gotName string
+		var gotArgs []string
+		calls := 0
+		opts := Options{
+			HelperPath: "/opt/custom/openfortitray-tunnel",
+			UseSudo:    true,
+			reapRunner: func(ctx context.Context, name string, args []string) error {
+				calls++
+				gotName, gotArgs = name, args
+				return nil
+			},
+		}
+		if err := opts.ReapStale(context.Background()); err != nil {
+			t.Fatalf("ReapStale returned error: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("reap runner called %d times, want exactly 1", calls)
+		}
+		if gotName != "sudo" || !slices.Equal(gotArgs, []string{"-n", "/opt/custom/openfortitray-tunnel", "stop"}) {
+			t.Errorf("reap invoked %q %q, want sudo -n /opt/custom/openfortitray-tunnel stop", gotName, gotArgs)
+		}
+	})
+
+	t.Run("empty helper path falls back to the installed location", func(t *testing.T) {
+		var gotArgs []string
+		opts := Options{
+			UseSudo:    true,
+			reapRunner: func(ctx context.Context, name string, args []string) error { gotArgs = args; return nil },
+		}
+		if err := opts.ReapStale(context.Background()); err != nil {
+			t.Fatalf("ReapStale returned error: %v", err)
+		}
+		if !slices.Equal(gotArgs, []string{"-n", DefaultHelperPath, "stop"}) {
+			t.Errorf("reap argv = %q, want -n %s stop", gotArgs, DefaultHelperPath)
+		}
+	})
+
+	t.Run("direct path has no privileged helper, so reap is a no-op", func(t *testing.T) {
+		called := false
+		opts := Options{
+			OpenconnectPath: "openconnect", // UseSudo false → direct path
+			reapRunner:      func(ctx context.Context, name string, args []string) error { called = true; return nil },
+		}
+		if err := opts.ReapStale(context.Background()); err != nil {
+			t.Fatalf("ReapStale on the direct path returned error: %v", err)
+		}
+		if called {
+			t.Error("direct path (no helper) must not shell out to a stop command")
+		}
+	})
+
+	t.Run("a runner error is surfaced so startup can log it", func(t *testing.T) {
+		opts := Options{
+			UseSudo:    true,
+			reapRunner: func(ctx context.Context, name string, args []string) error { return errors.New("boom") },
+		}
+		if err := opts.ReapStale(context.Background()); err == nil {
+			t.Error("ReapStale must return the runner error (best-effort, but logged)")
+		}
+	})
+}
+
 // writeScript writes an executable shell script and returns its path.
 func writeScript(t *testing.T, dir, name, body string) string {
 	t.Helper()

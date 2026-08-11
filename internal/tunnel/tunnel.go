@@ -480,6 +480,9 @@ type Options struct {
 
 	// sudoPath overrides the sudo binary; tests use it to substitute a stub.
 	sudoPath string
+	// reapRunner overrides command execution in ReapStale; tests substitute a
+	// recorder. nil means run the command for real (execReap).
+	reapRunner func(ctx context.Context, name string, args []string) error
 }
 
 // Server-certificate modes, mirrored from config.ServerCertMode as plain strings
@@ -576,6 +579,38 @@ func (o Options) stopArgv() (string, []string, bool) {
 		return "", nil, false
 	}
 	return o.sudo(), []string{"-n", o.helperPath(), "stop"}, true
+}
+
+// ReapStale asks the privileged helper to tear down any tunnel a previous,
+// unclean exit left running. A hard crash — SIGKILL of the app, a panic, power
+// loss — skips the in-process teardown entirely, orphaning a root openconnect
+// that keeps the FortiGate session alive; and because the gateway allows one
+// session per user, every reconnect then fails "Cookie was rejected" in a loop
+// until the orphan is killed by hand. Calling this on startup, before a new
+// cookie is minted, clears that orphan and its gateway session so even a hard
+// crash self-heals on the next launch.
+//
+// It is best-effort and bounded by ctx: the helper's "stop" is idempotent and
+// exits 0 when there is nothing to reap, so the common (clean) startup returns
+// fast. On the direct path (Windows, where the app is elevated and there is no
+// privileged helper) there is nothing to reap through a helper, so it is a
+// no-op. Any error is returned for the caller to log, not to act on — startup
+// proceeds regardless.
+func (o Options) ReapStale(ctx context.Context) error {
+	name, args, viaHelper := o.stopArgv()
+	if !viaHelper {
+		return nil
+	}
+	run := o.reapRunner
+	if run == nil {
+		run = execReap
+	}
+	return run(ctx, name, args)
+}
+
+// execReap is the real command runner behind ReapStale.
+func execReap(ctx context.Context, name string, args []string) error {
+	return exec.CommandContext(ctx, name, args...).Run()
 }
 
 // helperStopAttempts is how many times teardown is asked for before giving up.

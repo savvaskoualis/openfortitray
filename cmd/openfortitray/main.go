@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -24,11 +26,20 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
+// supervisor is the slice of *tunnel.Supervisor the app drives. Naming it as an
+// interface lets the tests substitute a fake that records the teardown calls the
+// graceful-shutdown path makes.
+type supervisor interface {
+	Connect()
+	Disconnect()
+	Wait(ctx context.Context)
+}
+
 // app adapts the packages to tray.App; it holds no logic of its own.
 type app struct {
 	cfg     *config.Config
 	cfgDir  string
-	sup     *tunnel.Supervisor
+	sup     supervisor
 	events  chan tunnel.Event
 	logPath string
 
@@ -46,6 +57,11 @@ type app struct {
 	// drains events without calling fyne.Do — so no fyne.Do is ever queued
 	// against a UI that a.fyneApp.Quit() is about to destroy.
 	quitting atomic.Bool
+	// shutdownOnce makes the graceful teardown run exactly once, no matter how it
+	// is triggered. Both the tray's Quit item and the OS-signal handler route
+	// through app.shutdown, so a second trigger (a repeated SIGTERM, or a signal
+	// arriving just as the user clicks Quit) cannot start the teardown twice.
+	shutdownOnce sync.Once
 
 	// tp is the snapshot of the active profile (and machine-wide paths) the
 	// tunnel actually dials. Connect refreshes it from a.cfg on the UI goroutine
@@ -178,25 +194,81 @@ func (a *app) pump() {
 	}
 }
 
-// Quit is invoked from the tray's Quit item on the UI goroutine. It tears the
-// tunnel down before the process leaves, exactly as the old post-systray.Run
-// block did, but off the UI goroutine: sup.Wait can block for shutdownWait, and
-// blocking the UI goroutine would freeze the menu bar. Once the tunnel is down
-// it marshals a.fyneApp.Quit() back onto the UI goroutine (fyne's own signal
-// handler quits the same way), which unblocks a.fyneApp.Run() in main.
-func (a *app) Quit() {
-	a.quitting.Store(true)
-	go func() {
-		a.sup.Disconnect()
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
-		defer cancel()
-		a.sup.Wait(ctx)
-		if ctx.Err() != nil {
-			log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
-		}
-		log.Printf("openfortitray: exiting")
-		fyne.Do(a.fyneApp.Quit)
-	}()
+// Quit is invoked from the tray's Quit item on the UI goroutine. It routes to the
+// shared graceful shutdown, which quits the fyne app once the tunnel is down.
+func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
+
+// shutdown tears the tunnel down and then calls done to leave the process. It is
+// the one graceful-exit path: the tray's Quit item and the OS-signal handler both
+// route here, so a launchctl bootout / kill -TERM / Ctrl-C tears the tunnel down
+// through the root helper's "stop" — which CAN signal the root openconnect —
+// exactly as a menu Quit does, instead of orphaning it. Without this an abrupt
+// signal skipped the teardown entirely (the Fyne 2 review flagged this) and left
+// a root openconnect holding the one-per-user FortiGate session.
+//
+// It mirrors the old Quit routine's structure: sup.Wait can block for
+// shutdownWait, so the teardown runs on a worker goroutine rather than the UI
+// goroutine (blocking that would freeze the menu bar); quitting is set first so
+// the event pump stops touching a UI that is about to be destroyed; and the
+// teardown runs at most once (shutdownOnce). done differs by caller only in how
+// the process is left — the tray and signal paths both quit the fyne app, which
+// unblocks a.fyneApp.Run() in main.
+//
+// Residual limitation: a true SIGKILL (or power loss) of the APP cannot run any
+// in-process teardown, so this path never executes and the root openconnect is
+// orphaned. The recovery for that case is the startup self-heal
+// (selfHealThenConnect → tunnel.ReapStale), which reaps the orphan on the next
+// launch. The only complete fix would be an out-of-process watchdog — a launchd
+// KeepAlive/watchdog that reaps openconnect on app death — which is out of scope
+// here.
+func (a *app) shutdown(done func()) {
+	a.shutdownOnce.Do(func() {
+		a.quitting.Store(true)
+		go func() {
+			a.sup.Disconnect()
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+			defer cancel()
+			a.sup.Wait(ctx)
+			if ctx.Err() != nil {
+				log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
+			}
+			log.Printf("openfortitray: exiting")
+			done()
+		}()
+	})
+}
+
+// watchSignals routes SIGINT/SIGTERM/SIGHUP to the same graceful shutdown the
+// tray Quit uses, so `launchctl bootout` (SIGTERM from launchd stop), `kill
+// -TERM`, `pkill` and Ctrl-C all tear the tunnel down cleanly instead of leaving
+// a root openconnect the unprivileged parent cannot signal. It loops rather than
+// returning after the first signal so a second signal is observed too — though
+// shutdown is once-guarded, so the second is a no-op. quit is what leaves the
+// process (a.fyneApp.Quit in production).
+func (a *app) watchSignals(sigs <-chan os.Signal, quit func()) {
+	for s := range sigs {
+		log.Printf("openfortitray: received signal %s, tearing down", s)
+		a.shutdown(quit)
+	}
+}
+
+// selfHealThenConnect runs the startup sequence off the UI thread: it first reaps
+// any tunnel orphaned by a previous unclean exit (so a prior crash's root
+// openconnect and its FortiGate session are cleared BEFORE we mint a new cookie),
+// then, only if autostart is enabled, connects. The reap runs to completion first
+// — ordering matters, because minting a cookie while the old session is still held
+// is exactly what triggers the "Cookie was rejected" loop. reap is bounded by
+// startupReapWait and best-effort; a failure is logged, never fatal. connect is
+// marshalled onto the UI goroutine by the caller (a.Connect touches the UI).
+func (a *app) selfHealThenConnect(reap func(ctx context.Context) error, autostart bool, connect func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), startupReapWait)
+	defer cancel()
+	if err := reap(ctx); err != nil {
+		log.Printf("openfortitray: startup reap of a stale tunnel failed (best-effort): %v", err)
+	}
+	if autostart {
+		connect()
+	}
 }
 
 // SetAutostart toggles the login item and the saved preference together. If the
@@ -245,6 +317,13 @@ const authTimeout = 5 * time.Minute
 // the VPN with a root openconnect nobody can signal. The normal path returns in
 // well under a second.
 const shutdownWait = 30 * time.Second
+
+// startupReapWait bounds the best-effort reap of an orphaned tunnel at launch
+// (selfHealThenConnect → tunnel.ReapStale). The helper's "stop" waits up to a few
+// seconds for a live openconnect to exit and returns at once when there is
+// nothing to reap, so a clean start pays almost none of this; the cap only guards
+// against a wedged privileged call holding up connect-on-launch.
+const startupReapWait = 15 * time.Second
 
 func main() {
 	cfgDir, err := config.DefaultDir()
@@ -311,8 +390,10 @@ func main() {
 			HelperPath:      tp.helperPath,
 			UseSudo:         runtime.GOOS != "windows",
 			// Tunnel-shaping toggles from the active profile. They reach
-			// openconnect on the direct (Windows) path; the privileged helper
-			// path does not yet carry them (see tunnel.Options).
+			// openconnect on BOTH paths: the direct (Windows) path and the
+			// privileged helper path, which validates each flag against an exact
+			// allowlist before openconnect sees it (Task 24; see tunnel.Options
+			// and scripts/openfortitray-tunnel).
 			DTLS:           tp.prof.DTLS,
 			DualStack:      tp.prof.DualStack,
 			ServerCertMode: string(tp.prof.ServerCert.Mode),
@@ -365,14 +446,30 @@ func main() {
 	// render as soon as Run starts.
 	go a.pump()
 
-	if cfg.Autostart {
-		a.Connect() // launch happens at login, so connect right away
-	}
+	// Signal-driven exit. launchd's stop (SIGTERM), Ctrl-C (SIGINT), a hangup
+	// (SIGHUP) and a plain `pkill` all route to the SAME graceful shutdown the
+	// tray Quit uses, so the tunnel is torn down through the root helper's "stop"
+	// instead of the process leaving a root openconnect orphaned. buffered so a
+	// signal is never dropped before the handler is scheduled.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go a.watchSignals(sigs, func() { fyne.Do(a.fyneApp.Quit) })
 
-	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's
-	// Quit item drives only after the tunnel has been torn down (see app.Quit).
-	// A tray-only fyne app (no window ever shown) stays alive here and exits
-	// cleanly on Quit — verified against fyne v2.8's glfw run loop.
+	// Startup self-heal, then connect-on-launch — off the UI thread and in that
+	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a
+	// new cookie clears the stale FortiGate session that would otherwise reject
+	// the cookie in a loop. On the direct path (Windows) ReapStale is a no-op.
+	// The connect is marshalled back onto the UI goroutine (a.Connect touches the
+	// settings window when the active profile is unconfigured); it queues onto
+	// fyne's main-loop queue and runs as soon as Run starts.
+	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
+	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart, func() { fyne.Do(a.Connect) })
+
+	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's Quit
+	// item and the signal handler both drive only after the tunnel has been torn
+	// down (see app.shutdown). A tray-only fyne app (no window ever shown) stays
+	// alive here and exits cleanly on Quit — verified against fyne v2.8's glfw
+	// run loop.
 	a.fyneApp.Run()
 }
 
