@@ -4,7 +4,7 @@ import "testing"
 
 // A representative `scutil --dns` dump on a mac where Tailscale MagicDNS owns the
 // primary resolver (resolver #1, en0 → 100.100.100.100) while an openconnect VPN
-// tunnel (utun4) has pushed the corp DNS 10.10.0.4 for hyperio.private. The
+// tunnel (utun4) has pushed the corp DNS 192.0.2.53 for corp.example. The
 // discovery must ignore MagicDNS and pick the tunnel's resolver.
 const scutilTailscalePlusVPN = `DNS configuration
 
@@ -16,8 +16,8 @@ resolver #1
   reach    : 0x00020002 (Reachable,Directly Reachable Address)
 
 resolver #2
-  domain   : hyperio.private
-  nameserver[0] : 10.10.0.4
+  domain   : corp.example
+  nameserver[0] : 192.0.2.53
   if_index : 18 (utun4)
   flags    : Supplemental, Request A records
   reach    : 0x00000002 (Reachable)
@@ -32,7 +32,7 @@ resolver #1
   reach    : 0x00020002 (Reachable,Directly Reachable Address)
 
 resolver #2
-  nameserver[0] : 10.10.0.4
+  nameserver[0] : 192.0.2.53
   if_index : 18 (utun4)
   flags    : Scoped, Request A records
   reach    : 0x00000002 (Reachable)
@@ -40,24 +40,24 @@ resolver #2
 
 func TestPickVPNResolverTailscaleCoexistence(t *testing.T) {
 	blocks := parseResolvers(scutilTailscalePlusVPN)
-	// The domain hint is the decisive signal: hyperio.private is pushed by the
+	// The domain hint is the decisive signal: corp.example is pushed by the
 	// VPN, so resolver #2 in the first section wins even though Tailscale also
 	// owns a utun.
-	if got := pickVPNResolver(blocks, []string{"hyperio.private"}); got != "10.10.0.4" {
-		t.Errorf("with a matching hint, picked %q, want 10.10.0.4", got)
+	if got := pickVPNResolver(blocks, []string{"corp.example"}); got != "192.0.2.53" {
+		t.Errorf("with a matching hint, picked %q, want 192.0.2.53", got)
 	}
 	// With no hint the tunnel-scoped fallback must still skip MagicDNS (utun3)
 	// and land on the corp resolver.
-	if got := pickVPNResolver(blocks, nil); got != "10.10.0.4" {
-		t.Errorf("with no hint, picked %q, want 10.10.0.4 (MagicDNS must be skipped)", got)
+	if got := pickVPNResolver(blocks, nil); got != "192.0.2.53" {
+		t.Errorf("with no hint, picked %q, want 192.0.2.53 (MagicDNS must be skipped)", got)
 	}
 }
 
 func TestPickVPNResolverSubdomainHintMatchesPushedApex(t *testing.T) {
-	// The VPN pushes the apex "hyperio.private"; the profile lists a subdomain.
+	// The VPN pushes the apex "corp.example"; the profile lists a subdomain.
 	blocks := parseResolvers(scutilTailscalePlusVPN)
-	if got := pickVPNResolver(blocks, []string{"db.hyperio.private"}); got != "10.10.0.4" {
-		t.Errorf("subdomain hint picked %q, want 10.10.0.4", got)
+	if got := pickVPNResolver(blocks, []string{"db.corp.example"}); got != "192.0.2.53" {
+		t.Errorf("subdomain hint picked %q, want 192.0.2.53", got)
 	}
 }
 
@@ -95,8 +95,8 @@ func TestParseResolversFields(t *testing.T) {
 	if b := blocks[0]; b.iface != "en0" || b.nameserver != "100.100.100.100" {
 		t.Errorf("block 0 = %+v, want en0 / 100.100.100.100", b)
 	}
-	if b := blocks[1]; b.iface != "utun4" || b.nameserver != "10.10.0.4" ||
-		len(b.domains) != 1 || b.domains[0] != "hyperio.private" {
-		t.Errorf("block 1 = %+v, want utun4 / 10.10.0.4 / [hyperio.private]", b)
+	if b := blocks[1]; b.iface != "utun4" || b.nameserver != "192.0.2.53" ||
+		len(b.domains) != 1 || b.domains[0] != "corp.example" {
+		t.Errorf("block 1 = %+v, want utun4 / 192.0.2.53 / [corp.example]", b)
 	}
 }

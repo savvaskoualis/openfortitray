@@ -63,7 +63,7 @@ func TestSplitDNSSetOnConnectClearOnTeardown(t *testing.T) {
 		HelperPath:  "/opt/h",
 		UseSudo:     true,
 		SplitDNS:    []string{"corp.private", "svc.corp.private"},
-		discoverDNS: func(ctx context.Context, hint []string) (string, error) { return "10.10.0.4", nil },
+		discoverDNS: func(ctx context.Context, hint []string) (string, error) { return "192.0.2.53", nil },
 		dnsRunner:   rec.run,
 	}
 	inner := func(ctx context.Context, cookie string, connected func(string)) error {
@@ -78,7 +78,7 @@ func TestSplitDNSSetOnConnectClearOnTeardown(t *testing.T) {
 	go func() { done <- run(ctx, "COOKIE", func(string) {}) }()
 
 	set := waitForCall(t, rec, "dns-set", 3*time.Second)
-	wantSet := []string{"sudo", "-n", "/opt/h", "dns-set", "10.10.0.4", "corp.private", "svc.corp.private"}
+	wantSet := []string{"sudo", "-n", "/opt/h", "dns-set", "192.0.2.53", "corp.private", "svc.corp.private"}
 	if !slices.Equal(set, wantSet) {
 		t.Errorf("dns-set argv = %v, want %v", set, wantSet)
 	}
@@ -207,8 +207,8 @@ func TestSplitDNSDisabledCases(t *testing.T) {
 
 func TestDNSArgv(t *testing.T) {
 	o := Options{HelperPath: "/opt/custom/h", UseSudo: true, SplitDNS: []string{"a.b", "c.d"}}
-	name, args := o.dnsSetArgv("10.10.0.4")
-	if name != "sudo" || !slices.Equal(args, []string{"-n", "/opt/custom/h", "dns-set", "10.10.0.4", "a.b", "c.d"}) {
+	name, args := o.dnsSetArgv("192.0.2.53")
+	if name != "sudo" || !slices.Equal(args, []string{"-n", "/opt/custom/h", "dns-set", "192.0.2.53", "a.b", "c.d"}) {
 		t.Errorf("dnsSetArgv = %q %q", name, args)
 	}
 	name, args = o.dnsClearArgv()

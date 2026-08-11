@@ -343,11 +343,11 @@ func TestHelperDNSSetWritesResolverFileWithMarker(t *testing.T) {
 	resolverDir := t.TempDir()
 	helper := dnsHelper(t, resolverDir)
 
-	out, code := runDNSHelper(t, helper, "dns-set", "10.10.0.4", "hyperio.private", "svc.corp.internal")
+	out, code := runDNSHelper(t, helper, "dns-set", "192.0.2.53", "corp.example", "svc.corp.internal")
 	if code != 0 {
 		t.Fatalf("dns-set exited %d (output: %q)", code, out)
 	}
-	for _, domain := range []string{"hyperio.private", "svc.corp.internal"} {
+	for _, domain := range []string{"corp.example", "svc.corp.internal"} {
 		f := filepath.Join(resolverDir, domain)
 		info, err := os.Stat(f)
 		if err != nil {
@@ -364,7 +364,7 @@ func TestHelperDNSSetWritesResolverFileWithMarker(t *testing.T) {
 		if !strings.Contains(got, "# openfortitray-managed") {
 			t.Errorf("%s missing the managed marker; got %q", f, got)
 		}
-		if !strings.Contains(got, "nameserver 10.10.0.4") {
+		if !strings.Contains(got, "nameserver 192.0.2.53") {
 			t.Errorf("%s missing the nameserver line; got %q", f, got)
 		}
 	}
@@ -387,14 +387,14 @@ func TestHelperDNSSetRejectsInjection(t *testing.T) {
 		{"ip is a flag", []string{"-nameserver", "corp.private"}, "must not start with '-'"},
 		{"ip has metacharacter", []string{"10.0.0.1;id", "corp.private"}, "invalid characters"},
 		{"ip is a path", []string{"/etc/passwd", "corp.private"}, "invalid characters"},
-		{"domain with slash (path traversal)", []string{"10.10.0.4", "../../etc/cron.d/x"}, "invalid characters"},
-		{"domain with a bare slash", []string{"10.10.0.4", "a/b"}, "invalid characters"},
-		{"domain with a shell metacharacter", []string{"10.10.0.4", "a;rm -rf"}, "invalid characters"},
-		{"domain with a space", []string{"10.10.0.4", "a b"}, "invalid characters"},
-		{"domain starting with a dash", []string{"10.10.0.4", "-x"}, "must not start with '-'"},
-		{"domain is dotdot", []string{"10.10.0.4", ".."}, "must not be '.' or '..'"},
-		{"empty domain", []string{"10.10.0.4", ""}, "must not be empty"},
-		{"no domain at all", []string{"10.10.0.4"}, "usage"},
+		{"domain with slash (path traversal)", []string{"192.0.2.53", "../../etc/cron.d/x"}, "invalid characters"},
+		{"domain with a bare slash", []string{"192.0.2.53", "a/b"}, "invalid characters"},
+		{"domain with a shell metacharacter", []string{"192.0.2.53", "a;rm -rf"}, "invalid characters"},
+		{"domain with a space", []string{"192.0.2.53", "a b"}, "invalid characters"},
+		{"domain starting with a dash", []string{"192.0.2.53", "-x"}, "must not start with '-'"},
+		{"domain is dotdot", []string{"192.0.2.53", ".."}, "must not be '.' or '..'"},
+		{"empty domain", []string{"192.0.2.53", ""}, "must not be empty"},
+		{"no domain at all", []string{"192.0.2.53"}, "usage"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,7 +428,7 @@ func TestHelperDNSClearRemovesOnlyMarkedFiles(t *testing.T) {
 	helper := dnsHelper(t, resolverDir)
 
 	// One of ours (created via dns-set), and one foreign file with no marker.
-	if _, code := runDNSHelper(t, helper, "dns-set", "10.10.0.4", "hyperio.private"); code != 0 {
+	if _, code := runDNSHelper(t, helper, "dns-set", "192.0.2.53", "corp.example"); code != 0 {
 		t.Fatal("setup dns-set failed")
 	}
 	foreign := filepath.Join(resolverDir, "database.windows.net")
@@ -437,11 +437,11 @@ func TestHelperDNSClearRemovesOnlyMarkedFiles(t *testing.T) {
 	}
 
 	// Ask to clear both domains: ours must go, the foreign one must remain.
-	out, code := runDNSHelper(t, helper, "dns-clear", "hyperio.private", "database.windows.net")
+	out, code := runDNSHelper(t, helper, "dns-clear", "corp.example", "database.windows.net")
 	if code != 0 {
 		t.Fatalf("dns-clear exited %d (output: %q)", code, out)
 	}
-	if _, err := os.Stat(filepath.Join(resolverDir, "hyperio.private")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(resolverDir, "corp.example")); !os.IsNotExist(err) {
 		t.Errorf("dns-clear did not remove our own resolver file (err=%v)", err)
 	}
 	if _, err := os.Stat(foreign); err != nil {

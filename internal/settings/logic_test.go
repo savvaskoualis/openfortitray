@@ -17,7 +17,7 @@ func TestValidateHost(t *testing.T) {
 	}{
 		{"empty is allowed (unconfigured profile is savable)", "", false},
 		{"a bare host is fine", "vpn.example.com", false},
-		{"dotted and hyphenated", "sec-hub.hyperio.cloud", false},
+		{"dotted and hyphenated", "vpn-gw.example.com", false},
 		{"a scheme is rejected", "https://vpn.example.com", true},
 		{"a port is rejected", "vpn.example.com:10443", true},
 		{"a path is rejected", "vpn.example.com/vpn", true},
