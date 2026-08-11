@@ -445,6 +445,50 @@ func TestDisconnectThenConnectRestarts(t *testing.T) {
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
 
+// A backend that ignores every teardown mechanism (a root openconnect the app
+// cannot signal, with the helper unreachable) must not leave the next Connect
+// waiting forever: without a bound the tray sits in Connecting with no
+// explanation and no way out.
+func TestWedgedPreviousBackendFailsConnectInsteadOfHanging(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	wedged := make(chan struct{}) // never closed: the first backend never exits
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	var runs atomic.Int32
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		runs.Add(1)
+		<-wedged
+		return nil
+	}
+	s := New(auth, run, events)
+	s.prevWait = 150 * time.Millisecond
+	s.Connect()
+	c.waitFor(t, Connecting, 2*time.Second)
+
+	s.Disconnect() // cancels the context; the backend ignores it
+	s.Connect()    // must give up on the wedged predecessor, not block
+
+	c.waitFor(t, Error, 2*time.Second)
+	for _, e := range c.snapshot() {
+		if e.State == Error && !strings.Contains(e.Detail, "restart the app") {
+			t.Errorf("Error detail = %q, want actionable advice", e.Detail)
+		}
+	}
+	// Crucially it must not have started a second backend: two openconnects
+	// would fight over the routing table.
+	if n := runs.Load(); n != 1 {
+		t.Errorf("runFn called %d times, want 1: no second backend may start while the first is wedged", n)
+	}
+	// The terminal Error must not be papered over by a trailing Disconnected.
+	last := c.snapshot()
+	if e := last[len(last)-1]; e.State != Error {
+		t.Errorf("last event = %+v, want the Error to stay terminal", e)
+	}
+	close(wedged)
+}
+
 // A blocked events channel must never stall the supervisor.
 func TestEmitDoesNotBlockOnFullChannel(t *testing.T) {
 	events := make(chan Event) // unbuffered, nobody reading

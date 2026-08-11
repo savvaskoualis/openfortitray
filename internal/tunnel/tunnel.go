@@ -71,6 +71,7 @@ type Supervisor struct {
 	backoffBase time.Duration // exposed for tests
 	backoffMax  time.Duration
 	minHealthy  time.Duration // time connected before a cookie counts as proven
+	prevWait    time.Duration // cap on waiting for the previous loop to tear down
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -88,6 +89,9 @@ func New(authFn func(ctx context.Context) (string, error),
 		backoffBase: 15 * time.Second,
 		backoffMax:  2 * time.Minute,
 		minHealthy:  30 * time.Second,
+		// Generous enough to cover the runner's own teardown budget (a helper
+		// stop attempt, one retry, then the WaitDelay backstop) and no more.
+		prevWait: 45 * time.Second,
 	}
 }
 
@@ -173,10 +177,10 @@ const maxImmediateReauths = 1
 
 func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struct{}) {
 	defer close(done) // runs last: the next loop waits for this
-	authFailed := false
+	emittedError := false
 	defer func() {
-		// Error is the terminal event when login failed; don't overwrite it.
-		if !authFailed {
+		// Error is the terminal event; don't overwrite it with Disconnected.
+		if !emittedError {
 			s.emit(gen, Disconnected, "")
 		}
 	}()
@@ -184,10 +188,25 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 
 	// Never run two backends at once: wait for the previous loop (and its
 	// openconnect process) to be fully gone before touching the tunnel.
+	//
+	// Bounded, because that wait depends on a root process we may be unable to
+	// signal: if the helper is unreachable and openconnect ignores its WaitDelay
+	// kill, the previous loop never finishes and an unbounded wait would leave
+	// the tray silently stuck in Connecting with no way out but a restart.
+	// Starting a second openconnect anyway would have the two fight over the
+	// routing table, so this Connect is abandoned with a message that says what
+	// to do instead.
 	if prev != nil {
+		timeout := time.NewTimer(s.prevWait)
+		defer timeout.Stop()
 		select {
 		case <-prev:
 		case <-ctx.Done():
+			return
+		case <-timeout.C:
+			emittedError = true
+			s.emit(gen, Error, "previous tunnel is still shutting down after "+
+				s.prevWait.String()+"; restart the app (the VPN may still be up)")
 			return
 		}
 	}
@@ -205,7 +224,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			c, err := s.authFn(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
-					authFailed = true
+					emittedError = true
 					s.emit(gen, Error, "login failed: "+err.Error())
 				}
 				return
@@ -327,14 +346,22 @@ func isAuthRejected(output string) bool {
 // DefaultHelperPath is where scripts/install.sh puts the privileged helper.
 const DefaultHelperPath = "/usr/local/libexec/hyp-vpn-tunnel"
 
+// helperPIDFile mirrors PIDFILE in scripts/hyp-vpn-tunnel. Nothing in this
+// package reads it — the helper owns it, because only root may write there — but
+// the tests assert the helper does not create it for a rejected gateway.
+const helperPIDFile = "/var/run/hyp-vpn-openconnect.pid"
+
 const (
-	// helperStopTimeout bounds the privileged teardown call. The helper waits up
+	// helperStopTimeout bounds one privileged teardown call. The helper waits up
 	// to 6s for openconnect to exit cleanly, so allow a little more.
-	helperStopTimeout = 10 * time.Second
-	// helperWaitDelay must exceed helperStopTimeout: killing our sudo child is a
-	// last resort that leaves the root openconnect (and its routes) behind, so
-	// the helper gets its full chance first.
-	helperWaitDelay = 12 * time.Second
+	helperStopTimeout = 8 * time.Second
+	// helperWaitDelay must exceed every stop attempt put together
+	// (helperStopAttempts * helperStopTimeout). Go starts this timer when the
+	// context is cancelled, not when Cancel returns, so a shorter delay would
+	// kill our sudo child while the retry was still in flight — the exact
+	// outcome the retry exists to avoid, since it leaves the root openconnect
+	// and its routes behind.
+	helperWaitDelay = 20 * time.Second
 	// signalWaitDelay backstops the direct path, where we can signal the
 	// process ourselves.
 	signalWaitDelay = 10 * time.Second
@@ -399,24 +426,36 @@ func (o Options) stopArgv() (string, []string, bool) {
 	return o.sudo(), []string{"-n", o.helperPath(), "stop"}, true
 }
 
+// helperStopAttempts is how many times teardown is asked for before giving up.
+// Two, because the failure this retries is worth one more try: the first stop can
+// lose a race with a just-started openconnect that has not written its pidfile
+// yet, and the cost of not tearing the tunnel down is a machine left on the VPN
+// with no way to bring it down short of a reboot.
+const helperStopAttempts = 2
+
 // runHelperStop asks the privileged helper to interrupt openconnect and waits
 // for it to finish. It runs on its own timeout because the caller's context is
 // already cancelled by the time Cancel is invoked.
 //
-// If the helper cannot be reached (not installed, sudoers rule missing) there is
-// no way to signal the root process, so we kill our sudo child to avoid hanging
-// Wait and return a loud error: the tunnel may still be up, and that has to
-// reach the log.
+// If the helper cannot be reached at all (not installed, sudoers rule missing)
+// there is no way to signal the root process, so we kill our sudo child to avoid
+// hanging Wait and return a loud error: the tunnel may still be up, and that has
+// to reach the log.
 func runHelperStop(cmd *exec.Cmd, name string, args []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), helperStopTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
-	if err == nil {
-		return nil
+	var err error
+	var out []byte
+	for attempt := 1; attempt <= helperStopAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), helperStopTimeout)
+		out, err = exec.CommandContext(ctx, name, args...).CombinedOutput()
+		cancel()
+		if err == nil {
+			return nil
+		}
 	}
 	killErr := cmd.Process.Kill()
-	return fmt.Errorf("tunnel teardown via %s failed: %w: %s (killed sudo: %v); "+
-		"the tunnel may still be up", name, err, strings.TrimSpace(string(out)), killErr)
+	return fmt.Errorf("tunnel teardown via %s failed after %d attempts: %w: %s "+
+		"(killed sudo: %v); the tunnel may still be up",
+		name, helperStopAttempts, err, strings.TrimSpace(string(out)), killErr)
 }
 
 // RunOpenconnect returns a runFn that runs openconnect --protocol=fortinet,

@@ -72,8 +72,11 @@ func setLoginItem(on bool) error {
 const authTimeout = 5 * time.Minute
 
 // shutdownWait caps how long we wait for the backend to tear the tunnel down on
-// quit; it has to cover the runner's 12s WaitDelay backstop.
-const shutdownWait = 15 * time.Second
+// quit. It has to cover the runner's 20s WaitDelay backstop, which in turn covers
+// two privileged-helper stop attempts: quitting a few seconds slower is a better
+// trade than quitting fast and leaving the machine on the VPN with a root
+// openconnect nobody can signal. The normal path returns in well under a second.
+const shutdownWait = 25 * time.Second
 
 func main() {
 	cfgDir, err := config.DefaultDir()

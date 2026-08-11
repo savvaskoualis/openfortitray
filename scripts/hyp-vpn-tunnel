@@ -18,15 +18,46 @@
 #     subcommands below, with the gateway argument validated before it is handed
 #     to openconnect.
 #
+# THREAT MODEL — read before widening anything here.
+#
+#   Argument injection: blocked on both platforms. The gateway is validated
+#   against a strict host:port pattern before it reaches openconnect, so a local
+#   caller cannot smuggle --script=/--csd-wrapper= (which openconnect would run
+#   as root) through the NOPASSWD rule.
+#
+#   Binary tampering: blocked on Linux, only WARNED ABOUT on macOS. The
+#   openconnect path is baked in at install time rather than resolved through
+#   PATH, and checked at run time, because a passwordless-root helper that
+#   resolves its payload through a writable directory is a root exploit, not a
+#   helper. On Linux the installer refuses to proceed unless the binary and every
+#   ancestor directory are root-owned and not group/other-writable, so this
+#   boundary holds. On macOS, Homebrew's prefix (/opt/homebrew, /usr/local) is
+#   owned by the installing user *by design*: anyone who can write there could
+#   replace openconnect and gain root through this rule. We warn loudly and
+#   continue, because on a single-user mac that user is already an admin who can
+#   run sudo directly, so the helper grants them nothing new. This is a
+#   documented limit of the design, not a property we claim to enforce. On a
+#   multi-user mac, install openconnect somewhere root-owned and point the
+#   installer at it.
+#
 # Usage (as invoked by the app via `sudo -n`):
 #   hyp-vpn-tunnel start <host:port>   # exec openconnect, cookie on stdin
 #   hyp-vpn-tunnel stop                # SIGINT the running openconnect
 set -eu
 
-# Fixed PATH: the openconnect location must never be influenced by the caller's
-# environment, or the scoped sudoers rule would buy us nothing.
-PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# Fixed PATH for the coreutils this script itself calls (cat, ps, kill, rm,
+# sleep, find). System directories only: the caller's environment must never
+# influence what runs as root, and package-manager prefixes are deliberately
+# absent — openconnect is not resolved through PATH at all (see OPENCONNECT).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
+
+# OPENCONNECT is substituted with an absolute path by scripts/install.sh when it
+# installs this file. The repo copy keeps the placeholder and refuses to run:
+# resolving openconnect at run time (command -v, or a PATH containing a
+# user-writable Homebrew prefix) would turn the NOPASSWD rule into passwordless
+# root code execution for anyone who can write to that directory.
+OPENCONNECT='@OPENCONNECT@'
 
 PIDFILE=/var/run/hyp-vpn-openconnect.pid
 # Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
@@ -97,10 +128,42 @@ terminate_running() {
 	rm -f "$PIDFILE"
 }
 
+# resolve_openconnect echoes the baked-in openconnect path after checking that it
+# is still safe to execute as root. See the threat model at the top: on Linux a
+# tampered-with binary is fatal, on macOS it is a warning because the Homebrew
+# prefix is user-owned by design.
+resolve_openconnect() {
+	case "$OPENCONNECT" in
+	'@OPENCONNECT@' | '')
+		die "not installed: run scripts/install.sh, which bakes in the openconnect path" ;;
+	/*) ;;
+	*) die "openconnect path must be absolute, got '$OPENCONNECT'" ;;
+	esac
+	[ -x "$OPENCONNECT" ] || die "$OPENCONNECT is missing or not executable"
+
+	# find, not stat: the -perm/-user predicates below behave identically on BSD
+	# and GNU find, whereas stat's format flags do not.
+	unsafe=''
+	if [ -n "$(find "$OPENCONNECT" -maxdepth 0 ! -user root -print 2>/dev/null)" ]; then
+		unsafe="not owned by root"
+	elif [ -n "$(find "$OPENCONNECT" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+		unsafe="writable by group or other"
+	fi
+	if [ -n "$unsafe" ]; then
+		if [ "$(uname -s)" = Darwin ]; then
+			echo "hyp-vpn-tunnel: WARNING: $OPENCONNECT is $unsafe;" \
+				"anyone who can write it gains root through this helper" >&2
+		else
+			die "refusing to run as root: $OPENCONNECT is $unsafe"
+		fi
+	fi
+	echo "$OPENCONNECT"
+}
+
 cmd_start() {
 	[ $# -eq 1 ] || die "usage: hyp-vpn-tunnel start <host:port>"
 	validate_gateway "$1"
-	oc=$(command -v openconnect) || die "openconnect not found in $PATH"
+	oc=$(resolve_openconnect)
 
 	# Adopt-and-replace: if a previous app instance died without stopping its
 	# tunnel, that root openconnect is orphaned and unreachable from the tray.
