@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/savvaskoualis/openfortitray/internal/dns"
 )
 
 // State is the tunnel lifecycle state reported to the UI.
@@ -478,11 +481,27 @@ type Options struct {
 	// ServerCertPin is the fingerprint passed to --servercert when pinning.
 	ServerCertPin string
 
+	// SplitDNS lists the domains whose lookups must go to the VPN-pushed DNS via
+	// macOS per-domain scoped resolvers (Profile.SplitDNS). When non-empty on the
+	// privileged (sudo helper) path, the discovered DNS is installed with the
+	// helper's "dns-set" once the tunnel is up and removed with "dns-clear" on
+	// teardown — this is what makes corp names resolve while a global override
+	// (Tailscale MagicDNS) owns the primary resolver. Empty disables it.
+	// cmd/openfortitray only populates this on macOS; Linux scoped DNS is not
+	// automated yet (TODO(linux-splitdns) in internal/dns and main.go).
+	SplitDNS []string
+
 	// sudoPath overrides the sudo binary; tests use it to substitute a stub.
 	sudoPath string
 	// reapRunner overrides command execution in ReapStale; tests substitute a
 	// recorder. nil means run the command for real (execReap).
 	reapRunner func(ctx context.Context, name string, args []string) error
+	// discoverDNS discovers the VPN-pushed DNS server once the tunnel is up. nil
+	// uses the platform default (dns.Discover). Tests inject a stub.
+	discoverDNS func(ctx context.Context, hintDomains []string) (string, error)
+	// dnsRunner runs the helper's dns-set/dns-clear (sudo -n helper ...). nil runs
+	// the command for real. Tests substitute a recorder.
+	dnsRunner func(ctx context.Context, name string, args []string) error
 }
 
 // Server-certificate modes, mirrored from config.ServerCertMode as plain strings
@@ -648,10 +667,149 @@ func runHelperStop(cmd *exec.Cmd, name string, args []string) error {
 		name, helperStopAttempts, err, strings.TrimSpace(string(out)), killErr)
 }
 
-// RunOpenconnect returns a runFn that runs openconnect --protocol=fortinet,
-// directly or through the privileged helper (see Options).
-func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, connected func(ip string)) error {
+// Split-DNS timing. Kept as vars so tests can shrink the discovery wait.
+var (
+	// dnsDiscoverAttempts / dnsDiscoverInterval bound the wait for openconnect's
+	// vpnc-script to install the pushed DNS after the "Configured as" line: the
+	// two happen close together but not simultaneously, so discovery is retried.
+	dnsDiscoverAttempts = 10
+	dnsDiscoverInterval = 500 * time.Millisecond
+)
+
+const (
+	// dnsSetTimeout / dnsClearTimeout bound a single privileged dns-set/dns-clear
+	// helper call. dns-clear runs on teardown, where the run's own context is
+	// already cancelled, so it uses a fresh bounded context of its own.
+	dnsSetTimeout   = 10 * time.Second
+	dnsClearTimeout = 8 * time.Second
+)
+
+// splitDNSEnabled reports whether scoped-resolver handling should run: only on
+// the privileged (sudo helper) path — the unprivileged app must never write
+// /etc/resolver itself — and only when the profile actually lists domains.
+func (o Options) splitDNSEnabled() bool { return o.UseSudo && len(o.SplitDNS) > 0 }
+
+// dnsSetArgv is the privileged command that installs the scoped resolvers:
+// `sudo -n <helper> dns-set <dns-ip> <domain>...`. The helper validates the IP
+// and every domain before touching /etc/resolver, so threading them through sudo
+// widens nothing (the sudoers rule matches the helper path, not its argv).
+func (o Options) dnsSetArgv(dnsIP string) (string, []string) {
+	args := append([]string{"-n", o.helperPath(), "dns-set", dnsIP}, o.SplitDNS...)
+	return o.sudo(), args
+}
+
+// dnsClearArgv is the privileged command that removes OUR scoped resolvers:
+// `sudo -n <helper> dns-clear <domain>...`. The helper only removes files it
+// stamped, so a pre-existing /etc/resolver entry survives.
+func (o Options) dnsClearArgv() (string, []string) {
+	args := append([]string{"-n", o.helperPath(), "dns-clear"}, o.SplitDNS...)
+	return o.sudo(), args
+}
+
+// runDNS executes a dns-set/dns-clear command, capturing output for the log.
+func (o Options) runDNS(ctx context.Context, name string, args []string) error {
+	if o.dnsRunner != nil {
+		return o.dnsRunner(ctx, name, args)
+	}
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// installSplitDNS discovers the VPN-pushed DNS server (retrying while
+// vpnc-script catches up) and points the profile's split-DNS domains at it via
+// the helper's dns-set. Best-effort: every failure is logged and swallowed —
+// split-DNS is a coexistence convenience, not something whose failure should
+// take down a working tunnel. Returns when ctx is cancelled (teardown).
+func (o Options) installSplitDNS(ctx context.Context) {
+	discover := o.discoverDNS
+	if discover == nil {
+		discover = dns.Discover
+	}
+	var dnsIP string
+	for attempt := 0; attempt < dnsDiscoverAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if ip, err := discover(ctx, o.SplitDNS); err == nil && ip != "" {
+			dnsIP = ip
+			break
+		}
+		select {
+		case <-time.After(dnsDiscoverInterval):
+		case <-ctx.Done():
+			return
+		}
+	}
+	if dnsIP == "" {
+		log.Printf("tunnel: split-DNS: could not discover the VPN DNS server; %v left unscoped", o.SplitDNS)
+		return
+	}
+	if ctx.Err() != nil {
+		return // disconnected while discovering; don't install what clear won't be told about
+	}
+	name, args := o.dnsSetArgv(dnsIP)
+	// A fresh context, not the run's: a set that has been decided on should
+	// complete atomically. Teardown is handled by clearSplitDNS afterwards.
+	cctx, cancel := context.WithTimeout(context.Background(), dnsSetTimeout)
+	defer cancel()
+	if err := o.runDNS(cctx, name, args); err != nil {
+		log.Printf("tunnel: split-DNS: dns-set failed (best-effort): %v", err)
+		return
+	}
+	log.Printf("tunnel: split-DNS: scoped %v to %s", o.SplitDNS, dnsIP)
+}
+
+// clearSplitDNS removes the scoped resolvers via the helper's dns-clear. It runs
+// on teardown with a fresh bounded context, since the run's context is already
+// cancelled by then. Best-effort and idempotent (dns-clear exits 0 with nothing
+// to remove).
+func (o Options) clearSplitDNS() {
+	name, args := o.dnsClearArgv()
+	ctx, cancel := context.WithTimeout(context.Background(), dnsClearTimeout)
+	defer cancel()
+	if err := o.runDNS(ctx, name, args); err != nil {
+		log.Printf("tunnel: split-DNS: dns-clear failed (best-effort): %v", err)
+	}
+}
+
+// withSplitDNS wraps a runFn so scoped resolvers are installed once the tunnel
+// reports up and removed when the run ends. When split-DNS is off it returns the
+// runFn unchanged, so the core path is untouched. The install runs on its own
+// goroutine (off the output-scan loop), and the wrapper waits for it before
+// clearing so a set can never race past the clear and orphan a resolver file.
+func (o Options) withSplitDNS(inner func(ctx context.Context, cookie string, connected func(ip string)) error) func(ctx context.Context, cookie string, connected func(ip string)) error {
+	if !o.splitDNSEnabled() {
+		return inner
+	}
 	return func(ctx context.Context, cookie string, connected func(ip string)) error {
+		var once sync.Once
+		var wg sync.WaitGroup
+		wrapped := func(ip string) {
+			connected(ip) // report the tunnel up first; DNS is a follow-on
+			once.Do(func() {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					o.installSplitDNS(ctx)
+				}()
+			})
+		}
+		err := inner(ctx, cookie, wrapped)
+		wg.Wait() // let an in-flight install finish before we remove
+		o.clearSplitDNS()
+		return err
+	}
+}
+
+// RunOpenconnect returns a runFn that runs openconnect --protocol=fortinet,
+// directly or through the privileged helper (see Options). On the privileged
+// path with a non-empty SplitDNS it also installs and removes macOS scoped
+// resolvers around the connection (see withSplitDNS).
+func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, connected func(ip string)) error {
+	base := func(ctx context.Context, cookie string, connected func(ip string)) error {
 		name, args := opts.startArgv()
 		cmd := exec.CommandContext(ctx, name, args...)
 		if stopName, stopArgs, viaHelper := opts.stopArgv(); viaHelper {
@@ -774,4 +932,5 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		}
 		return nil
 	}
+	return opts.withSplitDNS(base)
 }

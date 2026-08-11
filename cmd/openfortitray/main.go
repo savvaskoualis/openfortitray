@@ -384,11 +384,24 @@ func main() {
 	// already elevated and runs openconnect itself.
 	runFn := loggedRun(func(ctx context.Context, cookie string, connected func(ip string)) error {
 		tp := a.snapshot()
+		// Scoped resolvers (/etc/resolver/<domain>) are a macOS mechanism. On any
+		// other OS leave SplitDNS empty so the tunnel installs nothing rather than
+		// writing files that do nothing.
+		//
+		// TODO(linux-splitdns): Linux split-DNS is a systemd-resolved job
+		// (resolvectl domain <iface> ~<domain> + a per-link DNS keyed off the
+		// tunnel interface), not /etc/resolver. It is not automated yet; see
+		// internal/dns.Discover's non-darwin stub.
+		splitDNS := tp.prof.SplitDNS
+		if runtime.GOOS != "darwin" {
+			splitDNS = nil
+		}
 		run := tunnel.RunOpenconnect(tunnel.Options{
 			Gateway:         fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port),
 			OpenconnectPath: tp.openconnectPath,
 			HelperPath:      tp.helperPath,
 			UseSudo:         runtime.GOOS != "windows",
+			SplitDNS:        splitDNS,
 			// Tunnel-shaping toggles from the active profile. They reach
 			// openconnect on BOTH paths: the direct (Windows) path and the
 			// privileged helper path, which validates each flag against an exact
