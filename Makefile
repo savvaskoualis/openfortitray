@@ -8,7 +8,7 @@ PKG  := ./cmd/openfortitray
 APP        := OpenFortiTray
 APP_BUNDLE := $(DIST)/$(APP).app
 APP_PLIST  := scripts/Info.plist
-ICON_SRC   := internal/tray/assets/icon_gray.png
+ICON_SRC   := assets/icons/gate_dock.svg
 
 .PHONY: all build test release clean install app
 
@@ -50,18 +50,18 @@ endif
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	cp $(BIN) $(APP_BUNDLE)/Contents/MacOS/$(BIN)
 	cp $(APP_PLIST) $(APP_BUNDLE)/Contents/Info.plist
-	@if command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then \
+	@if command -v iconutil >/dev/null 2>&1 && command -v rsvg-convert >/dev/null 2>&1; then \
 		set -e; \
 		work="$$(mktemp -d)"; iconset="$$work/AppIcon.iconset"; mkdir -p "$$iconset"; \
 		for sz in 16 32 128 256 512; do \
-			sips -z $$sz $$sz "$(ICON_SRC)" --out "$$iconset/icon_$${sz}x$${sz}.png" >/dev/null; \
-			sips -z $$((sz*2)) $$((sz*2)) "$(ICON_SRC)" --out "$$iconset/icon_$${sz}x$${sz}@2x.png" >/dev/null; \
+			rsvg-convert -w $$sz         -h $$sz         "$(ICON_SRC)" -o "$$iconset/icon_$${sz}x$${sz}.png"; \
+			rsvg-convert -w $$((sz*2))   -h $$((sz*2))   "$(ICON_SRC)" -o "$$iconset/icon_$${sz}x$${sz}@2x.png"; \
 		done; \
 		iconutil -c icns "$$iconset" -o "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"; \
 		rm -rf "$$work"; \
 		echo "make app: generated Contents/Resources/AppIcon.icns from $(ICON_SRC)"; \
 	else \
-		echo "make app: iconutil/sips not found — skipping .icns (not a blocker)"; \
+		echo "make app: iconutil/rsvg-convert not found — skipping .icns (not a blocker)"; \
 	fi
 	@echo "make app: assembled $(APP_BUNDLE)"
 
