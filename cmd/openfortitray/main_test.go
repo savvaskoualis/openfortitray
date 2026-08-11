@@ -29,7 +29,10 @@ func newTestApp(t *testing.T, gateway, cfgDir string) (*app, chan struct{}) {
 	}
 	events := make(chan tunnel.Event, 16)
 	a := &app{
-		cfg:    &config.Config{Gateway: gateway, Port: 10443},
+		cfg: &config.Config{
+			ActiveProfile: "Default",
+			Profiles:      []config.Profile{{Name: "Default", Gateway: gateway, Port: 10443}},
+		},
 		cfgDir: cfgDir,
 		sup:    tunnel.New(authFn, runFn, events),
 		events: events,

@@ -40,7 +40,7 @@ type app struct {
 // truncated mid-path, which is worse than no path at all. The log line below
 // carries the absolute path for anyone who needs it.
 func (a *app) Connect() {
-	if a.cfg.Gateway == "" {
+	if a.cfg.Active().Gateway == "" {
 		log.Printf("connect refused: gateway not set — edit %s",
 			filepath.Join(a.cfgDir, "config.json"))
 		a.emit(tunnel.Event{State: tunnel.Error, Detail: "gateway not set — see config.json"})
@@ -127,22 +127,23 @@ func main() {
 		log.SetOutput(f)
 		defer f.Close()
 	}
-	if cfg.Gateway == "" {
+	prof := cfg.Active()
+	if prof.Gateway == "" {
 		log.Printf("openfortitray: starting, no gateway configured in %s",
 			filepath.Join(cfgDir, "config.json"))
 	} else {
-		log.Printf("openfortitray: starting, gateway %s", cfg.GatewayURL())
+		log.Printf("openfortitray: starting, gateway %s", prof.GatewayURL())
 	}
 
 	authr := &auth.Authenticator{
-		GatewayURL: cfg.GatewayURL(),
-		ListenPort: cfg.SAMLPort,
+		GatewayURL: prof.GatewayURL(),
+		ListenPort: prof.SAMLPort,
 		Client:     &http.Client{Timeout: 30 * time.Second},
 	}
 	authFn := tunnel.AuthFunc(func(ctx context.Context) (string, error) {
 		ctx, cancel := context.WithTimeout(ctx, authTimeout)
 		defer cancel()
-		log.Printf("auth: starting SAML login on 127.0.0.1:%d", cfg.SAMLPort)
+		log.Printf("auth: starting SAML login on 127.0.0.1:%d", prof.SAMLPort)
 		cookie, err := authr.Authenticate(ctx)
 		if err != nil {
 			log.Printf("auth: failed: %v", err)
@@ -156,7 +157,7 @@ func main() {
 	// scripts/install.sh (see internal/tunnel.Options); on Windows the app is
 	// already elevated and runs openconnect itself.
 	runFn := loggedRun(tunnel.RunOpenconnect(tunnel.Options{
-		Gateway:         fmt.Sprintf("%s:%d", cfg.Gateway, cfg.Port),
+		Gateway:         fmt.Sprintf("%s:%d", prof.Gateway, prof.Port),
 		OpenconnectPath: cfg.OpenconnectPath,
 		HelperPath:      cfg.HelperPath,
 		UseSudo:         runtime.GOOS != "windows",
