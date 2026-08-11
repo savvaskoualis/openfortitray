@@ -9,7 +9,7 @@ import (
 
 func plistPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "LaunchAgents", "com.hyperio.vpn.plist")
+	return filepath.Join(home, "Library", "LaunchAgents", "io.github.savvaskoualis.postern.plist")
 }
 
 // Enable writes the LaunchAgent plist for exePath and loads it best-effort.
@@ -28,7 +28,7 @@ func Enable(exePath string) error {
 
 // Disable unloads the LaunchAgent best-effort and removes the plist.
 func Disable() error {
-	_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/com.hyperio.vpn", os.Getuid())).Run()
+	_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/io.github.savvaskoualis.postern", os.Getuid())).Run()
 	err := os.Remove(plistPath())
 	if os.IsNotExist(err) {
 		return nil

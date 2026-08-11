@@ -18,7 +18,7 @@ import (
 // coverage that runs on every `go test`.
 func helperScript(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs(filepath.Join("..", "..", "scripts", "hyp-vpn-tunnel"))
+	p, err := filepath.Abs(filepath.Join("..", "..", "scripts", "postern-tunnel"))
 	if err != nil {
 		t.Fatal(err)
 	}

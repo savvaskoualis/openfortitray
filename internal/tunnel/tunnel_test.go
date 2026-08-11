@@ -92,14 +92,14 @@ func TestConnectHappyPath(t *testing.T) {
 		if cookie != "COOKIE" {
 			t.Errorf("wrong cookie %q", cookie)
 		}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done() // stay "up" until disconnected
 		return ctx.Err()
 	}
 	s := New(auth, run, events)
 	s.Connect()
 	e := c.waitFor(t, Connected, 2*time.Second)
-	if e.Detail != "10.212.134.5" {
+	if e.Detail != "10.0.0.5" {
 		t.Errorf("Connected detail = %q, want assigned IP", e.Detail)
 	}
 	s.Disconnect()
@@ -146,7 +146,7 @@ func TestReconnectOnDrop(t *testing.T) {
 		case runs <- struct{}{}:
 		default:
 		}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		return errors.New("link dropped") // simulated network drop
 	}
 	s := New(auth, run, events)
@@ -180,7 +180,7 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 		if runs.Add(1) == 1 {
 			return ErrAuthRejected
 		}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -206,7 +206,7 @@ func TestAuthRejectedAfterHealthySessionReauthsImmediately(t *testing.T) {
 	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
 	var runs atomic.Int32
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		if runs.Add(1) == 1 {
 			time.Sleep(40 * time.Millisecond) // healthy session, then rejected
 			return ErrAuthRejected
@@ -240,7 +240,7 @@ func TestShortLivedConnectionRejectedBacksOff(t *testing.T) {
 	var authCalls atomic.Int32
 	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		return ErrAuthRejected // never healthy for minHealthy
 	}
 	s := New(auth, run, events)
@@ -266,7 +266,7 @@ func TestImmediateReauthIsCapped(t *testing.T) {
 	var authCalls atomic.Int32
 	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		time.Sleep(30 * time.Millisecond) // always "healthy", always rejected
 		return ErrAuthRejected
 	}
@@ -358,7 +358,7 @@ func TestEventOrderOnConnect(t *testing.T) {
 
 	auth := func(ctx context.Context) (string, error) { return "C", nil }
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -405,7 +405,7 @@ func TestDisconnectThenConnectRestarts(t *testing.T) {
 		}
 		defer inRun.Add(-1)
 		<-release // hold the first loop inside runFn so its teardown lags
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -512,7 +512,7 @@ func TestEmitDoesNotBlockOnFullChannel(t *testing.T) {
 
 func TestRunOpenconnectStartFailure(t *testing.T) {
 	run := RunOpenconnect(Options{
-		OpenconnectPath: "/nonexistent/openconnect-hyp-vpn-test",
+		OpenconnectPath: "/nonexistent/openconnect-postern-test",
 		Gateway:         "vpn.example.com:443",
 	})
 	err := run(context.Background(), "COOKIE", func(string) { t.Error("connected must not be called") })
@@ -532,20 +532,20 @@ func TestConnectedRegex(t *testing.T) {
 		want string
 	}{{
 		name: "openconnect 9.x IPv4",
-		line: "Configured as 10.212.134.5, with SSL connected and DTLS connected",
-		want: "10.212.134.5",
+		line: "Configured as 10.0.0.5, with SSL connected and DTLS connected",
+		want: "10.0.0.5",
 	}, {
 		name: "openconnect 9.x ESP disabled",
-		line: "Configured as 10.212.134.5, with SSL connected and ESP disabled",
-		want: "10.212.134.5",
+		line: "Configured as 10.0.0.5, with SSL connected and ESP disabled",
+		want: "10.0.0.5",
 	}, {
 		name: "openconnect 9.x dual stack reports the legacy IP first",
 		line: "Configured as 10.0.0.5 + 2001:db8::5, with SSL connected and ESP in progress",
 		want: "10.0.0.5",
 	}, {
 		name: "openconnect 7.x wording",
-		line: "Connected as 10.212.134.9, using SSL + LZ4",
-		want: "10.212.134.9",
+		line: "Connected as 10.0.0.9, using SSL + LZ4",
+		want: "10.0.0.9",
 	}, {
 		// This line carries the *gateway* address; reporting it as the tunnel
 		// address would show the user a bogus IP and mark a dead cookie proven.
@@ -554,7 +554,7 @@ func TestConnectedRegex(t *testing.T) {
 		want: "",
 	}, {
 		name: "unrelated progress line",
-		line: "SSL negotiation with securityhub.hyperio.cloud",
+		line: "SSL negotiation with vpn.example.com",
 		want: "",
 	}}
 	for _, tc := range tests {
@@ -608,11 +608,11 @@ func TestIsAuthRejected(t *testing.T) {
 		// Plain link trouble must be retried with the existing cookie: treating
 		// it as a rejection would pop a SAML browser window on every hiccup.
 		name: "network failure is not a rejection",
-		tail: "Failed to connect to host securityhub.hyperio.cloud\nError establishing Fortinet connection\n",
+		tail: "Failed to connect to host vpn.example.com\nError establishing Fortinet connection\n",
 		want: false,
 	}, {
 		name: "clean output",
-		tail: "Configured as 10.212.134.5, with SSL connected and ESP disabled",
+		tail: "Configured as 10.0.0.5, with SSL connected and ESP disabled",
 		want: false,
 	}}
 	for _, tc := range tests {
@@ -648,12 +648,12 @@ func TestStartArgv(t *testing.T) {
 		name: "privileged run goes through the helper, never openconnect itself",
 		opts: Options{
 			OpenconnectPath: "openconnect",
-			HelperPath:      "/opt/hyp/hyp-vpn-tunnel",
+			HelperPath:      "/opt/custom/postern-tunnel",
 			Gateway:         "gw.example.com:10443",
 			UseSudo:         true,
 		},
 		wantName: "sudo",
-		wantArgs: []string{"-n", "/opt/hyp/hyp-vpn-tunnel", "start", "gw.example.com:10443"},
+		wantArgs: []string{"-n", "/opt/custom/postern-tunnel", "start", "gw.example.com:10443"},
 	}, {
 		name:     "empty helper path falls back to the installed location",
 		opts:     Options{Gateway: "gw.example.com:10443", UseSudo: true},
@@ -685,12 +685,12 @@ func TestStopArgv(t *testing.T) {
 	if _, _, viaHelper := (Options{OpenconnectPath: "openconnect"}).stopArgv(); viaHelper {
 		t.Error("direct path must be torn down by signal, not by a stop command")
 	}
-	name, args, viaHelper := (Options{HelperPath: "/opt/hyp/h", UseSudo: true}).stopArgv()
+	name, args, viaHelper := (Options{HelperPath: "/opt/custom/h", UseSudo: true}).stopArgv()
 	if !viaHelper {
 		t.Fatal("privileged path must tear down via the helper: a root process cannot be signalled")
 	}
-	if name != "sudo" || !slices.Equal(args, []string{"-n", "/opt/hyp/h", "stop"}) {
-		t.Errorf("stop command = %q %q, want sudo -n /opt/hyp/h stop", name, args)
+	if name != "sudo" || !slices.Equal(args, []string{"-n", "/opt/custom/h", "stop"}) {
+		t.Errorf("stop command = %q %q, want sudo -n /opt/custom/h stop", name, args)
 	}
 }
 
@@ -727,7 +727,7 @@ start)
 	trap '' INT TERM
 	cat > `+cookieFile+`
 	echo "Connected to 203.0.113.7:10443"
-	echo "Configured as 10.212.134.5, with SSL connected and ESP disabled"
+	echo "Configured as 10.0.0.5, with SSL connected and ESP disabled"
 	while [ ! -f `+stopFile+` ]; do sleep 0.05; done
 	exit 0
 	;;
@@ -741,7 +741,7 @@ exit 64
 
 	opts := Options{
 		Gateway:    "gw.example.com:10443",
-		HelperPath: "/opt/hyp/hyp-vpn-tunnel",
+		HelperPath: "/opt/custom/postern-tunnel",
 		UseSudo:    true,
 		sudoPath:   sudo,
 	}
@@ -761,8 +761,8 @@ exit 64
 
 	select {
 	case ip := <-gotIP:
-		if ip != "10.212.134.5" {
-			t.Errorf("connected IP = %q, want the tunnel address 10.212.134.5", ip)
+		if ip != "10.0.0.5" {
+			t.Errorf("connected IP = %q, want the tunnel address 10.0.0.5", ip)
 		}
 	case err := <-done:
 		t.Fatalf("run exited before reporting Connected: %v", err)
@@ -792,8 +792,8 @@ exit 64
 		t.Fatal(err)
 	}
 	wantLines := []string{
-		"-n /opt/hyp/hyp-vpn-tunnel start gw.example.com:10443",
-		"-n /opt/hyp/hyp-vpn-tunnel stop",
+		"-n /opt/custom/postern-tunnel start gw.example.com:10443",
+		"-n /opt/custom/postern-tunnel stop",
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(string(logged), want) {
@@ -812,7 +812,7 @@ func TestRunOpenconnectDirectPathIsSignalled(t *testing.T) {
 	interrupted := filepath.Join(dir, "interrupted")
 	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
 trap 'touch `+interrupted+`; exit 0' INT
-echo "Configured as 10.212.134.7, with SSL connected and ESP disabled"
+echo "Configured as 10.0.0.7, with SSL connected and ESP disabled"
 while :; do sleep 0.05; done
 `)
 
@@ -830,7 +830,7 @@ while :; do sleep 0.05; done
 	}()
 	select {
 	case ip := <-gotIP:
-		if ip != "10.212.134.7" {
+		if ip != "10.0.0.7" {
 			t.Errorf("connected IP = %q", ip)
 		}
 	case <-time.After(10 * time.Second):

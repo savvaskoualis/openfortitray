@@ -10,7 +10,7 @@ func DarwinPlist(exePath string) string {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.hyperio.vpn</string>
+	<string>io.github.savvaskoualis.postern</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
@@ -26,7 +26,7 @@ func DarwinPlist(exePath string) string {
 func LinuxDesktop(exePath string) string {
 	return fmt.Sprintf(`[Desktop Entry]
 Type=Application
-Name=Hyperio VPN
+Name=Postern
 Exec=%s
 X-GNOME-Autostart-enabled=true
 `, exePath)

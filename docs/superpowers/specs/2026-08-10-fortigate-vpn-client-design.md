@@ -1,4 +1,4 @@
-# Hyperio VPN — Cross-Platform FortiGate Tray App
+# Postern — Cross-Platform FortiGate Tray App
 
 **Date:** 2026-08-10
 **Status:** Approved (v2 — supersedes terminal-only v1 design)
@@ -19,13 +19,18 @@ that:
 
 | Setting | Value |
 |---|---|
-| Gateway | `securityhub.hyperio.cloud` |
+| Gateway | `vpn.example.com` |
 | Port | `10443` |
 | VPN type | SSL-VPN |
 | Auth | SAML/SSO, external browser flow (`UseExternalBrowser: 1`) |
-| Client tunnel subnet | `10.212.134.0/24` (observed assigned IP `10.212.134.1`) |
+| Client tunnel subnet | `10.0.0.0/24` (observed assigned IP `10.0.0.1`) |
 
 Config source on macOS: `/Library/Application Support/Fortinet/FortiClient/conf/vpn.plist`.
+
+The gateway and addresses above are placeholders. Postern ships with **no default
+gateway** — it is deployment-specific, so `scripts/install.sh` takes it from
+`POSTERN_GATEWAY=host:port` and writes it to the user's `config.json`, and the tray
+reports "gateway not set" rather than dialling anything until it is present.
 
 ## Tech Choice
 
@@ -43,11 +48,11 @@ tunneling itself; it supervises openconnect.
 
 ## Architecture
 
-One Go binary `hyp-vpn`, four packages:
+One Go binary `postern`, four packages:
 
 ```
-hyp-vpn/
-├── cmd/hyp-vpn/main.go        wiring: config → tray → supervisor
+postern/
+├── cmd/postern/main.go        wiring: config → tray → supervisor
 ├── internal/auth/             SAML external-browser flow → SVPNCOOKIE
 ├── internal/tunnel/           openconnect supervisor (spawn, health, backoff restart)
 ├── internal/autostart/        login-item install/remove per OS
@@ -59,7 +64,7 @@ hyp-vpn/
 
 1. Start HTTP listener on `127.0.0.1:8020` (FortiClient's conventional redirect port).
 2. Open system browser at
-   `https://securityhub.hyperio.cloud:10443/remote/saml/start?redirect=1`.
+   `https://vpn.example.com:10443/remote/saml/start?redirect=1`.
 3. User authenticates at IdP (silent if session alive); FortiGate redirects browser to
    `http://127.0.0.1:8020/?id=<auth-id>`.
 4. App exchanges the id at `https://<gateway>/remote/saml/auth_id?id=<auth-id>` and
@@ -86,33 +91,33 @@ reconnects are silent until the IdP session expires.
 
 ### `internal/tray`
 
-Menu: status line (`Connected — 10.212.134.x` / `Disconnected` / `Connecting…`),
+Menu: status line (`Connected — 10.0.0.x` / `Disconnected` / `Connecting…`),
 Connect, Disconnect, ✓ Auto-connect at login, View logs (opens log file), Quit.
 Icon variants: gray (down), animated/half (connecting), green dot (up), red (error).
 
 ### `internal/autostart`
 
 Toggle from tray, default ON at install:
-- macOS: `~/Library/LaunchAgents/com.hyperio.vpn.plist` (`RunAtLoad`, no KeepAlive —
+- macOS: `~/Library/LaunchAgents/io.github.savvaskoualis.postern.plist` (`RunAtLoad`, no KeepAlive —
   the app supervises itself)
-- Linux: `~/.config/autostart/hyp-vpn.desktop` (XDG autostart)
+- Linux: `~/.config/autostart/postern.desktop` (XDG autostart)
 - Windows: Scheduled Task at logon, "Run with highest privileges" (this is also the
   elevation mechanism)
 
 ### `internal/config`
 
 Gateway/port compiled in as defaults, overridable by
-`~/.config/hyp-vpn/config.json` (`gateway`, `port`, `saml_port`, `openconnect_path`).
+`~/.config/postern/config.json` (`gateway`, `port`, `saml_port`, `openconnect_path`).
 User prefs (autostart on/off) stored in the same file. Logs to
-`~/.config/hyp-vpn/hyp-vpn.log` (platform-appropriate dir via `os.UserConfigDir`).
+`~/.config/postern/postern.log` (platform-appropriate dir via `os.UserConfigDir`).
 
 ## Install & Packaging
 
 - Repo ships `install.sh` (macOS/Linux) and `install.ps1` (Windows):
   1. Install openconnect (brew / apt / dnf; Windows: download bundled openconnect
-     release + wintun into `%ProgramFiles%\hyp-vpn`).
-  2. Copy the `hyp-vpn` release binary into place.
-  3. macOS/Linux: write `/etc/sudoers.d/hyp-vpn` (NOPASSWD, exact openconnect path,
+     release + wintun into `%ProgramFiles%\postern`).
+  2. Copy the `postern` release binary into place.
+  3. macOS/Linux: write `/etc/sudoers.d/postern` (NOPASSWD, exact openconnect path,
      validated with `visudo -c`).
   4. Register autostart; launch the app.
 - GitHub-style release artifacts built by `make release`: darwin-arm64, darwin-amd64,
@@ -147,7 +152,7 @@ Automated (Go unit tests, `go test ./...`):
 
 Manual acceptance per platform:
 1. Install script → tray icon appears, first Connect shows browser login, tunnel up,
-   internal resource reachable, IP in `10.212.134.0/24`.
+   internal resource reachable, IP in `10.0.0.0/24`.
 2. Toggle Wi-Fi → `Reconnecting…` → `Connected` without user action.
 3. Reboot → auto-connects at login (IdP session valid), no interaction.
 4. Disconnect from tray → stays down until manual Connect.

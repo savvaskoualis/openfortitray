@@ -3,7 +3,7 @@ package autostart
 import "os/exec"
 
 // taskName must match the name used by the Windows install script.
-const taskName = "HyperioVPN"
+const taskName = "Postern"
 
 // Enable registers an ONLOGON scheduled task running exePath.
 //

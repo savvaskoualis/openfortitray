@@ -1,6 +1,6 @@
-BIN  := hyp-vpn
+BIN  := postern
 DIST := dist
-PKG  := ./cmd/hyp-vpn
+PKG  := ./cmd/postern
 
 .PHONY: all build test release clean install
 
@@ -16,8 +16,8 @@ test:
 # Cross-compilation notes:
 #  - darwin needs cgo: fyne.io/systray drives the Cocoa status bar. The amd64
 #    slice cross-builds from an Apple Silicon mac because the macOS SDK is a
-#    fat SDK; if a future SDK drops x86_64 support, drop that line (the team is
-#    all Apple Silicon).
+#    fat SDK; if a future SDK drops x86_64 support, drop that line — the amd64
+#    slice only serves pre-2020 Intel macs.
 #  - linux systray is pure Go (D-Bus StatusNotifierItem via godbus), so it
 #    builds with cgo off and stays portable across glibc versions.
 #  - windows needs -H=windowsgui, or launching the tray app pops a console

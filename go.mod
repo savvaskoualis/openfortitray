@@ -1,4 +1,4 @@
-module github.com/hyperiosoftware/hyp-vpn
+module github.com/savvaskoualis/postern
 
 go 1.26.5
 

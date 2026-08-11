@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# Installs hyp-vpn on macOS or Linux: openconnect, the tray binary, the
+# Installs Postern on macOS or Linux: openconnect, the tray binary, the
 # root-owned privileged helper, and a sudoers rule scoped to that helper.
 # Idempotent: safe to re-run; updates everything in place.
 #
 # Usage:
-#   bash scripts/install.sh                            # build from this checkout
-#   HYP_VPN_RELEASE_URL=<url> bash scripts/install.sh  # install a prebuilt binary
-#   HYP_VPN_OPENCONNECT=/path/to/openconnect bash scripts/install.sh
+#   POSTERN_GATEWAY=vpn.example.com:10443 bash scripts/install.sh
 #
-# THREAT MODEL (the same one documented in scripts/hyp-vpn-tunnel):
+# POSTERN_GATEWAY is required on a first install: the app ships with no gateway
+# (it is deployment-specific) and the installer writes the one you give here into
+# your own config.json. Re-runs on a machine whose config already names a gateway
+# do not need it.
+#
+# Other knobs:
+#   POSTERN_RELEASE_URL=<url>                 # install a prebuilt binary instead of building
+#   POSTERN_OPENCONNECT=/path/to/openconnect  # use this openconnect, not the one on PATH
+#   POSTERN_HELPER_DIR=/usr/libexec           # install the privileged helper elsewhere
+#
+# THREAT MODEL (the same one documented in scripts/postern-tunnel):
 #
 #   The sudoers rule written here grants the invoking user passwordless root for
 #   one script. That script validates its arguments, so argument injection into
@@ -24,19 +32,20 @@
 #   the sudoers rule. On a single-user mac that person is already an admin who can
 #   run sudo directly, so the rule grants them nothing they did not have. On a
 #   shared mac, install openconnect somewhere root-owned and pass
-#   HYP_VPN_OPENCONNECT. This is a documented boundary, not a claim of safety.
+#   POSTERN_OPENCONNECT. This is a documented boundary, not a claim of safety.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_URL="${HYP_VPN_RELEASE_URL:-}"
-BIN_TARGET=/usr/local/bin/hyp-vpn
-HELPER_SRC="$REPO_DIR/scripts/hyp-vpn-tunnel"
+RELEASE_URL="${POSTERN_RELEASE_URL:-}"
+BIN_TARGET=/usr/local/bin/postern
+HELPER_SRC="$REPO_DIR/scripts/postern-tunnel"
 # Overridable so a machine whose /usr/local is user-owned (an Intel-mac Homebrew
 # prefix) can put the helper somewhere root-owned instead of loosening the check.
 # Changing it means matching "helper_path" in the app's config.json.
-HELPER_DIR="${HYP_VPN_HELPER_DIR:-/usr/local/libexec}"
-HELPER_TARGET="$HELPER_DIR/hyp-vpn-tunnel"
-SUDOERS_TARGET=/etc/sudoers.d/hyp-vpn
+HELPER_DIR="${POSTERN_HELPER_DIR:-/usr/local/libexec}"
+HELPER_TARGET="$HELPER_DIR/postern-tunnel"
+SUDOERS_TARGET=/etc/sudoers.d/postern
+GATEWAY="${POSTERN_GATEWAY:-}"
 OS="$(uname -s)"
 
 log() { printf 'install: %s\n' "$1"; }
@@ -134,8 +143,8 @@ check_chain() {
 			"anything reachable from a passwordless-root path must be root-owned and not writable by others." \
 			"Remedy: sudo chown root:$ROOT_GROUP $HELPER_DIR && sudo chmod 755 $HELPER_DIR" \
 			"(an Intel-mac Homebrew prefix leaves /usr/local user-owned), or point the helper" \
-			"somewhere already root-owned by setting HYP_VPN_HELPER_DIR=/usr/libexec and matching" \
-			"\"helper_path\" in ~/Library/Application Support/hyp-vpn/config.json." >&2
+			"somewhere already root-owned by setting POSTERN_HELPER_DIR=/usr/libexec and matching" \
+			"\"helper_path\" in ~/Library/Application Support/postern/config.json." >&2
 		exit 1
 	fi
 	while IFS= read -r problem; do warn "$problem"; done <<<"$problems"
@@ -179,6 +188,114 @@ resolve_principal() {
 	PRINCIPAL="$user"
 }
 
+# validate_gateway applies exactly the charset and shape rule that
+# scripts/postern-tunnel enforces on the argument it hands to openconnect. Keeping
+# them identical means a gateway this installer accepts is one the helper will
+# accept too — otherwise the install "succeeds" and every connect dies in the
+# privileged helper.
+validate_gateway() {
+	local gw="$1" host port
+	case "$gw" in
+	-*) die "POSTERN_GATEWAY must not start with '-': '$gw'" ;;
+	*[!A-Za-z0-9.:_-]*) die "POSTERN_GATEWAY contains invalid characters: '$gw'" ;;
+	*:*) ;;
+	*) die "POSTERN_GATEWAY must be host:port, got '$gw'" ;;
+	esac
+	host="${gw%:*}"
+	port="${gw##*:}"
+	case "$host" in
+	'' | *:*) die "POSTERN_GATEWAY must be host:port, got '$gw'" ;;
+	esac
+	case "$port" in
+	'' | *[!0-9]*) die "POSTERN_GATEWAY port must be numeric, got '$gw'" ;;
+	esac
+	GATEWAY_HOST="$host"
+	GATEWAY_PORT="$port"
+}
+
+# principal_home prints $PRINCIPAL's home directory. Under sudo, $HOME is root's,
+# so the config would land where the app never looks. PRINCIPAL has already been
+# checked against ^[A-Za-z0-9._-]+$ by resolve_principal, which is what makes the
+# tilde expansion below safe to eval.
+principal_home() {
+	local h=""
+	eval "h=~$PRINCIPAL"
+	[[ -n "$h" && -d "$h" ]] || die "cannot find the home directory of $PRINCIPAL"
+	printf '%s\n' "$h"
+}
+
+# as_principal runs "$@" as $PRINCIPAL. Running the whole installer under sudo is a
+# common mistake, and nothing it creates in the user's home may end up root-owned:
+# ~/.config often does not exist yet, so even the directory matters. We are already
+# root on that branch, so sudo does not prompt.
+as_principal() {
+	if [[ "$(id -u)" -eq 0 ]]; then
+		sudo -u "$PRINCIPAL" "$@"
+	else
+		"$@"
+	fi
+}
+
+# config_dir mirrors config.DefaultDir() in the Go app — os.UserConfigDir() plus
+# "postern". Keep the two in step: a mismatch means this installer writes a config
+# the app silently ignores, and the tray reports "gateway not set" after a
+# successful install.
+#
+# XDG_CONFIG_HOME is honoured only when we are not root, because sudo would have
+# handed us root's copy of it rather than the user's.
+config_dir() {
+	local home
+	home="$(principal_home)"
+	if [[ "$OS" == Darwin ]]; then
+		printf '%s\n' "$home/Library/Application Support/postern"
+	elif [[ "$(id -u)" -ne 0 && -n "${XDG_CONFIG_HOME:-}" ]]; then
+		printf '%s\n' "$XDG_CONFIG_HOME/postern"
+	else
+		printf '%s\n' "$home/.config/postern"
+	fi
+}
+
+# config_has_gateway reports whether $1 already sets a non-empty "gateway". A grep
+# rather than jq: jq is not installed by default anywhere this script runs, and
+# the question is narrow enough not to need a JSON parser.
+config_has_gateway() {
+	grep -qE '"gateway"[[:space:]]*:[[:space:]]*"[^"]+"' "$1" 2>/dev/null
+}
+
+# install_config makes sure the app has a gateway to dial before anything
+# privileged happens, so a missing POSTERN_GATEWAY costs the user nothing but a
+# re-run.
+#
+# An existing config.json is never rewritten: it holds the user's own settings
+# (helper_path, autostart, port) and this installer has no merge logic. When one
+# exists without a gateway, the fix is spelled out instead.
+install_config() {
+	local dir file
+	dir="$(config_dir)"
+	file="$dir/config.json"
+
+	if [[ -e "$file" ]]; then
+		if config_has_gateway "$file"; then
+			[[ -z "$GATEWAY" ]] ||
+				warn "$file already sets a gateway; POSTERN_GATEWAY ignored (edit the file to change it)"
+			log "using the gateway already configured in $file"
+			return
+		fi
+		die "$file exists but sets no gateway. Add one by hand (this installer will not rewrite an existing config): \"gateway\": \"<host>\", \"port\": <port>"
+	fi
+
+	[[ -n "$GATEWAY" ]] ||
+		die "POSTERN_GATEWAY is required: re-run as POSTERN_GATEWAY=vpn.example.com:10443 bash scripts/install.sh (it is written to $file)"
+	validate_gateway "$GATEWAY"
+
+	as_principal mkdir -p "$dir"
+	printf '{\n  "gateway": "%s",\n  "port": %s\n}\n' "$GATEWAY_HOST" "$GATEWAY_PORT" |
+		as_principal tee "$file" >/dev/null
+	as_principal chmod 0700 "$dir"
+	as_principal chmod 0600 "$file"
+	log "wrote $file (gateway $GATEWAY_HOST:$GATEWAY_PORT)"
+}
+
 install_openconnect() {
 	if command -v openconnect >/dev/null 2>&1; then
 		log "openconnect already installed ($(command -v openconnect))"
@@ -210,7 +327,7 @@ install_openconnect() {
 # costs no coverage.
 resolve_openconnect() {
 	local p
-	p="${HYP_VPN_OPENCONNECT:-$(command -v openconnect || true)}"
+	p="${POSTERN_OPENCONNECT:-$(command -v openconnect || true)}"
 	[[ -n "$p" ]] || die "openconnect not found after install"
 	[[ -x "$p" ]] || die "$p is not executable"
 	[[ "$p" == /* ]] || die "openconnect path must be absolute, got '$p'"
@@ -223,8 +340,8 @@ resolve_openconnect() {
 		check_chain "$p" abort || true
 	elif ! check_chain "$p" warn; then
 		warn "openconnect at $p is not on a root-owned path (normal for Homebrew)."
-		warn "Anyone who can write there gains root via the hyp-vpn sudoers rule."
-		warn "On a shared mac, install openconnect root-owned and re-run with HYP_VPN_OPENCONNECT=<path>."
+		warn "Anyone who can write there gains root via the postern sudoers rule."
+		warn "On a shared mac, install openconnect root-owned and re-run with POSTERN_OPENCONNECT=<path>."
 	fi
 	OPENCONNECT_PATH="$p"
 	log "openconnect resolved to $OPENCONNECT_PATH"
@@ -240,7 +357,7 @@ install_binary() {
 		log "installed $BIN_TARGET from $RELEASE_URL"
 	else
 		(cd "$REPO_DIR" && make build)
-		sudo install -o root -m 0755 "$REPO_DIR/hyp-vpn" "$BIN_TARGET"
+		sudo install -o root -m 0755 "$REPO_DIR/postern" "$BIN_TARGET"
 		log "built from checkout and installed $BIN_TARGET"
 	fi
 }
@@ -303,6 +420,9 @@ verify() {
 }
 
 resolve_principal
+# Before anything privileged: a missing or malformed POSTERN_GATEWAY should cost a
+# re-run, not a half-finished install.
+install_config
 preflight_paths
 install_openconnect
 resolve_openconnect
@@ -312,5 +432,6 @@ install_sudoers
 verify
 
 log "done. Launch the app with: $BIN_TARGET &"
+log "Gateway lives in $(config_dir)/config.json; edit it there to point elsewhere."
 log "First connect opens a browser window for the SAML login."
 log "Quit FortiClient before connecting — two clients must not share the tunnel."

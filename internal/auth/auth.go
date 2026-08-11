@@ -63,7 +63,7 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 		}
 		cookie, err := a.exchange(ctx, client, id)
 		if err != nil {
-			http.Error(w, "login failed, check hyp-vpn logs", http.StatusBadGateway)
+			http.Error(w, "login failed, check postern logs", http.StatusBadGateway)
 			select {
 			case done <- result{err: err}:
 			default:
@@ -71,7 +71,7 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body><h2>Hyperio VPN connected — you can close this tab.</h2></body></html>")
+		fmt.Fprint(w, "<html><body><h2>Postern connected — you can close this tab.</h2></body></html>")
 		select {
 		case done <- result{cookie: cookie}:
 		default:

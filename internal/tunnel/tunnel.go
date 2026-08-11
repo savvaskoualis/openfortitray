@@ -289,7 +289,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 // connectedRe matches the openconnect progress line that reports the address
 // assigned to the tunnel. openconnect 8.x/9.x print
 //
-//	Configured as 10.212.134.5, with SSL connected and DTLS connected
+//	Configured as 10.0.0.5, with SSL connected and DTLS connected
 //
 // (verified against the format string in openconnect v9.21:
 // "Configured as %s%s%s, with SSL%s%s %s and %s%s%s %s"). openconnect 7.x used
@@ -345,12 +345,12 @@ func isAuthRejected(output string) bool {
 }
 
 // DefaultHelperPath is where scripts/install.sh puts the privileged helper.
-const DefaultHelperPath = "/usr/local/libexec/hyp-vpn-tunnel"
+const DefaultHelperPath = "/usr/local/libexec/postern-tunnel"
 
-// helperPIDFile mirrors PIDFILE in scripts/hyp-vpn-tunnel. Nothing in this
+// helperPIDFile mirrors PIDFILE in scripts/postern-tunnel. Nothing in this
 // package reads it — the helper owns it, because only root may write there — but
 // the tests assert the helper does not create it for a rejected gateway.
-const helperPIDFile = "/var/run/hyp-vpn-openconnect.pid"
+const helperPIDFile = "/var/run/postern-openconnect.pid"
 
 const (
 	// helperStopTimeout bounds one privileged teardown call. The helper waits up
@@ -361,7 +361,7 @@ const (
 	// completion and only then creates the WaitDelay timer, so the two are
 	// consecutive rather than concurrent. Worst case for a cancelled run is
 	// therefore helperStopAttempts*helperStopTimeout + helperWaitDelay, which is
-	// what cmd/hyp-vpn's shutdownWait has to cover — keep them in step.
+	// what cmd/postern's shutdownWait has to cover — keep them in step.
 	helperWaitDelay = 12 * time.Second
 	// signalWaitDelay backstops the direct path, where we can signal the
 	// process ourselves.
@@ -375,7 +375,7 @@ type Options struct {
 	// OpenconnectPath is the openconnect binary, used only when the app is
 	// already privileged (Windows) and runs it directly.
 	OpenconnectPath string
-	// HelperPath is the root-owned helper script (scripts/hyp-vpn-tunnel) run
+	// HelperPath is the root-owned helper script (scripts/postern-tunnel) run
 	// through sudo on macOS/Linux. Empty means DefaultHelperPath.
 	HelperPath string
 	// UseSudo runs the tunnel as root via `sudo -n <HelperPath>`; false runs

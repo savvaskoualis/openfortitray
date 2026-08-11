@@ -9,6 +9,10 @@ import (
 )
 
 type Config struct {
+	// Gateway is the FortiGate SSL-VPN host. It has no default: the gateway is
+	// deployment-specific, so a fresh install has no usable value and the app
+	// must say so rather than dial somebody else's endpoint. scripts/install.sh
+	// writes it from POSTERN_GATEWAY; otherwise the user edits config.json.
 	Gateway  string `json:"gateway"`
 	Port     int    `json:"port"`
 	SAMLPort int    `json:"saml_port"`
@@ -26,11 +30,11 @@ type Config struct {
 
 func defaults() *Config {
 	return &Config{
-		Gateway:         "securityhub.hyperio.cloud",
+		Gateway:         "",
 		Port:            10443,
 		SAMLPort:        8020,
 		OpenconnectPath: "openconnect",
-		HelperPath:      "/usr/local/libexec/hyp-vpn-tunnel",
+		HelperPath:      "/usr/local/libexec/postern-tunnel",
 		Autostart:       true,
 	}
 }
@@ -67,7 +71,7 @@ func DefaultDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "hyp-vpn"), nil
+	return filepath.Join(base, "postern"), nil
 }
 
 func (c *Config) GatewayURL() string {

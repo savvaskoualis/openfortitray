@@ -1,4 +1,4 @@
-// Command hyp-vpn is the Hyperio VPN tray application.
+// Command postern is the Postern tray application.
 package main
 
 import (
@@ -11,11 +11,11 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/hyperiosoftware/hyp-vpn/internal/auth"
-	"github.com/hyperiosoftware/hyp-vpn/internal/autostart"
-	"github.com/hyperiosoftware/hyp-vpn/internal/config"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tray"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tunnel"
+	"github.com/savvaskoualis/postern/internal/auth"
+	"github.com/savvaskoualis/postern/internal/autostart"
+	"github.com/savvaskoualis/postern/internal/config"
+	"github.com/savvaskoualis/postern/internal/tray"
+	"github.com/savvaskoualis/postern/internal/tunnel"
 )
 
 // app adapts the packages to tray.App; it holds no logic of its own.
@@ -27,7 +27,31 @@ type app struct {
 	logPath string
 }
 
-func (a *app) Connect()                    { a.sup.Connect() }
+// Connect starts the tunnel, unless no gateway is configured. The gateway has no
+// built-in default (it is deployment-specific), so a fresh install would
+// otherwise hand openconnect a bare ":10443" — the SAML browser window would
+// open against a nonexistent host and the failure would surface as an opaque
+// connection error. Reporting the missing setting instead, as the terminal Error
+// state, tells the user the one thing they have to do.
+func (a *app) Connect() {
+	if a.cfg.Gateway == "" {
+		msg := "gateway not set — edit " + filepath.Join(a.cfgDir, "config.json")
+		log.Printf("connect refused: %s", msg)
+		a.emit(tunnel.Event{State: tunnel.Error, Detail: msg})
+		return
+	}
+	a.sup.Connect()
+}
+
+// emit delivers an event the supervisor did not produce, without blocking on a
+// slow UI (the same drop-on-full rule the supervisor uses).
+func (a *app) emit(e tunnel.Event) {
+	select {
+	case a.events <- e:
+	default:
+	}
+}
+
 func (a *app) Disconnect()                 { a.sup.Disconnect() }
 func (a *app) AutostartEnabled() bool      { return autostart.IsEnabled() }
 func (a *app) LogPath() string             { return a.logPath }
@@ -92,12 +116,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	logPath := filepath.Join(cfgDir, "hyp-vpn.log")
+	logPath := filepath.Join(cfgDir, "postern.log")
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		log.SetOutput(f)
 		defer f.Close()
 	}
-	log.Printf("hyp-vpn: starting, gateway %s", cfg.GatewayURL())
+	if cfg.Gateway == "" {
+		log.Printf("postern: starting, no gateway configured in %s",
+			filepath.Join(cfgDir, "config.json"))
+	} else {
+		log.Printf("postern: starting, gateway %s", cfg.GatewayURL())
+	}
 
 	authr := &auth.Authenticator{
 		GatewayURL: cfg.GatewayURL(),
@@ -137,7 +166,7 @@ func main() {
 	}
 
 	if cfg.Autostart {
-		a.sup.Connect() // launch happens at login, so connect right away
+		a.Connect() // launch happens at login, so connect right away
 	}
 	tray.Run(a)
 
@@ -148,9 +177,9 @@ func main() {
 	defer cancel()
 	a.sup.Wait(ctx)
 	if ctx.Err() != nil {
-		log.Printf("hyp-vpn: backend did not stop within %s", shutdownWait)
+		log.Printf("postern: backend did not stop within %s", shutdownWait)
 	}
-	log.Printf("hyp-vpn: exiting")
+	log.Printf("postern: exiting")
 }
 
 // loggedRun wraps runFn so every backend exit lands in the log file.

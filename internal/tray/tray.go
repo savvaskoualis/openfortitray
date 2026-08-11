@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"fyne.io/systray"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tunnel"
-	"github.com/hyperiosoftware/hyp-vpn/internal/xopen"
+	"github.com/savvaskoualis/postern/internal/tunnel"
+	"github.com/savvaskoualis/postern/internal/xopen"
 )
 
 // App is everything the menu needs from the application.
@@ -26,7 +26,7 @@ func Run(app App) {
 
 func onReady(app App) {
 	systray.SetIcon(iconGray)
-	systray.SetTooltip("Hyperio VPN")
+	systray.SetTooltip("Postern")
 
 	status := systray.AddMenuItem("Disconnected", "")
 	status.Disable()
@@ -113,7 +113,7 @@ func render(e tunnel.Event, status, connect, disconnect *systray.MenuItem) {
 		disconnect.Disable()
 	}
 	status.SetTitle(title)
-	systray.SetTooltip("Hyperio VPN — " + title)
+	systray.SetTooltip("Postern — " + title)
 }
 
 // short reduces event detail to a single short line fit for a menu item.

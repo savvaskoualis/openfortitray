@@ -1,7 +1,7 @@
 #!/bin/sh
-# hyp-vpn-tunnel — root-owned privileged helper for the hyp-vpn tray app.
+# postern-tunnel — root-owned privileged helper for the postern tray app.
 #
-# Installed by scripts/install.sh as /usr/local/libexec/hyp-vpn-tunnel
+# Installed by scripts/install.sh as /usr/local/libexec/postern-tunnel
 # (owner root, mode 0755, in a root-owned directory). The sudoers rule written by
 # the installer grants NOPASSWD for *this path only*, never for openconnect
 # itself: a bare NOPASSWD on openconnect would let any local process run
@@ -41,8 +41,8 @@
 #   installer at it.
 #
 # Usage (as invoked by the app via `sudo -n`):
-#   hyp-vpn-tunnel start <host:port>   # exec openconnect, cookie on stdin
-#   hyp-vpn-tunnel stop                # SIGINT the running openconnect
+#   postern-tunnel start <host:port>   # exec openconnect, cookie on stdin
+#   postern-tunnel stop                # SIGINT the running openconnect
 set -eu
 
 # Fixed PATH for the coreutils this script itself calls (cat, ps, kill, rm,
@@ -59,13 +59,13 @@ export PATH
 # root code execution for anyone who can write to that directory.
 OPENCONNECT='@OPENCONNECT@'
 
-PIDFILE=/var/run/hyp-vpn-openconnect.pid
+PIDFILE=/var/run/postern-openconnect.pid
 # Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
 # internal/tunnel allows a little more than this before giving up on us.
 STOP_TIMEOUT=6
 
 die() {
-	echo "hyp-vpn-tunnel: $1" >&2
+	echo "postern-tunnel: $1" >&2
 	exit 1
 }
 
@@ -151,7 +151,7 @@ resolve_openconnect() {
 	fi
 	if [ -n "$unsafe" ]; then
 		if [ "$(uname -s)" = Darwin ]; then
-			echo "hyp-vpn-tunnel: WARNING: $OPENCONNECT is $unsafe;" \
+			echo "postern-tunnel: WARNING: $OPENCONNECT is $unsafe;" \
 				"anyone who can write it gains root through this helper" >&2
 		else
 			die "refusing to run as root: $OPENCONNECT is $unsafe"
@@ -161,7 +161,7 @@ resolve_openconnect() {
 }
 
 cmd_start() {
-	[ $# -eq 1 ] || die "usage: hyp-vpn-tunnel start <host:port>"
+	[ $# -eq 1 ] || die "usage: postern-tunnel start <host:port>"
 	validate_gateway "$1"
 	oc=$(resolve_openconnect)
 
@@ -185,12 +185,12 @@ cmd_start() {
 }
 
 cmd_stop() {
-	[ $# -eq 0 ] || die "usage: hyp-vpn-tunnel stop"
+	[ $# -eq 0 ] || die "usage: postern-tunnel stop"
 	terminate_running
 	exit 0 # stop is idempotent: "already gone" is success
 }
 
-[ $# -ge 1 ] || die "usage: hyp-vpn-tunnel {start <host:port>|stop}"
+[ $# -ge 1 ] || die "usage: postern-tunnel {start <host:port>|stop}"
 sub=$1
 shift
 case "$sub" in

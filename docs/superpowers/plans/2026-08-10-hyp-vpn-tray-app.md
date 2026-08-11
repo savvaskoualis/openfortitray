@@ -1,8 +1,8 @@
-# Hyperio VPN Tray App Implementation Plan
+# Postern Tray App Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Single Go binary `hyp-vpn` with a tray icon that connects to the company FortiGate SSL-VPN (SAML external-browser auth) via OpenConnect, auto-starts at login, and auto-reconnects — on macOS, Linux, and Windows.
+**Goal:** Single Go binary `postern` with a tray icon that connects to the company FortiGate SSL-VPN (SAML external-browser auth) via OpenConnect, auto-starts at login, and auto-reconnects — on macOS, Linux, and Windows.
 
 **Architecture:** Tray UI (`fyne.io/systray`) drives a tunnel supervisor that obtains an `SVPNCOOKIE` through a localhost SAML redirect flow and supervises an `openconnect --protocol=fortinet` child process with backoff restart. Autostart is a per-OS login item. All I/O boundaries (browser open, HTTP client, tunnel process) are injected so core logic is unit-testable.
 
@@ -10,12 +10,14 @@
 
 ## Global Constraints
 
-- Gateway default: `securityhub.hyperio.cloud`, port `10443`, SAML listen port `8020` (from spec).
-- Module path: `github.com/hyperiosoftware/hyp-vpn`.
+- Gateway: no default (superseded by the open-sourcing pass — it is deployment
+  specific and comes from `POSTERN_GATEWAY` at install time); port `10443`, SAML
+  listen port `8020` (from spec). `vpn.example.com` below is a placeholder.
+- Module path: `github.com/savvaskoualis/postern`.
 - Go ≥1.22; only external Go dependency allowed: `fyne.io/systray` (plus its transitive deps).
 - The app never implements tunneling itself; it always spawns openconnect.
 - All commits: message prefix `feat:`/`fix:`/`chore:`/`docs:`, body optional.
-- Repo root: `~/code/hyp-vpn` (already a git repo, spec committed).
+- Repo root: `~/code/postern` (already a git repo, spec committed).
 - Tests: `go test ./...` must pass on macOS (dev machine). No network access in tests.
 
 ---
@@ -41,15 +43,15 @@
   }
   func Load(dir string) (*Config, error)   // defaults overlaid with dir/config.json if present
   func (c *Config) Save(dir string) error  // writes dir/config.json (0600), creates dir
-  func DefaultDir() (string, error)        // os.UserConfigDir() + "/hyp-vpn"
+  func DefaultDir() (string, error)        // os.UserConfigDir() + "/postern"
   func (c *Config) GatewayURL() string     // "https://" + Gateway + ":" + Port
   ```
 
 - [ ] **Step 1: Scaffold module**
 
 ```bash
-cd ~/code/hyp-vpn
-go mod init github.com/hyperiosoftware/hyp-vpn
+cd ~/code/postern
+go mod init github.com/savvaskoualis/postern
 printf 'dist/\n*.log\n' > .gitignore
 ```
 
@@ -71,7 +73,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Gateway != "securityhub.hyperio.cloud" || c.Port != 10443 || c.SAMLPort != 8020 {
+	if c.Gateway != "vpn.example.com" || c.Port != 10443 || c.SAMLPort != 8020 {
 		t.Fatalf("bad defaults: %+v", c)
 	}
 	if c.OpenconnectPath != "openconnect" {
@@ -114,7 +116,7 @@ func TestLoadOverlayKeepsUnsetDefaults(t *testing.T) {
 
 func TestGatewayURL(t *testing.T) {
 	c, _ := Load(t.TempDir())
-	if got := c.GatewayURL(); got != "https://securityhub.hyperio.cloud:10443" {
+	if got := c.GatewayURL(); got != "https://vpn.example.com:10443" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -150,7 +152,7 @@ type Config struct {
 
 func defaults() *Config {
 	return &Config{
-		Gateway:         "securityhub.hyperio.cloud",
+		Gateway:         "vpn.example.com",
 		Port:            10443,
 		SAMLPort:        8020,
 		OpenconnectPath: "openconnect",
@@ -190,7 +192,7 @@ func DefaultDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "hyp-vpn"), nil
+	return filepath.Join(base, "postern"), nil
 }
 
 func (c *Config) GatewayURL() string {
@@ -224,7 +226,7 @@ git commit -m "feat: config package with defaults, overlay load, save"
   ```go
   package auth
   type Authenticator struct {
-      GatewayURL  string            // e.g. https://securityhub.hyperio.cloud:10443
+      GatewayURL  string            // e.g. https://vpn.example.com:10443
       ListenPort  int               // e.g. 8020
       Client      *http.Client      // nil → http.DefaultClient
       OpenBrowser func(url string) error
@@ -419,12 +421,12 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 		}
 		cookie, err := a.exchange(ctx, client, id)
 		if err != nil {
-			http.Error(w, "login failed, check hyp-vpn logs", http.StatusBadGateway)
+			http.Error(w, "login failed, check postern logs", http.StatusBadGateway)
 			done <- result{err: err}
 			return
 		}
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body><h2>Hyperio VPN connected — you can close this tab.</h2></body></html>")
+		fmt.Fprint(w, "<html><body><h2>Postern connected — you can close this tab.</h2></body></html>")
 		done <- result{cookie: cookie}
 	})
 	srv := &http.Server{Handler: mux}
@@ -587,7 +589,7 @@ func TestConnectHappyPath(t *testing.T) {
 		if cookie != "COOKIE" {
 			t.Errorf("wrong cookie %q", cookie)
 		}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done() // stay "up" until disconnected
 		return ctx.Err()
 	}
@@ -609,7 +611,7 @@ func TestReconnectOnDrop(t *testing.T) {
 	auth := func(ctx context.Context) (string, error) { return "C", nil }
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
 		runs <- struct{}{}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		return errors.New("link dropped") // simulated network drop
 	}
 	s := New(auth, run, events)
@@ -642,7 +644,7 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 			first = false
 			return ErrAuthRejected
 		}
-		connected("10.212.134.5")
+		connected("10.0.0.5")
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -936,9 +938,9 @@ git commit -m "feat: tunnel supervisor with backoff reconnect and openconnect ru
   ```
 
 **Per-OS behavior:**
-- darwin: write `~/Library/LaunchAgents/com.hyperio.vpn.plist` (`RunAtLoad=true`, `Label=com.hyperio.vpn`, `ProgramArguments=[exePath]`, no KeepAlive), then `launchctl bootstrap gui/$UID <plist>` best-effort (ignore "already loaded" error). Disable: `launchctl bootout gui/$UID/com.hyperio.vpn` best-effort + remove file.
-- linux: write `~/.config/autostart/hyp-vpn.desktop` with `Type=Application`, `Name=Hyperio VPN`, `Exec=<exePath>`, `X-GNOME-Autostart-enabled=true`. Disable: remove file.
-- windows: `schtasks /Create /TN "HyperioVPN" /SC ONLOGON /RL HIGHEST /TR "<exePath>" /F`; Disable: `schtasks /Delete /TN "HyperioVPN" /F`; IsEnabled: `schtasks /Query /TN "HyperioVPN"` exit code.
+- darwin: write `~/Library/LaunchAgents/io.github.savvaskoualis.postern.plist` (`RunAtLoad=true`, `Label=io.github.savvaskoualis.postern`, `ProgramArguments=[exePath]`, no KeepAlive), then `launchctl bootstrap gui/$UID <plist>` best-effort (ignore "already loaded" error). Disable: `launchctl bootout gui/$UID/io.github.savvaskoualis.postern` best-effort + remove file.
+- linux: write `~/.config/autostart/postern.desktop` with `Type=Application`, `Name=Postern`, `Exec=<exePath>`, `X-GNOME-Autostart-enabled=true`. Disable: remove file.
+- windows: `schtasks /Create /TN "Postern" /SC ONLOGON /RL HIGHEST /TR "<exePath>" /F`; Disable: `schtasks /Delete /TN "Postern" /F`; IsEnabled: `schtasks /Query /TN "Postern"` exit code.
 
 - [ ] **Step 1: Write failing tests** (template rendering only — registration is OS-mutating, verified manually in Task 6)
 
@@ -953,11 +955,11 @@ import (
 )
 
 func TestDarwinPlist(t *testing.T) {
-	p := DarwinPlist("/usr/local/bin/hyp-vpn")
+	p := DarwinPlist("/usr/local/bin/postern")
 	for _, want := range []string{
-		"<key>Label</key>", "com.hyperio.vpn",
+		"<key>Label</key>", "io.github.savvaskoualis.postern",
 		"<key>RunAtLoad</key>", "<true/>",
-		"/usr/local/bin/hyp-vpn",
+		"/usr/local/bin/postern",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("plist missing %q:\n%s", want, p)
@@ -969,10 +971,10 @@ func TestDarwinPlist(t *testing.T) {
 }
 
 func TestLinuxDesktop(t *testing.T) {
-	d := LinuxDesktop("/usr/local/bin/hyp-vpn")
+	d := LinuxDesktop("/usr/local/bin/postern")
 	for _, want := range []string{
-		"[Desktop Entry]", "Type=Application", "Name=Hyperio VPN",
-		"Exec=/usr/local/bin/hyp-vpn",
+		"[Desktop Entry]", "Type=Application", "Name=Postern",
+		"Exec=/usr/local/bin/postern",
 	} {
 		if !strings.Contains(d, want) {
 			t.Errorf(".desktop missing %q:\n%s", want, d)
@@ -1002,7 +1004,7 @@ func DarwinPlist(exePath string) string {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.hyperio.vpn</string>
+	<string>io.github.savvaskoualis.postern</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
@@ -1017,7 +1019,7 @@ func DarwinPlist(exePath string) string {
 func LinuxDesktop(exePath string) string {
 	return fmt.Sprintf(`[Desktop Entry]
 Type=Application
-Name=Hyperio VPN
+Name=Postern
 Exec=%s
 X-GNOME-Autostart-enabled=true
 `, exePath)
@@ -1038,7 +1040,7 @@ import (
 
 func plistPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "LaunchAgents", "com.hyperio.vpn.plist")
+	return filepath.Join(home, "Library", "LaunchAgents", "io.github.savvaskoualis.postern.plist")
 }
 
 func Enable(exePath string) error {
@@ -1055,7 +1057,7 @@ func Enable(exePath string) error {
 }
 
 func Disable() error {
-	exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/com.hyperio.vpn", os.Getuid())).Run()
+	exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/io.github.savvaskoualis.postern", os.Getuid())).Run()
 	err := os.Remove(plistPath())
 	if os.IsNotExist(err) {
 		return nil
@@ -1081,7 +1083,7 @@ import (
 
 func desktopPath() string {
 	base, _ := os.UserConfigDir()
-	return filepath.Join(base, "autostart", "hyp-vpn.desktop")
+	return filepath.Join(base, "autostart", "postern.desktop")
 }
 
 func Enable(exePath string) error {
@@ -1113,7 +1115,7 @@ package autostart
 
 import "os/exec"
 
-const taskName = "HyperioVPN"
+const taskName = "Postern"
 
 func Enable(exePath string) error {
 	return exec.Command("schtasks", "/Create", "/TN", taskName,
@@ -1146,7 +1148,7 @@ git commit -m "feat: per-OS login-item autostart (launchd, XDG, schtasks)"
 ### Task 5: Tray UI + main wiring
 
 **Files:**
-- Create: `cmd/hyp-vpn/main.go`
+- Create: `cmd/postern/main.go`
 - Create: `internal/tray/tray.go`, `internal/tray/icons.go`
 - Modify: `go.mod` (add `fyne.io/systray`)
 
@@ -1219,8 +1221,8 @@ import (
 	"fmt"
 
 	"fyne.io/systray"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tunnel"
-	"github.com/hyperiosoftware/hyp-vpn/internal/xopen"
+	"github.com/savvaskoualis/postern/internal/tunnel"
+	"github.com/savvaskoualis/postern/internal/xopen"
 )
 
 type App interface {
@@ -1238,7 +1240,7 @@ func Run(app App) {
 
 func onReady(app App) {
 	systray.SetIcon(iconGray)
-	systray.SetTooltip("Hyperio VPN")
+	systray.SetTooltip("Postern")
 
 	status := systray.AddMenuItem("Disconnected", "")
 	status.Disable()
@@ -1333,7 +1335,7 @@ func File(path string) error {
 
 - [ ] **Step 4: Implement main**
 
-`cmd/hyp-vpn/main.go`:
+`cmd/postern/main.go`:
 
 ```go
 package main
@@ -1348,11 +1350,11 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/hyperiosoftware/hyp-vpn/internal/auth"
-	"github.com/hyperiosoftware/hyp-vpn/internal/autostart"
-	"github.com/hyperiosoftware/hyp-vpn/internal/config"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tray"
-	"github.com/hyperiosoftware/hyp-vpn/internal/tunnel"
+	"github.com/savvaskoualis/postern/internal/auth"
+	"github.com/savvaskoualis/postern/internal/autostart"
+	"github.com/savvaskoualis/postern/internal/config"
+	"github.com/savvaskoualis/postern/internal/tray"
+	"github.com/savvaskoualis/postern/internal/tunnel"
 )
 
 type app struct {
@@ -1398,7 +1400,7 @@ func main() {
 		log.Fatal(err)
 	}
 	os.MkdirAll(cfgDir, 0o700)
-	logPath := filepath.Join(cfgDir, "hyp-vpn.log")
+	logPath := filepath.Join(cfgDir, "postern.log")
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		log.SetOutput(f)
 		defer f.Close()
@@ -1448,12 +1450,12 @@ func loggedRun(run func(ctx context.Context, cookie string, connected func(strin
 
 - [ ] **Step 5: Build + vet + test everything**
 
-Run: `go vet ./... && go test ./... && go build ./cmd/hyp-vpn`
-Expected: clean build, binary `hyp-vpn` in repo root (gitignored? add `/hyp-vpn` to .gitignore)
+Run: `go vet ./... && go test ./... && go build ./cmd/postern`
+Expected: clean build, binary `postern` in repo root (gitignored? add `/postern` to .gitignore)
 
 - [ ] **Step 6: Manual smoke test (macOS, no VPN yet)**
 
-Run: `./hyp-vpn` — tray icon appears (gray), menu shows all items, Quit works. If openconnect not installed yet, Connect must end in red Error state with message in `~/Library/Application Support/hyp-vpn/hyp-vpn.log` — acceptable at this stage.
+Run: `./postern` — tray icon appears (gray), menu shows all items, Quit works. If openconnect not installed yet, Connect must end in red Error state with message in `~/Library/Application Support/postern/postern.log` — acceptable at this stage.
 
 - [ ] **Step 7: Commit**
 
@@ -1471,29 +1473,29 @@ git commit -m "feat: systray UI and main wiring"
 - Create: `scripts/install.sh` (macOS + Linux), `scripts/install.ps1` (Windows)
 
 **Interfaces:**
-- Consumes: the `hyp-vpn` binary; openconnect from package manager
-- Produces: `make release` → `dist/hyp-vpn-{darwin-arm64,darwin-amd64,linux-amd64,windows-amd64.exe}`
+- Consumes: the `postern` binary; openconnect from package manager
+- Produces: `make release` → `dist/postern-{darwin-arm64,darwin-amd64,linux-amd64,windows-amd64.exe}`
 
 - [ ] **Step 1: Makefile**
 
 ```makefile
-BIN := hyp-vpn
+BIN := postern
 DIST := dist
 
 .PHONY: build test release clean
 
 build:
-	go build -o $(BIN) ./cmd/hyp-vpn
+	go build -o $(BIN) ./cmd/postern
 
 test:
 	go vet ./... && go test ./...
 
 release: clean
 	mkdir -p $(DIST)
-	GOOS=darwin  GOARCH=arm64 go build -o $(DIST)/$(BIN)-darwin-arm64 ./cmd/hyp-vpn
-	GOOS=darwin  GOARCH=amd64 go build -o $(DIST)/$(BIN)-darwin-amd64 ./cmd/hyp-vpn
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o $(DIST)/$(BIN)-linux-amd64 ./cmd/hyp-vpn
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags -H=windowsgui -o $(DIST)/$(BIN)-windows-amd64.exe ./cmd/hyp-vpn
+	GOOS=darwin  GOARCH=arm64 go build -o $(DIST)/$(BIN)-darwin-arm64 ./cmd/postern
+	GOOS=darwin  GOARCH=amd64 go build -o $(DIST)/$(BIN)-darwin-amd64 ./cmd/postern
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o $(DIST)/$(BIN)-linux-amd64 ./cmd/postern
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags -H=windowsgui -o $(DIST)/$(BIN)-windows-amd64.exe ./cmd/postern
 
 clean:
 	rm -rf $(DIST) $(BIN)
@@ -1505,10 +1507,10 @@ Note: darwin targets need cgo (systray uses Cocoa) — build them natively on th
 
 ```bash
 #!/usr/bin/env bash
-# Installs hyp-vpn: openconnect dependency, binary, sudoers rule, autostart.
+# Installs postern: openconnect dependency, binary, sudoers rule, autostart.
 set -euo pipefail
 
-REPO_URL="${HYP_VPN_RELEASE_URL:-}" # optional: URL of prebuilt binary
+REPO_URL="${POSTERN_RELEASE_URL:-}" # optional: URL of prebuilt binary
 OS="$(uname -s)"
 
 install_openconnect() {
@@ -1524,38 +1526,38 @@ install_openconnect() {
 }
 
 install_binary() {
-  local target=/usr/local/bin/hyp-vpn
+  local target=/usr/local/bin/postern
   if [[ -n "$REPO_URL" ]]; then
-    curl -fsSL "$REPO_URL" -o /tmp/hyp-vpn && sudo install -m755 /tmp/hyp-vpn "$target"
+    curl -fsSL "$REPO_URL" -o /tmp/postern && sudo install -m755 /tmp/postern "$target"
   else
     # from a repo checkout
     make build
-    sudo install -m755 hyp-vpn "$target"
+    sudo install -m755 postern "$target"
   fi
 }
 
 install_sudoers() {
   local oc; oc="$(command -v openconnect)"
   local rule="$USER ALL=(root) NOPASSWD: $oc"
-  echo "$rule" | sudo tee /etc/sudoers.d/hyp-vpn >/dev/null
-  sudo chmod 440 /etc/sudoers.d/hyp-vpn
-  sudo visudo -c >/dev/null || { sudo rm /etc/sudoers.d/hyp-vpn; echo "sudoers validation failed" >&2; exit 1; }
+  echo "$rule" | sudo tee /etc/sudoers.d/postern >/dev/null
+  sudo chmod 440 /etc/sudoers.d/postern
+  sudo visudo -c >/dev/null || { sudo rm /etc/sudoers.d/postern; echo "sudoers validation failed" >&2; exit 1; }
 }
 
 install_openconnect
 install_binary
 install_sudoers
-/usr/local/bin/hyp-vpn &   # first launch registers autostart via default config
-echo "hyp-vpn installed. Tray icon should be visible; click Connect."
+/usr/local/bin/postern &   # first launch registers autostart via default config
+echo "postern installed. Tray icon should be visible; click Connect."
 ```
 
 - [ ] **Step 3: install.ps1**
 
 ```powershell
-# Installs hyp-vpn on Windows: openconnect, binary, elevated logon task.
+# Installs postern on Windows: openconnect, binary, elevated logon task.
 # Run from an elevated PowerShell.
 $ErrorActionPreference = "Stop"
-$dir = "$env:ProgramFiles\hyp-vpn"
+$dir = "$env:ProgramFiles\postern"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 # 1. openconnect (winget package provides openconnect + wintun)
@@ -1563,22 +1565,22 @@ if (-not (Get-Command openconnect -ErrorAction SilentlyContinue)) {
     winget install --accept-package-agreements --accept-source-agreements OpenConnect.OpenConnect
 }
 
-# 2. binary (expects hyp-vpn-windows-amd64.exe next to this script)
-Copy-Item "$PSScriptRoot\hyp-vpn-windows-amd64.exe" "$dir\hyp-vpn.exe" -Force
+# 2. binary (expects postern-windows-amd64.exe next to this script)
+Copy-Item "$PSScriptRoot\postern-windows-amd64.exe" "$dir\postern.exe" -Force
 
 # 3. elevated logon task (also serves as the elevation mechanism)
-schtasks /Create /TN "HyperioVPN" /SC ONLOGON /RL HIGHEST /TR "$dir\hyp-vpn.exe" /F
+schtasks /Create /TN "Postern" /SC ONLOGON /RL HIGHEST /TR "$dir\postern.exe" /F
 
 # 4. start now
-Start-ScheduledTask -TaskName "HyperioVPN"
-Write-Host "hyp-vpn installed; tray icon should appear."
+Start-ScheduledTask -TaskName "Postern"
+Write-Host "postern installed; tray icon should appear."
 ```
 
 Implementer note: verify the winget package id with `winget search openconnect` at implementation time; if no suitable package exists, document manual download of an openconnect Windows build in README and set `openconnect_path` in config.json accordingly.
 
 - [ ] **Step 4: Autostart flag wiring check**
 
-The Windows scheduled task from install.ps1 and `autostart.Enable` use the same task name `HyperioVPN` — confirm both files use it verbatim.
+The Windows scheduled task from install.ps1 and `autostart.Enable` use the same task name `Postern` — confirm both files use it verbatim.
 
 - [ ] **Step 5: End-to-end test on this mac (the real acceptance test)**
 
@@ -1587,12 +1589,12 @@ bash scripts/install.sh
 ```
 
 Then, with FortiClient quit:
-1. Tray icon appears; Connect → browser opens SAML page → after login tray goes green with `Connected — 10.212.134.x`.
+1. Tray icon appears; Connect → browser opens SAML page → after login tray goes green with `Connected — 10.0.0.x`.
 2. `ping <internal-host>` works (ask user for a known internal IP/host to verify).
 3. Wi-Fi off/on → yellow `Reconnecting…` → green without interaction.
 4. Disconnect from tray → gray, stays down.
 5. Quit app, relaunch → auto-connects (config Autostart=true).
-Expected: all five pass. Any failure: stop, debug with `~/Library/Application Support/hyp-vpn/hyp-vpn.log`, fix before proceeding.
+Expected: all five pass. Any failure: stop, debug with `~/Library/Application Support/postern/postern.log`, fix before proceeding.
 
 - [ ] **Step 6: Commit**
 
@@ -1615,7 +1617,7 @@ git commit -m "chore: build tooling and per-OS install scripts"
 1. What it is (one paragraph, mention it replaces FortiClient's missing auto-connect).
 2. **Before installing:** quit FortiClient and disable its login item (System Settings → General → Login Items on macOS). Never run both clients at once.
 3. Install per OS:
-   - macOS/Linux: `bash scripts/install.sh` (from repo checkout, or `HYP_VPN_RELEASE_URL=<url> bash scripts/install.sh`)
+   - macOS/Linux: `bash scripts/install.sh` (from repo checkout, or `POSTERN_RELEASE_URL=<url> bash scripts/install.sh`)
    - Windows: elevated PowerShell, `.\scripts\install.ps1` with the release exe alongside.
    - macOS Gatekeeper note: unsigned binary → right-click → Open on first launch.
 4. Usage: tray menu items; first connect opens a browser SAML login; later connects are silent until the IdP session expires.
@@ -1636,4 +1638,4 @@ git commit -m "docs: install, usage, troubleshooting"
 
 - **Spec coverage:** tray+status ✓ (T5), connect/disconnect ✓ (T3/T5), SAML ✓ (T2), autostart ✓ (T4), reconnect/backoff ✓ (T3), per-OS install + sudoers ✓ (T6), logs ✓ (T5/T7), FortiClient caveat ✓ (T7), release builds ✓ (T6).
 - **Known risk flagged for implementer:** exact openconnect stderr strings for cookie rejection vary by version — `RunOpenconnect` matches three known variants; adjust after first real test in Task 6 Step 5 if reconnect-after-expiry misbehaves (symptom: endless yellow instead of browser popup).
-- **Type consistency:** `tunnel.Event`/`State` names used in tray match Task 3 definitions; `App` interface in tray matches `app` struct methods in main; autostart task name `HyperioVPN` consistent between Go code and install.ps1.
+- **Type consistency:** `tunnel.Event`/`State` names used in tray match Task 3 definitions; `App` interface in tray matches `app` struct methods in main; autostart task name `Postern` consistent between Go code and install.ps1.
