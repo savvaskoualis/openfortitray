@@ -16,6 +16,13 @@
 #   POSTERN_OPENCONNECT=/path/to/openconnect  # use this openconnect, not the one on PATH
 #   POSTERN_HELPER_DIR=/usr/libexec           # install the privileged helper elsewhere
 #
+# POSTERN_HELPER_DIR moves three things at once: the helper, the sudoers rule that
+# names it, and the "helper_path" the app dials. On a first install this script
+# records it in config.json for you. On a machine that already has a config.json it
+# cannot rewrite one, so a mismatch between the two is refused with instructions
+# rather than installed — a helper the app never calls, or one it calls without a
+# sudoers rule, fails at every connect with a password prompt the tray cannot answer.
+#
 # THREAT MODEL (the same one documented in scripts/postern-tunnel):
 #
 #   The sudoers rule written here grants the invoking user passwordless root for
@@ -41,8 +48,12 @@ BIN_TARGET=/usr/local/bin/postern
 HELPER_SRC="$REPO_DIR/scripts/postern-tunnel"
 # Overridable so a machine whose /usr/local is user-owned (an Intel-mac Homebrew
 # prefix) can put the helper somewhere root-owned instead of loosening the check.
-# Changing it means matching "helper_path" in the app's config.json.
-HELPER_DIR="${POSTERN_HELPER_DIR:-/usr/local/libexec}"
+# Keep DEFAULT_HELPER_DIR in step with tunnel.DefaultHelperPath in the Go app: it is
+# what the app dials when config.json sets no "helper_path", so this script has to
+# know it to tell "the user chose this path" from "the app's built-in default".
+DEFAULT_HELPER_DIR=/usr/local/libexec
+DEFAULT_HELPER_TARGET="$DEFAULT_HELPER_DIR/postern-tunnel"
+HELPER_DIR="${POSTERN_HELPER_DIR:-$DEFAULT_HELPER_DIR}"
 HELPER_TARGET="$HELPER_DIR/postern-tunnel"
 SUDOERS_TARGET=/etc/sudoers.d/postern
 GATEWAY="${POSTERN_GATEWAY:-}"
@@ -143,8 +154,9 @@ check_chain() {
 			"anything reachable from a passwordless-root path must be root-owned and not writable by others." \
 			"Remedy: sudo chown root:$ROOT_GROUP $HELPER_DIR && sudo chmod 755 $HELPER_DIR" \
 			"(an Intel-mac Homebrew prefix leaves /usr/local user-owned), or point the helper" \
-			"somewhere already root-owned by setting POSTERN_HELPER_DIR=/usr/libexec and matching" \
-			"\"helper_path\" in ~/Library/Application Support/postern/config.json." >&2
+			"somewhere already root-owned by setting POSTERN_HELPER_DIR=/usr/libexec — this script" \
+			"records that as \"helper_path\" when it writes config.json, and refuses to run at all" \
+			"if an existing config.json names a different one." >&2
 		exit 1
 	fi
 	while IFS= read -r problem; do warn "$problem"; done <<<"$problems"
@@ -213,6 +225,21 @@ validate_gateway() {
 	GATEWAY_PORT="$port"
 }
 
+# validate_helper_dir refuses a POSTERN_HELPER_DIR that cannot be embedded safely.
+# The path ends up in three places with three different quoting rules — a sudoers
+# rule, a JSON string in config.json, and a sudo command line — so rather than escape
+# for each, anything outside a conservative charset is rejected. A trailing slash is
+# refused too: it would make the installed path ("$dir//postern-tunnel") differ as a
+# string from the one written to config.json, and sudoers matches on the string.
+validate_helper_dir() {
+	[[ "$HELPER_DIR" == /* ]] ||
+		die "POSTERN_HELPER_DIR must be an absolute path, got '$HELPER_DIR'"
+	[[ "$HELPER_DIR" != */ ]] ||
+		die "POSTERN_HELPER_DIR must not end in '/', got '$HELPER_DIR'"
+	[[ "$HELPER_DIR" =~ ^[A-Za-z0-9._/+-]+$ ]] ||
+		die "POSTERN_HELPER_DIR contains characters unsafe to embed in a sudoers rule and in config.json: '$HELPER_DIR'"
+}
+
 # principal_home prints $PRINCIPAL's home directory. Under sudo, $HOME is root's,
 # so the config would land where the app never looks. PRINCIPAL has already been
 # checked against ^[A-Za-z0-9._-]+$ by resolve_principal, which is what makes the
@@ -262,6 +289,65 @@ config_has_gateway() {
 	grep -qE '"gateway"[[:space:]]*:[[:space:]]*"[^"]+"' "$1" 2>/dev/null
 }
 
+# config_helper_path prints the "helper_path" string set in $1, or nothing when the
+# key is absent or the file does not exist.
+#
+# DELIBERATELY FRAGILE: a sed expression, not a JSON parser, for the same reason as
+# config_has_gateway — jq is not installed by default on any platform this script
+# runs on, and pulling in a dependency to read one string is a worse trade. It
+# understands the one-key-per-line shape this script writes and a human edits, and
+# nothing else: no escape sequences, no two keys on one line, no comments. Anything
+# it cannot read looks to it like a config with no helper_path, i.e. the default —
+# which is why verify() re-checks the path it derived by actually invoking it
+# instead of trusting this.
+config_helper_path() {
+	sed -n 's/.*"helper_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null |
+		head -n 1
+}
+
+# effective_helper_path prints the helper the *app* will invoke: whatever
+# config.json names, or the app's built-in default when it names nothing. This, not
+# HELPER_TARGET, is the path that has to be reachable through sudo -n; the two agree
+# on a normal install and can disagree on a re-run with a different
+# POSTERN_HELPER_DIR, which is precisely the case this exists to catch.
+effective_helper_path() {
+	local configured
+	configured="$(config_helper_path "$(config_dir)/config.json")"
+	printf '%s\n' "${configured:-$DEFAULT_HELPER_TARGET}"
+}
+
+# require_config_helper_match aborts when the app would dial a different helper from
+# the one this run is about to install. It runs before anything privileged happens,
+# because the alternative is the trap this replaces: the installer places the helper
+# and the sudoers rule at HELPER_TARGET, verifies *that* path, reports success — and
+# every connect then fails, because the app dials the path in config.json, for which
+# no sudoers rule exists.
+#
+# It cannot pick a side on the user's behalf: this script does not rewrite an
+# existing config, and either path may be the intended one. So it names both and the
+# two ways to reconcile them.
+require_config_helper_match() {
+	local file="$1" configured effective
+	configured="$(config_helper_path "$file")"
+	effective="${configured:-$DEFAULT_HELPER_TARGET}"
+	[[ "$effective" != "$HELPER_TARGET" ]] || return 0
+
+	printf 'install: error: %s\n' \
+		"the app and this install disagree about where the privileged helper lives." >&2
+	if [[ -n "$configured" ]]; then
+		printf 'install: error: %s\n' "  $file sets \"helper_path\": \"$configured\"" >&2
+	else
+		printf 'install: error: %s\n' \
+			"  $file sets no \"helper_path\", so the app uses the default $DEFAULT_HELPER_TARGET" >&2
+	fi
+	printf 'install: error: %s\n' \
+		"  this run would install the helper and the sudoers rule at $HELPER_TARGET" \
+		"Nothing has been installed. Reconcile them one of two ways:" \
+		"  1. re-run with POSTERN_HELPER_DIR=$(dirname "$effective")   (install where the app already looks)" \
+		"  2. set \"helper_path\": \"$HELPER_TARGET\" in $file   (point the app at this run's location)" >&2
+	exit 1
+}
+
 # install_config makes sure the app has a gateway to dial before anything
 # privileged happens, so a missing POSTERN_GATEWAY costs the user nothing but a
 # re-run.
@@ -279,6 +365,9 @@ install_config() {
 			[[ -z "$GATEWAY" ]] ||
 				warn "$file already sets a gateway; POSTERN_GATEWAY ignored (edit the file to change it)"
 			log "using the gateway already configured in $file"
+			# Checked here rather than at the end: an existing config that names a
+			# different helper is a stop-before-you-touch-anything condition.
+			require_config_helper_match "$file"
 			return
 		fi
 		die "$file exists but sets no gateway. Add one by hand (this installer will not rewrite an existing config): \"gateway\": \"<host>\", \"port\": <port>"
@@ -289,11 +378,25 @@ install_config() {
 	validate_gateway "$GATEWAY"
 
 	as_principal mkdir -p "$dir"
-	printf '{\n  "gateway": "%s",\n  "port": %s\n}\n' "$GATEWAY_HOST" "$GATEWAY_PORT" |
-		as_principal tee "$file" >/dev/null
+	# helper_path is written only when it differs from the app's built-in default,
+	# so an ordinary install still produces a two-key config with nothing in it to
+	# go stale. When POSTERN_HELPER_DIR *is* in play the key is mandatory: without
+	# it the app would dial $DEFAULT_HELPER_TARGET while the helper and its sudoers
+	# rule sit somewhere else — an install that verifies clean and never connects.
+	# (validate_helper_dir has already refused any path needing JSON escaping.)
+	if [[ "$HELPER_TARGET" == "$DEFAULT_HELPER_TARGET" ]]; then
+		printf '{\n  "gateway": "%s",\n  "port": %s\n}\n' "$GATEWAY_HOST" "$GATEWAY_PORT"
+	else
+		printf '{\n  "gateway": "%s",\n  "port": %s,\n  "helper_path": "%s"\n}\n' \
+			"$GATEWAY_HOST" "$GATEWAY_PORT" "$HELPER_TARGET"
+	fi | as_principal tee "$file" >/dev/null
 	as_principal chmod 0700 "$dir"
 	as_principal chmod 0600 "$file"
-	log "wrote $file (gateway $GATEWAY_HOST:$GATEWAY_PORT)"
+	if [[ "$HELPER_TARGET" == "$DEFAULT_HELPER_TARGET" ]]; then
+		log "wrote $file (gateway $GATEWAY_HOST:$GATEWAY_PORT)"
+	else
+		log "wrote $file (gateway $GATEWAY_HOST:$GATEWAY_PORT, helper_path $HELPER_TARGET)"
+	fi
 }
 
 install_openconnect() {
@@ -411,17 +514,36 @@ install_sudoers() {
 	log "installed $SUDOERS_TARGET: $rule"
 }
 
+# verify checks the path the *app* will invoke, which is not necessarily the one
+# this script just installed: the app reads "helper_path" from config.json and falls
+# back to its own default. Checking HELPER_TARGET instead would report success for
+# exactly the install that cannot work — helper and sudoers rule in one place, the
+# app dialling another. install_config refuses that combination up front; this is the
+# backstop for the case it cannot see, a config.json whose shape the sed in
+# config_helper_path failed to read.
+#
+# The invocation goes through as_principal because the rule names $PRINCIPAL: when
+# the whole installer was run under sudo we are already root, and a bare `sudo -n`
+# would succeed for root no matter what /etc/sudoers.d/postern says — a check that
+# passes on a machine where the app is broken.
 verify() {
+	local app_helper
+	app_helper="$(effective_helper_path)"
+	if [[ "$app_helper" != "$HELPER_TARGET" ]]; then
+		die "$(config_dir)/config.json points the app at $app_helper, but the helper and the sudoers rule were installed at $HELPER_TARGET. Set \"helper_path\": \"$HELPER_TARGET\" in that file, or re-run with POSTERN_HELPER_DIR=$(dirname "$app_helper")"
+	fi
 	# "stop" with no tunnel running is a successful no-op, which makes it the
 	# cheapest end-to-end check that the rule, the path and the mode all line up.
-	sudo -n "$HELPER_TARGET" stop >/dev/null 2>&1 ||
-		die "'sudo -n $HELPER_TARGET stop' still prompts or fails; the sudoers rule is not effective for $PRINCIPAL"
-	log "verified passwordless helper invocation as $PRINCIPAL"
+	as_principal sudo -n "$app_helper" stop >/dev/null 2>&1 ||
+		die "'sudo -n $app_helper stop' still prompts or fails; the sudoers rule is not effective for $PRINCIPAL"
+	log "verified passwordless invocation of $app_helper (the path the app dials) as $PRINCIPAL"
 }
 
 resolve_principal
-# Before anything privileged: a missing or malformed POSTERN_GATEWAY should cost a
-# re-run, not a half-finished install.
+validate_helper_dir
+# Before anything privileged: a missing or malformed POSTERN_GATEWAY, or a config
+# that names a helper somewhere else, should cost a re-run rather than a
+# half-finished install.
 install_config
 preflight_paths
 install_openconnect

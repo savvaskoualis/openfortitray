@@ -56,6 +56,19 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
+      # The windows-only files (internal/autostart/autostart_windows.go, the
+      # scheduled-task path) are invisible to the two runners above: build
+      # constraints exclude them, so a compile error there would first surface
+      # when release.yml cross-builds at tag time — after the tag exists. This
+      # type-checks them on every push. Build only, no test: `go test` would need
+      # a windows runner to execute anything.
+      - name: Cross-build for windows
+        if: runner.os == 'Linux'
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...
+
       # Shell syntax gate for the installer and the privileged helper. Linux
       # only: these are parse checks, not execution, so one platform suffices.
       # install.sh is bash (arrays, [[ ]]); postern-tunnel is strict POSIX sh

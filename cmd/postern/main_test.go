@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -62,8 +61,14 @@ func TestConnectWithoutGatewayReportsMissingSetting(t *testing.T) {
 		if !strings.Contains(e.Detail, "gateway not set") {
 			t.Errorf("detail = %q, want it to say the gateway is not set", e.Detail)
 		}
-		if want := filepath.Join(cfgDir, "config.json"); !strings.Contains(e.Detail, want) {
-			t.Errorf("detail = %q, want it to name the file to edit (%s)", e.Detail, want)
+		if !strings.Contains(e.Detail, "config.json") {
+			t.Errorf("detail = %q, want it to name the file to edit (config.json)", e.Detail)
+		}
+		// The tray clips the status line at 60 runes, so a detail longer than that
+		// reaches the user truncated. The absolute config path does not fit; it
+		// lives in the log line instead.
+		if n := len([]rune(e.Detail)); n > 60 {
+			t.Errorf("detail is %d runes (%q); the tray clips at 60", n, e.Detail)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no event emitted for a missing gateway")

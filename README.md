@@ -27,7 +27,7 @@ the credentials.
 
 ## How it works
 
-One Go binary, `postern`, wires five internal packages together:
+One Go binary, `postern`, wires six internal packages together:
 
 | package | responsibility |
 | --- | --- |
@@ -36,6 +36,7 @@ One Go binary, `postern`, wires five internal packages together:
 | `internal/tunnel` | supervises the `openconnect` process: start, watch, back off, restart |
 | `internal/autostart` | per-user login item (LaunchAgent / XDG autostart / scheduled task) |
 | `internal/tray` | the menu and status icon (`fyne.io/systray`) |
+| `internal/xopen` | opens a path with the OS default handler (`open` / `xdg-open` / `cmd /c start`) |
 
 ### The SAML flow
 
@@ -145,11 +146,12 @@ Other environment knobs:
 | `POSTERN_GATEWAY` | gateway as `host:port`; written to `config.json` on a first install |
 | `POSTERN_RELEASE_URL` | download and install this binary instead of running `make build` |
 | `POSTERN_OPENCONNECT` | use this absolute `openconnect` path instead of the one on `PATH` |
-| `POSTERN_HELPER_DIR` | install the helper somewhere other than `/usr/local/libexec` (match `helper_path` in `config.json`) |
+| `POSTERN_HELPER_DIR` | install the helper somewhere other than `/usr/local/libexec`; recorded as `helper_path` when the installer writes `config.json` |
 
 The installer places `/usr/local/bin/postern`, the helper, and the sudoers rule, then
-verifies that `sudo -n <helper> stop` runs without prompting. It does not launch the
-app or create the login item:
+verifies that `sudo -n <helper> stop` runs without prompting — using the `helper_path`
+your `config.json` actually names, not just the path it installed to. It does not launch
+the app or create the login item:
 
 ```sh
 /usr/local/bin/postern &
@@ -159,7 +161,12 @@ Enable auto-connect at login from the tray menu afterwards.
 
 `POSTERN_HELPER_DIR=/usr/libexec` is the escape hatch for an Intel Mac, where
 Homebrew leaves `/usr/local` user-owned and the install aborts rather than putting a
-passwordless-root helper on a path others can write.
+passwordless-root helper on a path others can write. It moves three things together:
+the helper, the sudoers rule that names it, and the `helper_path` the app dials. On a
+first install the value is written into `config.json` for you. The installer never
+rewrites an existing `config.json`, so if one already names a different `helper_path`
+it stops before touching anything and prints both ways to reconcile them — pass
+`POSTERN_HELPER_DIR` again on the re-run, or edit the key.
 
 #### macOS Gatekeeper
 
@@ -269,8 +276,9 @@ A password prompt or an error means the rule is missing, names the wrong user (a
 cause: the installer was run under `sudo`), or `helper_path` in your config no longer
 matches the path the rule names. Re-run `scripts/install.sh` as your normal user.
 
-**Status reads `gateway not set — edit …/config.json`.** No gateway is configured. Add
-one to `config.json` (see the table above) and restart the app.
+**Status reads `gateway not set — see config.json`.** No gateway is configured. Add one
+to `config.json` (see the table above) and restart the app; the log file names the exact
+path.
 
 **Stuck on `Reconnecting…` forever.** Usually your VPN session died and your
 openconnect build words the rejection differently from the fragments Postern matches
@@ -296,6 +304,11 @@ sudo /usr/local/libexec/postern-tunnel stop
 
 `stop` is idempotent — running it with no tunnel up is a successful no-op — and it
 clears the stale `/var/run/postern-openconnect.pid`.
+
+On Windows there is no helper and no clean interrupt: Postern hard-kills openconnect on
+disconnect (Go cannot send an interrupt to a Windows process), so routes and the wintun
+adapter are left as openconnect had them until you reconnect or reboot — one of which
+always restores them. This is by design, not a regression.
 
 **openconnect not found, or a warning about its path.** Re-run `scripts/install.sh`,
 or point it at a specific binary with `POSTERN_OPENCONNECT=/absolute/path`. On a shared

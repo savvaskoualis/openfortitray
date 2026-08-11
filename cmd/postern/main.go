@@ -33,11 +33,17 @@ type app struct {
 // open against a nonexistent host and the failure would surface as an opaque
 // connection error. Reporting the missing setting instead, as the terminal Error
 // state, tells the user the one thing they have to do.
+//
+// The menu text names the file but not its directory, because tray.short() clips
+// the detail at 60 runes and the full path ("~/Library/Application
+// Support/postern/config.json") does not fit — the user would see the sentence
+// truncated mid-path, which is worse than no path at all. The log line below
+// carries the absolute path for anyone who needs it.
 func (a *app) Connect() {
 	if a.cfg.Gateway == "" {
-		msg := "gateway not set — edit " + filepath.Join(a.cfgDir, "config.json")
-		log.Printf("connect refused: %s", msg)
-		a.emit(tunnel.Event{State: tunnel.Error, Detail: msg})
+		log.Printf("connect refused: gateway not set — edit %s",
+			filepath.Join(a.cfgDir, "config.json"))
+		a.emit(tunnel.Event{State: tunnel.Error, Detail: "gateway not set — see config.json"})
 		return
 	}
 	a.sup.Connect()

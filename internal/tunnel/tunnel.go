@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"regexp"
@@ -53,6 +54,15 @@ type Event struct {
 
 // ErrAuthRejected signals the backend refused the cookie (re-auth needed).
 var ErrAuthRejected = errors.New("tunnel: cookie rejected")
+
+// ErrPermanent marks a failure no amount of retrying can clear: the backend
+// binary is not there, the privileged helper was never installed, or the sudoers
+// rule that makes it callable without a password is gone. The supervisor turns it
+// into the terminal Error state instead of spinning in Reconnecting forever,
+// because the tray's "Reconnecting…" is a promise the loop cannot keep — the user
+// has to fix the installation, and only a message that stays on screen tells them
+// so.
+var ErrPermanent = errors.New("tunnel: install is broken")
 
 // AuthFunc obtains a fresh VPN cookie.
 type AuthFunc func(ctx context.Context) (string, error)
@@ -213,7 +223,8 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	}
 
 	cookie := ""
-	proven := false // this cookie carried a healthy connection at some point
+	proven := false        // this cookie carried a healthy connection at some point
+	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
 	backoff := s.backoffBase
 	for {
@@ -250,10 +261,29 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		}
 		wasConnected := up.Load()
 		if wasConnected {
+			everConnected = true
 			backoff = s.backoffBase
 			if time.Since(time.Unix(0, connectedAt.Load())) >= s.minHealthy {
 				proven = true // the cookie worked for a real session
 			}
+		}
+
+		// A permanent failure means the installation is broken, so retrying only
+		// burns the user's time behind a "Reconnecting…" that will never resolve.
+		// Report it and stop; Error is terminal, which also leaves Connect
+		// clickable so a fixed install can be tried without restarting the app.
+		//
+		// Gated on everConnected — the whole session, not just this attempt —
+		// because a tunnel that demonstrably worked a moment ago was installed
+		// correctly. A permanent-looking failure after that is far more likely to
+		// be transient (sudo momentarily unavailable, the package manager
+		// mid-upgrade, config management rewriting /etc/sudoers.d) than a real
+		// misconfiguration, and killing a working session's supervisor over it
+		// would be worse than backing off and trying again.
+		if errors.Is(err, ErrPermanent) && !everConnected {
+			emittedError = true
+			s.emit(gen, Error, err.Error())
+			return
 		}
 
 		if errors.Is(err, ErrAuthRejected) {
@@ -343,6 +373,49 @@ func isAuthRejected(output string) bool {
 	}
 	return false
 }
+
+// permanentMarkers are output fragments meaning the privileged path itself is
+// not set up, as opposed to the tunnel failing. Matched case-insensitively, so
+// they must be written in lower case (TestPermanentMarkersAreLowercase enforces
+// that).
+//
+// Both come from our own side of the boundary, not from openconnect, which is
+// what makes them safe to treat as terminal:
+//
+//   - "a password is required" is sudo's reply to `sudo -n` when the
+//     /etc/sudoers.d/postern rule is missing, does not name this user, or names
+//     a different helper path. No cookie, gateway or network state can produce
+//     it, and no retry can clear it.
+//   - "not installed: run scripts/install.sh" is scripts/postern-tunnel's own
+//     guard, printed when the helper still carries the @OPENCONNECT@ placeholder
+//     because it was copied into place without going through the installer.
+//
+// Deliberately narrow. A marker that also fires on ordinary trouble would strand
+// the user in a terminal Error over a hiccup, which is the opposite failure and
+// the harder one to recover from (only Connect gets them out of it).
+var permanentMarkers = []string{
+	"a password is required",
+	"not installed: run scripts/install.sh",
+}
+
+// isPermanent reports whether the backend's output says the install is broken
+// rather than the connection.
+func isPermanent(output string) bool {
+	lower := strings.ToLower(output)
+	for _, marker := range permanentMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// installHint leads the detail of every permanent failure — before the
+// diagnostics, not after them. Every one of them is fixed the same way, and the
+// tray keeps only the first line of a detail and clips it at 60 runes, so an
+// instruction placed after the process output would be the part that gets cut.
+// The diagnostics go on the following lines, where the log file still has them.
+const installHint = "re-run scripts/install.sh"
 
 // DefaultHelperPath is where scripts/install.sh puts the privileged helper.
 const DefaultHelperPath = "/usr/local/libexec/postern-tunnel"
@@ -472,8 +545,25 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 			cmd.Cancel = func() error { return runHelperStop(cmd, stopName, stopArgs) }
 			cmd.WaitDelay = helperWaitDelay
 		} else {
-			// Interrupt rather than kill so openconnect tears the tunnel down
-			// and restores routing; WaitDelay is the hard backstop.
+			// The direct path is Windows in production (cmd/postern sets
+			// UseSudo = GOOS != "windows"), and on Windows this branch always
+			// kills: os.Process.Signal(os.Interrupt) is unimplemented there and
+			// returns an error unconditionally, so the fallback below is the only
+			// path actually taken. A hard kill means openconnect never runs its
+			// own teardown, so routes and the wintun adapter are left as they
+			// were — reconnecting or rebooting is what restores them. This is a
+			// known limitation, not a bug to work around here: interrupting a
+			// Windows process requires a console-control-event dance
+			// (GenerateConsoleCtrlEvent against a shared console group) that
+			// would have to be built into the child's startup, and the app is
+			// elevated on that platform so the routing damage is repairable.
+			//
+			// The Signal attempt is kept for the POSIX case, which the tests
+			// exercise (TestRunOpenconnectDirectPathIsSignalled) and which is
+			// reachable in production only if UseSudo is ever set false on
+			// macOS/Linux: there SIGINT makes openconnect tear the tunnel down
+			// and restore routing itself. WaitDelay is the hard backstop for
+			// both.
 			cmd.Cancel = func() error {
 				if err := cmd.Process.Signal(os.Interrupt); err != nil {
 					return cmd.Process.Kill()
@@ -499,6 +589,19 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 			stdin.Close()
 			pw.Close()
 			pr.Close()
+			// Nothing to execute: either sudo is missing (privileged path) or
+			// openconnect is not there (direct path). Every retry would look the
+			// same, so mark it terminal and say what fixes it.
+			//
+			// Two error shapes, because os/exec produces different ones: a bare
+			// name that PATH lookup cannot resolve yields exec.ErrNotFound, while
+			// a path with separators is used verbatim and fails at execve with
+			// ENOENT. The second is the common one on Windows, where
+			// openconnect_path is an absolute install path — classifying only the
+			// first would leave that platform looping forever.
+			if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("%w: %s\ncannot run %s: %w", ErrPermanent, installHint, name, err)
+			}
 			return fmt.Errorf("start openconnect: %w", err)
 		}
 
@@ -539,6 +642,13 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		// a refused cookie and still exit 0.
 		if isAuthRejected(tail) {
 			return ErrAuthRejected
+		}
+		// Likewise regardless of exit status, and checked before the generic exit
+		// error below so the wrapping carries the sentinel. Whether this actually
+		// ends the session is the supervisor's call: it retries a permanent-looking
+		// failure that follows a healthy connection (see loop()).
+		if isPermanent(tail) {
+			return fmt.Errorf("%w: %s\n%s", ErrPermanent, installHint, strings.TrimSpace(tail))
 		}
 		if err != nil {
 			return fmt.Errorf("openconnect exited: %w\n%s", err, tail)

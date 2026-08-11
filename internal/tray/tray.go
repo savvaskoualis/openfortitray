@@ -77,43 +77,58 @@ func onReady(app App) {
 // run to many lines, and the full text is already in the log file.
 const maxDetail = 60
 
-func render(e tunnel.Event, status, connect, disconnect *systray.MenuItem) {
-	var title string
+// view is everything one event changes about the menu. It exists so the
+// state→appearance mapping can be tested without a live status bar: on macOS
+// systray.SetIcon goes straight into Cocoa with no no-op path for a tray that was
+// never started, so a test that called render would be exercising AppKit rather
+// than this package.
+type view struct {
+	icon  []byte
+	title string
+	// canConnect enables Connect and disables Disconnect; false is the reverse.
+	// The two are always opposites — there is no state where both make sense.
+	canConnect bool
+}
+
+func viewFor(e tunnel.Event) view {
 	switch e.State {
 	case tunnel.Connected:
-		systray.SetIcon(iconGreen)
-		title = "Connected"
+		title := "Connected"
 		if ip := short(e.Detail); ip != "" {
 			title += " — " + ip
 		}
-		connect.Disable()
-		disconnect.Enable()
+		return view{icon: iconGreen, title: title}
 	case tunnel.Authenticating, tunnel.Connecting, tunnel.Reconnecting:
-		systray.SetIcon(iconYellow)
-		title = e.State.String() + "…"
+		title := e.State.String() + "…"
 		if d := short(e.Detail); d != "" {
 			title = e.State.String() + " — " + d
 		}
-		connect.Disable()
-		disconnect.Enable()
+		return view{icon: iconYellow, title: title}
 	case tunnel.Error:
 		// Error is terminal for a run: no Disconnected follows it, so the menu
 		// has to offer Connect again from here.
-		systray.SetIcon(iconRed)
-		title = "Error"
+		title := "Error"
 		if d := short(e.Detail); d != "" {
 			title = "Error: " + d
 		}
-		connect.Enable()
-		disconnect.Disable()
+		return view{icon: iconRed, title: title, canConnect: true}
 	default:
-		systray.SetIcon(iconGray)
-		title = "Disconnected"
+		return view{icon: iconGray, title: "Disconnected", canConnect: true}
+	}
+}
+
+func render(e tunnel.Event, status, connect, disconnect *systray.MenuItem) {
+	v := viewFor(e)
+	systray.SetIcon(v.icon)
+	if v.canConnect {
 		connect.Enable()
 		disconnect.Disable()
+	} else {
+		connect.Disable()
+		disconnect.Enable()
 	}
-	status.SetTitle(title)
-	systray.SetTooltip("Postern — " + title)
+	status.SetTitle(v.title)
+	systray.SetTooltip("Postern — " + v.title)
 }
 
 // short reduces event detail to a single short line fit for a menu item.

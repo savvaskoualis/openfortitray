@@ -3,10 +3,12 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +67,25 @@ func (c *collector) waitFor(t *testing.T, want State, timeout time.Duration) Eve
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("state %v never reached; got %+v", want, c.snapshot())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForDetail is waitFor for the cases where two events share a state and only
+// the detail tells them apart (a Reconnecting caused by a plain exit, versus one
+// caused by a permanent-looking failure the supervisor decided to retry).
+func (c *collector) waitForDetail(t *testing.T, want State, detail string, timeout time.Duration) Event {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, e := range c.snapshot() {
+			if e.State == want && strings.Contains(e.Detail, detail) {
+				return e
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %v event with a detail containing %q; got %+v", want, detail, c.snapshot())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -350,6 +371,164 @@ func TestAuthFailureStopsWithError(t *testing.T) {
 	s.Disconnect()
 }
 
+// A broken installation cannot be retried away. Before this was classified, a
+// missing openconnect or a missing sudoers rule left the tray cycling
+// "Reconnecting…" forever: the one state that promises the app is handling it,
+// while every attempt failed identically and the user was never told what to fix.
+//
+// The counterweight is that a *working* tunnel must not be killed off by a
+// permanent-looking blip, so the terminal verdict is gated on the tunnel never
+// having come up since this Connect — the last case below is that gate.
+func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
+	// A stub sudo that prints one thing and fails, standing in for the two ways
+	// the privileged path can be missing.
+	failingSudo := func(t *testing.T, output string) RunFunc {
+		t.Helper()
+		sudo := writeScript(t, t.TempDir(), "sudo", "#!/bin/sh\n"+
+			"cat >/dev/null\n"+ // swallow the cookie on stdin
+			"printf '%s\\n' "+strconv.Quote(output)+" >&2\n"+
+			"exit 1\n")
+		return RunOpenconnect(Options{
+			Gateway:    "gw.example.com:10443",
+			HelperPath: "/opt/custom/postern-tunnel",
+			UseSudo:    true,
+			sudoPath:   sudo,
+		})
+	}
+
+	tests := []struct {
+		name       string
+		needsShell bool // uses a shell stub, so POSIX only
+		runFn      func(t *testing.T) RunFunc
+		wantState  State
+		wantDetail string
+		wantRuns   int32 // exact when terminal, a minimum otherwise
+		terminal   bool
+	}{{
+		// The real runner, so exec.ErrNotFound → ErrPermanent is exercised end to
+		// end rather than injected.
+		name: "backend binary is not on PATH",
+		runFn: func(t *testing.T) RunFunc {
+			return RunOpenconnect(Options{
+				OpenconnectPath: "postern-openconnect-does-not-exist",
+				Gateway:         "gw.example.com:10443",
+			})
+		},
+		wantState:  Error,
+		wantDetail: "scripts/install.sh", // the message has to say what fixes it
+		wantRuns:   1,
+		terminal:   true,
+	}, {
+		name:       "sudoers rule is missing, so sudo -n wants a password",
+		needsShell: true,
+		runFn: func(t *testing.T) RunFunc {
+			return failingSudo(t, "sudo: a password is required")
+		},
+		wantState:  Error,
+		wantDetail: "a password is required",
+		wantRuns:   1,
+		terminal:   true,
+	}, {
+		name:       "helper is in place but never went through the installer",
+		needsShell: true,
+		runFn: func(t *testing.T) RunFunc {
+			return failingSudo(t, "postern-tunnel: not installed: run scripts/install.sh, "+
+				"which bakes in the openconnect path")
+		},
+		wantState:  Error,
+		wantDetail: "not installed",
+		wantRuns:   1,
+		terminal:   true,
+	}, {
+		// The gate: the install demonstrably worked, so the same marker is now
+		// far more likely to be transient (sudo unavailable for a moment, config
+		// management rewriting /etc/sudoers.d) than a real misconfiguration.
+		name: "the same marker after a healthy connection keeps retrying",
+		runFn: func(t *testing.T) RunFunc {
+			var attempts atomic.Int32
+			return func(ctx context.Context, cookie string, connected func(string)) error {
+				if attempts.Add(1) == 1 {
+					connected("10.0.0.5")
+					return nil // the link dropped; nothing wrong with the install
+				}
+				return fmt.Errorf("%w: %s\nsudo: a password is required", ErrPermanent, installHint)
+			}
+		},
+		wantState:  Reconnecting,
+		wantDetail: "a password is required",
+		wantRuns:   2,
+		terminal:   false,
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.needsShell && runtime.GOOS == "windows" {
+				t.Skip("shell stub: POSIX only (the privileged path is macOS/Linux anyway)")
+			}
+			events := make(chan Event, 64)
+			c := collect(events)
+			defer c.close()
+
+			var runs atomic.Int32
+			inner := tc.runFn(t)
+			run := func(ctx context.Context, cookie string, connected func(string)) error {
+				runs.Add(1)
+				return inner(ctx, cookie, connected)
+			}
+			s := New(func(ctx context.Context) (string, error) { return "C", nil }, run, events)
+			s.backoffBase = 20 * time.Millisecond
+			s.backoffMax = 20 * time.Millisecond
+			defer s.Disconnect()
+
+			s.Connect()
+			e := c.waitForDetail(t, tc.wantState, tc.wantDetail, 5*time.Second)
+			time.Sleep(200 * time.Millisecond) // time for a retry, or a stray event, to land
+			seen := c.snapshot()
+
+			// The tray shows the first line of a detail, clipped at 60 runes. The
+			// instruction has to survive that, or the user is told there is an
+			// error and nothing about how to clear it.
+			first := strings.SplitN(e.Detail, "\n", 2)[0]
+			if !strings.Contains(first, "re-run scripts/install.sh") {
+				t.Errorf("first line of the detail is %q; the fix must appear there, "+
+					"not after the process output the menu clips away", first)
+			}
+			if n := len([]rune(first)); n > 60 {
+				t.Errorf("first line of the detail is %d runes (%q); the menu clips at 60", n, first)
+			}
+
+			if !tc.terminal {
+				for _, e := range seen {
+					if e.State == Error {
+						t.Fatalf("Error after a healthy connection: the supervisor must keep "+
+							"retrying instead; got %+v", seen)
+					}
+				}
+				if n := runs.Load(); n < tc.wantRuns {
+					t.Errorf("backend started %d times, want at least %d", n, tc.wantRuns)
+				}
+				return
+			}
+			// Error is the last word: a trailing Disconnected would wipe the
+			// explanation out of a latest-state UI, and Reconnecting would promise
+			// a recovery that cannot happen.
+			if last := seen[len(seen)-1]; last.State != Error {
+				t.Errorf("last event = %v, want Error to be terminal; got %+v", last.State, seen)
+			}
+			for _, e := range seen {
+				if e.State == Reconnecting {
+					t.Errorf("emitted Reconnecting for a permanent failure; got %+v", seen)
+					break
+				}
+			}
+			if n := runs.Load(); n != tc.wantRuns {
+				t.Errorf("backend started %d times, want exactly %d: a permanent failure "+
+					"must not be retried", n, tc.wantRuns)
+			}
+		})
+	}
+}
+
 // Events must arrive in lifecycle order, with no surprises before Connected.
 func TestEventOrderOnConnect(t *testing.T) {
 	events := make(chan Event, 64)
@@ -510,14 +689,25 @@ func TestEmitDoesNotBlockOnFullChannel(t *testing.T) {
 	s.Disconnect()
 }
 
+// An absolute openconnect_path that does not exist fails at execve with ENOENT
+// rather than as exec.ErrNotFound (os/exec only does a PATH lookup for bare
+// names), and that is the shape Windows produces — where openconnect_path is an
+// absolute install path. It has to be classified as permanent too, or that
+// platform retries a missing binary forever.
 func TestRunOpenconnectStartFailure(t *testing.T) {
 	run := RunOpenconnect(Options{
-		OpenconnectPath: "/nonexistent/openconnect-postern-test",
+		OpenconnectPath: filepath.Join(t.TempDir(), "openconnect-postern-test"),
 		Gateway:         "vpn.example.com:443",
 	})
 	err := run(context.Background(), "COOKIE", func(string) { t.Error("connected must not be called") })
 	if err == nil {
 		t.Fatal("expected an error when the binary does not exist")
+	}
+	if !errors.Is(err, ErrPermanent) {
+		t.Errorf("err = %v, want ErrPermanent: retrying cannot conjure up a missing binary", err)
+	}
+	if !strings.Contains(err.Error(), "scripts/install.sh") {
+		t.Errorf("err = %v, want it to say what fixes the install", err)
 	}
 }
 
@@ -627,6 +817,65 @@ func TestIsAuthRejected(t *testing.T) {
 // Matching lowercases the output, so an upper-case marker could never match.
 func TestAuthRejectedMarkersAreLowercase(t *testing.T) {
 	for _, m := range authRejectedMarkers {
+		if m != strings.ToLower(m) {
+			t.Errorf("marker %q must be lower case: matching is done against lowercased output", m)
+		}
+	}
+}
+
+func TestIsPermanent(t *testing.T) {
+	tests := []struct {
+		name string
+		tail string
+		want bool
+	}{{
+		// sudo's own wording when /etc/sudoers.d/postern is gone, does not name
+		// this user, or names a different helper path.
+		name: "sudo -n with no NOPASSWD rule",
+		tail: "sudo: a password is required\n",
+		want: true,
+	}, {
+		name: "the helper's own uninstalled guard",
+		tail: "postern-tunnel: not installed: run scripts/install.sh, which bakes in " +
+			"the openconnect path\n",
+		want: true,
+	}, {
+		// Matching lowercases the output, so capitalisation must not matter.
+		name: "capitalisation is irrelevant",
+		tail: "Sudo: A Password Is Required",
+		want: true,
+	}, {
+		// Everything below is worth retrying: treating it as permanent would
+		// strand the user in a terminal Error over a hiccup, and only Connect
+		// gets them out of that.
+		name: "network trouble",
+		tail: "Failed to connect to host vpn.example.com\nError establishing Fortinet connection\n",
+		want: false,
+	}, {
+		name: "a rejected cookie is handled by re-authenticating, not by giving up",
+		tail: "Cookie was rejected by server; exiting.",
+		want: false,
+	}, {
+		name: "clean output",
+		tail: "Configured as 10.0.0.5, with SSL connected and ESP disabled",
+		want: false,
+	}, {
+		name: "empty output",
+		tail: "",
+		want: false,
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPermanent(tc.tail); got != tc.want {
+				t.Errorf("isPermanent(%q) = %v, want %v", tc.tail, got, tc.want)
+			}
+		})
+	}
+}
+
+// Matching lowercases the output, so an upper-case marker could never match.
+func TestPermanentMarkersAreLowercase(t *testing.T) {
+	for _, m := range permanentMarkers {
 		if m != strings.ToLower(m) {
 			t.Errorf("marker %q must be lower case: matching is done against lowercased output", m)
 		}
