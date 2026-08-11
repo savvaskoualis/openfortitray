@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/savvaskoualis/postern/internal/config"
-	"github.com/savvaskoualis/postern/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 // newTestApp builds an app whose supervisor records whether it was ever asked to

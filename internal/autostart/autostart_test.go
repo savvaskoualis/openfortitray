@@ -6,11 +6,11 @@ import (
 )
 
 func TestDarwinPlist(t *testing.T) {
-	p := DarwinPlist("/usr/local/bin/postern")
+	p := DarwinPlist("/usr/local/bin/openfortitray")
 	for _, want := range []string{
-		"<key>Label</key>", "io.github.savvaskoualis.postern",
+		"<key>Label</key>", "io.github.savvaskoualis.openfortitray",
 		"<key>RunAtLoad</key>", "<true/>",
-		"/usr/local/bin/postern",
+		"/usr/local/bin/openfortitray",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("plist missing %q:\n%s", want, p)
@@ -22,10 +22,10 @@ func TestDarwinPlist(t *testing.T) {
 }
 
 func TestLinuxDesktop(t *testing.T) {
-	d := LinuxDesktop("/usr/local/bin/postern")
+	d := LinuxDesktop("/usr/local/bin/openfortitray")
 	for _, want := range []string{
-		"[Desktop Entry]", "Type=Application", "Name=Postern",
-		"Exec=/usr/local/bin/postern",
+		"[Desktop Entry]", "Type=Application", "Name=OpenFortiTray",
+		"Exec=/usr/local/bin/openfortitray",
 	} {
 		if !strings.Contains(d, want) {
 			t.Errorf(".desktop missing %q:\n%s", want, d)

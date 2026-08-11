@@ -30,7 +30,7 @@ jobs:
           go-version: stable
           cache: true
 
-      # NOTE: no -X main.version stamp — cmd/postern declares no `version` var
+      # NOTE: no -X main.version stamp — cmd/openfortitray declares no `version` var
       # today. If one is added, append
       #   -ldflags "-X main.version=${GITHUB_REF_NAME}"
       # to each build below (and merge it with the windows -H=windowsgui flag).
@@ -38,16 +38,16 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -o dist/postern-darwin-arm64 ./cmd/postern
+            go build -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -o dist/postern-darwin-amd64 ./cmd/postern
+            go build -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
           ls -l dist
 
       - name: Verify architectures
         # Cheap guard against a silently-native amd64 build.
         run: |
-          file dist/postern-darwin-arm64 | grep -q 'arm64'
-          file dist/postern-darwin-amd64 | grep -q 'x86_64'
+          file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
+          file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
 
       # Checksums are computed HERE, on the runner that produced the bytes, so
       # the verification in the release job actually covers the upload/download
@@ -57,7 +57,7 @@ jobs:
       - name: Checksum darwin binaries
         working-directory: dist
         run: |
-          shasum -a 256 postern-darwin-* > SHA256SUMS.darwin
+          shasum -a 256 openfortitray-darwin-* > SHA256SUMS.darwin
           cat SHA256SUMS.darwin
 
       - name: Upload darwin binaries
@@ -65,7 +65,7 @@ jobs:
         with:
           name: binaries-darwin
           path: |
-            dist/postern-darwin-*
+            dist/openfortitray-darwin-*
             dist/SHA256SUMS.darwin
           if-no-files-found: error
           retention-days: 7
@@ -92,9 +92,9 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -o dist/postern-linux-amd64 ./cmd/postern
+            go build -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -ldflags="-H=windowsgui" -o dist/postern-windows-amd64.exe ./cmd/postern
+            go build -ldflags="-H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
           ls -l dist
 
       # See the darwin job: hashed on the producing runner so the release job's
@@ -102,7 +102,7 @@ jobs:
       - name: Checksum linux + windows binaries
         working-directory: dist
         run: |
-          sha256sum postern-linux-amd64 postern-windows-amd64.exe > SHA256SUMS.linux-windows
+          sha256sum openfortitray-linux-amd64 openfortitray-windows-amd64.exe > SHA256SUMS.linux-windows
           cat SHA256SUMS.linux-windows
 
       - name: Upload linux + windows binaries
@@ -110,8 +110,8 @@ jobs:
         with:
           name: binaries-linux-windows
           path: |
-            dist/postern-linux-amd64
-            dist/postern-windows-amd64.exe
+            dist/openfortitray-linux-amd64
+            dist/openfortitray-windows-amd64.exe
             dist/SHA256SUMS.linux-windows
           if-no-files-found: error
           retention-days: 7
@@ -155,7 +155,7 @@ jobs:
         # verification: chmod changes the mode, not the bytes, so ordering is
         # cosmetic, but verifying the artifacts exactly as received is clearer.
         working-directory: dist
-        run: chmod +x postern-darwin-arm64 postern-darwin-amd64 postern-linux-amd64
+        run: chmod +x openfortitray-darwin-arm64 openfortitray-darwin-amd64 openfortitray-linux-amd64
 
       - name: Create GitHub Release
         # `gh release create` over softprops/action-gh-release: gh is preinstalled
@@ -171,8 +171,8 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             --verify-tag \
-            dist/postern-darwin-arm64 \
-            dist/postern-darwin-amd64 \
-            dist/postern-linux-amd64 \
-            dist/postern-windows-amd64.exe \
+            dist/openfortitray-darwin-arm64 \
+            dist/openfortitray-darwin-amd64 \
+            dist/openfortitray-linux-amd64 \
+            dist/openfortitray-windows-amd64.exe \
             dist/SHA256SUMS

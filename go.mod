@@ -1,4 +1,4 @@
-module github.com/savvaskoualis/postern
+module github.com/savvaskoualis/openfortitray
 
 go 1.22
 

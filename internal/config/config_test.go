@@ -28,7 +28,7 @@ func TestLoadDefaults(t *testing.T) {
 	// The sudoers rule written by scripts/install.sh is scoped to exactly this
 	// path; a mismatch means sudo asks for a password and the tunnel never
 	// starts.
-	if c.HelperPath != "/usr/local/libexec/postern-tunnel" {
+	if c.HelperPath != "/usr/local/libexec/openfortitray-tunnel" {
 		t.Fatalf("default helper path must match the install location, got %q", c.HelperPath)
 	}
 }

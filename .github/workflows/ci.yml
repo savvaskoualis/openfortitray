@@ -71,10 +71,10 @@ jobs:
 
       # Shell syntax gate for the installer and the privileged helper. Linux
       # only: these are parse checks, not execution, so one platform suffices.
-      # install.sh is bash (arrays, [[ ]]); postern-tunnel is strict POSIX sh
+      # install.sh is bash (arrays, [[ ]]); openfortitray-tunnel is strict POSIX sh
       # because it runs from a sudoers rule under an unknown login shell.
       - name: Shell syntax check
         if: runner.os == 'Linux'
         run: |
           bash -n scripts/install.sh
-          sh -n scripts/postern-tunnel
+          sh -n scripts/openfortitray-tunnel

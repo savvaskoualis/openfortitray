@@ -1,4 +1,4 @@
-// Command postern is the Postern tray application.
+// Command openfortitray is the OpenFortiTray tray application.
 package main
 
 import (
@@ -11,11 +11,11 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/savvaskoualis/postern/internal/auth"
-	"github.com/savvaskoualis/postern/internal/autostart"
-	"github.com/savvaskoualis/postern/internal/config"
-	"github.com/savvaskoualis/postern/internal/tray"
-	"github.com/savvaskoualis/postern/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/auth"
+	"github.com/savvaskoualis/openfortitray/internal/autostart"
+	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tray"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 // app adapts the packages to tray.App; it holds no logic of its own.
@@ -36,7 +36,7 @@ type app struct {
 //
 // The menu text names the file but not its directory, because tray.short() clips
 // the detail at 60 runes and the full path ("~/Library/Application
-// Support/postern/config.json") does not fit — the user would see the sentence
+// Support/openfortitray/config.json") does not fit — the user would see the sentence
 // truncated mid-path, which is worse than no path at all. The log line below
 // carries the absolute path for anyone who needs it.
 func (a *app) Connect() {
@@ -122,16 +122,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	logPath := filepath.Join(cfgDir, "postern.log")
+	logPath := filepath.Join(cfgDir, "openfortitray.log")
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		log.SetOutput(f)
 		defer f.Close()
 	}
 	if cfg.Gateway == "" {
-		log.Printf("postern: starting, no gateway configured in %s",
+		log.Printf("openfortitray: starting, no gateway configured in %s",
 			filepath.Join(cfgDir, "config.json"))
 	} else {
-		log.Printf("postern: starting, gateway %s", cfg.GatewayURL())
+		log.Printf("openfortitray: starting, gateway %s", cfg.GatewayURL())
 	}
 
 	authr := &auth.Authenticator{
@@ -183,9 +183,9 @@ func main() {
 	defer cancel()
 	a.sup.Wait(ctx)
 	if ctx.Err() != nil {
-		log.Printf("postern: backend did not stop within %s", shutdownWait)
+		log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
 	}
-	log.Printf("postern: exiting")
+	log.Printf("openfortitray: exiting")
 }
 
 // loggedRun wraps runFn so every backend exit lands in the log file.

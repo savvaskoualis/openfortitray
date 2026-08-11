@@ -12,7 +12,7 @@ type Config struct {
 	// Gateway is the FortiGate SSL-VPN host. It has no default: the gateway is
 	// deployment-specific, so a fresh install has no usable value and the app
 	// must say so rather than dial somebody else's endpoint. scripts/install.sh
-	// writes it from POSTERN_GATEWAY; otherwise the user edits config.json.
+	// writes it from OPENFORTITRAY_GATEWAY; otherwise the user edits config.json.
 	Gateway  string `json:"gateway"`
 	Port     int    `json:"port"`
 	SAMLPort int    `json:"saml_port"`
@@ -34,7 +34,7 @@ func defaults() *Config {
 		Port:            10443,
 		SAMLPort:        8020,
 		OpenconnectPath: "openconnect",
-		HelperPath:      "/usr/local/libexec/postern-tunnel",
+		HelperPath:      "/usr/local/libexec/openfortitray-tunnel",
 		Autostart:       true,
 	}
 }
@@ -71,7 +71,7 @@ func DefaultDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "postern"), nil
+	return filepath.Join(base, "openfortitray"), nil
 }
 
 func (c *Config) GatewayURL() string {

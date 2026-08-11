@@ -20,7 +20,7 @@ import (
 // reject unrecognized clients (Go's default "Go-http-client/1.1" often draws a
 // 403), so present a FortiClient-like agent matching the browser that just
 // completed the SAML login.
-const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X) FortiClient Postern"
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X) FortiClient OpenFortiTray"
 
 type Authenticator struct {
 	GatewayURL  string
@@ -85,7 +85,7 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 		}
 		cookie, err := a.exchange(ctx, client, id)
 		if err != nil {
-			http.Error(w, "login failed, check postern logs", http.StatusBadGateway)
+			http.Error(w, "login failed, check openfortitray logs", http.StatusBadGateway)
 			select {
 			case done <- result{err: err}:
 			default:
@@ -94,7 +94,7 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, "<!doctype html><html><head><meta charset=\"utf-8\"></head>"+
-			"<body><h2>Postern connected — you can close this tab.</h2></body></html>")
+			"<body><h2>OpenFortiTray connected — you can close this tab.</h2></body></html>")
 		select {
 		case done <- result{cookie: cookie}:
 		default:

@@ -390,7 +390,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 			"exit 1\n")
 		return RunOpenconnect(Options{
 			Gateway:    "gw.example.com:10443",
-			HelperPath: "/opt/custom/postern-tunnel",
+			HelperPath: "/opt/custom/openfortitray-tunnel",
 			UseSudo:    true,
 			sudoPath:   sudo,
 		})
@@ -410,7 +410,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 		name: "backend binary is not on PATH",
 		runFn: func(t *testing.T) RunFunc {
 			return RunOpenconnect(Options{
-				OpenconnectPath: "postern-openconnect-does-not-exist",
+				OpenconnectPath: "openfortitray-openconnect-does-not-exist",
 				Gateway:         "gw.example.com:10443",
 			})
 		},
@@ -432,7 +432,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 		name:       "helper is in place but never went through the installer",
 		needsShell: true,
 		runFn: func(t *testing.T) RunFunc {
-			return failingSudo(t, "postern-tunnel: not installed: run scripts/install.sh, "+
+			return failingSudo(t, "openfortitray-tunnel: not installed: run scripts/install.sh, "+
 				"which bakes in the openconnect path")
 		},
 		wantState:  Error,
@@ -696,7 +696,7 @@ func TestEmitDoesNotBlockOnFullChannel(t *testing.T) {
 // platform retries a missing binary forever.
 func TestRunOpenconnectStartFailure(t *testing.T) {
 	run := RunOpenconnect(Options{
-		OpenconnectPath: filepath.Join(t.TempDir(), "openconnect-postern-test"),
+		OpenconnectPath: filepath.Join(t.TempDir(), "openconnect-openfortitray-test"),
 		Gateway:         "vpn.example.com:443",
 	})
 	err := run(context.Background(), "COOKIE", func(string) { t.Error("connected must not be called") })
@@ -829,14 +829,14 @@ func TestIsPermanent(t *testing.T) {
 		tail string
 		want bool
 	}{{
-		// sudo's own wording when /etc/sudoers.d/postern is gone, does not name
+		// sudo's own wording when /etc/sudoers.d/openfortitray is gone, does not name
 		// this user, or names a different helper path.
 		name: "sudo -n with no NOPASSWD rule",
 		tail: "sudo: a password is required\n",
 		want: true,
 	}, {
 		name: "the helper's own uninstalled guard",
-		tail: "postern-tunnel: not installed: run scripts/install.sh, which bakes in " +
+		tail: "openfortitray-tunnel: not installed: run scripts/install.sh, which bakes in " +
 			"the openconnect path\n",
 		want: true,
 	}, {
@@ -897,12 +897,12 @@ func TestStartArgv(t *testing.T) {
 		name: "privileged run goes through the helper, never openconnect itself",
 		opts: Options{
 			OpenconnectPath: "openconnect",
-			HelperPath:      "/opt/custom/postern-tunnel",
+			HelperPath:      "/opt/custom/openfortitray-tunnel",
 			Gateway:         "gw.example.com:10443",
 			UseSudo:         true,
 		},
 		wantName: "sudo",
-		wantArgs: []string{"-n", "/opt/custom/postern-tunnel", "start", "gw.example.com:10443"},
+		wantArgs: []string{"-n", "/opt/custom/openfortitray-tunnel", "start", "gw.example.com:10443"},
 	}, {
 		name:     "empty helper path falls back to the installed location",
 		opts:     Options{Gateway: "gw.example.com:10443", UseSudo: true},
@@ -990,7 +990,7 @@ exit 64
 
 	opts := Options{
 		Gateway:    "gw.example.com:10443",
-		HelperPath: "/opt/custom/postern-tunnel",
+		HelperPath: "/opt/custom/openfortitray-tunnel",
 		UseSudo:    true,
 		sudoPath:   sudo,
 	}
@@ -1041,8 +1041,8 @@ exit 64
 		t.Fatal(err)
 	}
 	wantLines := []string{
-		"-n /opt/custom/postern-tunnel start gw.example.com:10443",
-		"-n /opt/custom/postern-tunnel stop",
+		"-n /opt/custom/openfortitray-tunnel start gw.example.com:10443",
+		"-n /opt/custom/openfortitray-tunnel stop",
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(string(logged), want) {

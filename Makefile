@@ -1,6 +1,6 @@
-BIN  := postern
+BIN  := openfortitray
 DIST := dist
-PKG  := ./cmd/postern
+PKG  := ./cmd/openfortitray
 
 .PHONY: all build test release clean install
 

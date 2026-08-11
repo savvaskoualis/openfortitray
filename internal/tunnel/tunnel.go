@@ -383,10 +383,10 @@ func isAuthRejected(output string) bool {
 // what makes them safe to treat as terminal:
 //
 //   - "a password is required" is sudo's reply to `sudo -n` when the
-//     /etc/sudoers.d/postern rule is missing, does not name this user, or names
+//     /etc/sudoers.d/openfortitray rule is missing, does not name this user, or names
 //     a different helper path. No cookie, gateway or network state can produce
 //     it, and no retry can clear it.
-//   - "not installed: run scripts/install.sh" is scripts/postern-tunnel's own
+//   - "not installed: run scripts/install.sh" is scripts/openfortitray-tunnel's own
 //     guard, printed when the helper still carries the @OPENCONNECT@ placeholder
 //     because it was copied into place without going through the installer.
 //
@@ -418,12 +418,12 @@ func isPermanent(output string) bool {
 const installHint = "re-run scripts/install.sh"
 
 // DefaultHelperPath is where scripts/install.sh puts the privileged helper.
-const DefaultHelperPath = "/usr/local/libexec/postern-tunnel"
+const DefaultHelperPath = "/usr/local/libexec/openfortitray-tunnel"
 
-// helperPIDFile mirrors PIDFILE in scripts/postern-tunnel. Nothing in this
+// helperPIDFile mirrors PIDFILE in scripts/openfortitray-tunnel. Nothing in this
 // package reads it — the helper owns it, because only root may write there — but
 // the tests assert the helper does not create it for a rejected gateway.
-const helperPIDFile = "/var/run/postern-openconnect.pid"
+const helperPIDFile = "/var/run/openfortitray-openconnect.pid"
 
 const (
 	// helperStopTimeout bounds one privileged teardown call. The helper waits up
@@ -434,7 +434,7 @@ const (
 	// completion and only then creates the WaitDelay timer, so the two are
 	// consecutive rather than concurrent. Worst case for a cancelled run is
 	// therefore helperStopAttempts*helperStopTimeout + helperWaitDelay, which is
-	// what cmd/postern's shutdownWait has to cover — keep them in step.
+	// what cmd/openfortitray's shutdownWait has to cover — keep them in step.
 	helperWaitDelay = 12 * time.Second
 	// signalWaitDelay backstops the direct path, where we can signal the
 	// process ourselves.
@@ -448,7 +448,7 @@ type Options struct {
 	// OpenconnectPath is the openconnect binary, used only when the app is
 	// already privileged (Windows) and runs it directly.
 	OpenconnectPath string
-	// HelperPath is the root-owned helper script (scripts/postern-tunnel) run
+	// HelperPath is the root-owned helper script (scripts/openfortitray-tunnel) run
 	// through sudo on macOS/Linux. Empty means DefaultHelperPath.
 	HelperPath string
 	// UseSudo runs the tunnel as root via `sudo -n <HelperPath>`; false runs
@@ -545,7 +545,7 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 			cmd.Cancel = func() error { return runHelperStop(cmd, stopName, stopArgs) }
 			cmd.WaitDelay = helperWaitDelay
 		} else {
-			// The direct path is Windows in production (cmd/postern sets
+			// The direct path is Windows in production (cmd/openfortitray sets
 			// UseSudo = GOOS != "windows"), and on Windows this branch always
 			// kills: os.Process.Signal(os.Interrupt) is unimplemented there and
 			// returns an error unconditionally, so the fallback below is the only

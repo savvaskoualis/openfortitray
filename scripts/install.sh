@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Installs Postern on macOS or Linux: openconnect, the tray binary, the
+# Installs OpenFortiTray on macOS or Linux: openconnect, the tray binary, the
 # root-owned privileged helper, and a sudoers rule scoped to that helper.
 # Idempotent: safe to re-run; updates everything in place.
 #
 # Usage:
-#   POSTERN_GATEWAY=vpn.example.com:10443 bash scripts/install.sh
+#   OPENFORTITRAY_GATEWAY=vpn.example.com:10443 bash scripts/install.sh
 #
-# POSTERN_GATEWAY is required on a first install: the app ships with no gateway
+# OPENFORTITRAY_GATEWAY is required on a first install: the app ships with no gateway
 # (it is deployment-specific) and the installer writes the one you give here into
 # your own config.json. Re-runs on a machine whose config already names a gateway
 # do not need it.
 #
 # Other knobs:
-#   POSTERN_RELEASE_URL=<url>                 # install a prebuilt binary instead of building
-#   POSTERN_OPENCONNECT=/path/to/openconnect  # use this openconnect, not the one on PATH
-#   POSTERN_HELPER_DIR=/usr/libexec           # install the privileged helper elsewhere
+#   OPENFORTITRAY_RELEASE_URL=<url>                 # install a prebuilt binary instead of building
+#   OPENFORTITRAY_OPENCONNECT=/path/to/openconnect  # use this openconnect, not the one on PATH
+#   OPENFORTITRAY_HELPER_DIR=/usr/libexec           # install the privileged helper elsewhere
 #
-# POSTERN_HELPER_DIR moves three things at once: the helper, the sudoers rule that
+# OPENFORTITRAY_HELPER_DIR moves three things at once: the helper, the sudoers rule that
 # names it, and the "helper_path" the app dials. On a first install this script
 # records it in config.json for you. On a machine that already has a config.json it
 # cannot rewrite one, so a mismatch between the two is refused with instructions
 # rather than installed — a helper the app never calls, or one it calls without a
 # sudoers rule, fails at every connect with a password prompt the tray cannot answer.
 #
-# THREAT MODEL (the same one documented in scripts/postern-tunnel):
+# THREAT MODEL (the same one documented in scripts/openfortitray-tunnel):
 #
 #   The sudoers rule written here grants the invoking user passwordless root for
 #   one script. That script validates its arguments, so argument injection into
@@ -39,24 +39,24 @@
 #   the sudoers rule. On a single-user mac that person is already an admin who can
 #   run sudo directly, so the rule grants them nothing they did not have. On a
 #   shared mac, install openconnect somewhere root-owned and pass
-#   POSTERN_OPENCONNECT. This is a documented boundary, not a claim of safety.
+#   OPENFORTITRAY_OPENCONNECT. This is a documented boundary, not a claim of safety.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_URL="${POSTERN_RELEASE_URL:-}"
-BIN_TARGET=/usr/local/bin/postern
-HELPER_SRC="$REPO_DIR/scripts/postern-tunnel"
+RELEASE_URL="${OPENFORTITRAY_RELEASE_URL:-}"
+BIN_TARGET=/usr/local/bin/openfortitray
+HELPER_SRC="$REPO_DIR/scripts/openfortitray-tunnel"
 # Overridable so a machine whose /usr/local is user-owned (an Intel-mac Homebrew
 # prefix) can put the helper somewhere root-owned instead of loosening the check.
 # Keep DEFAULT_HELPER_DIR in step with tunnel.DefaultHelperPath in the Go app: it is
 # what the app dials when config.json sets no "helper_path", so this script has to
 # know it to tell "the user chose this path" from "the app's built-in default".
 DEFAULT_HELPER_DIR=/usr/local/libexec
-DEFAULT_HELPER_TARGET="$DEFAULT_HELPER_DIR/postern-tunnel"
-HELPER_DIR="${POSTERN_HELPER_DIR:-$DEFAULT_HELPER_DIR}"
-HELPER_TARGET="$HELPER_DIR/postern-tunnel"
-SUDOERS_TARGET=/etc/sudoers.d/postern
-GATEWAY="${POSTERN_GATEWAY:-}"
+DEFAULT_HELPER_TARGET="$DEFAULT_HELPER_DIR/openfortitray-tunnel"
+HELPER_DIR="${OPENFORTITRAY_HELPER_DIR:-$DEFAULT_HELPER_DIR}"
+HELPER_TARGET="$HELPER_DIR/openfortitray-tunnel"
+SUDOERS_TARGET=/etc/sudoers.d/openfortitray
+GATEWAY="${OPENFORTITRAY_GATEWAY:-}"
 OS="$(uname -s)"
 
 log() { printf 'install: %s\n' "$1"; }
@@ -154,7 +154,7 @@ check_chain() {
 			"anything reachable from a passwordless-root path must be root-owned and not writable by others." \
 			"Remedy: sudo chown root:$ROOT_GROUP $HELPER_DIR && sudo chmod 755 $HELPER_DIR" \
 			"(an Intel-mac Homebrew prefix leaves /usr/local user-owned), or point the helper" \
-			"somewhere already root-owned by setting POSTERN_HELPER_DIR=/usr/libexec — this script" \
+			"somewhere already root-owned by setting OPENFORTITRAY_HELPER_DIR=/usr/libexec — this script" \
 			"records that as \"helper_path\" when it writes config.json, and refuses to run at all" \
 			"if an existing config.json names a different one." >&2
 		exit 1
@@ -201,43 +201,43 @@ resolve_principal() {
 }
 
 # validate_gateway applies exactly the charset and shape rule that
-# scripts/postern-tunnel enforces on the argument it hands to openconnect. Keeping
+# scripts/openfortitray-tunnel enforces on the argument it hands to openconnect. Keeping
 # them identical means a gateway this installer accepts is one the helper will
 # accept too — otherwise the install "succeeds" and every connect dies in the
 # privileged helper.
 validate_gateway() {
 	local gw="$1" host port
 	case "$gw" in
-	-*) die "POSTERN_GATEWAY must not start with '-': '$gw'" ;;
-	*[!A-Za-z0-9.:_-]*) die "POSTERN_GATEWAY contains invalid characters: '$gw'" ;;
+	-*) die "OPENFORTITRAY_GATEWAY must not start with '-': '$gw'" ;;
+	*[!A-Za-z0-9.:_-]*) die "OPENFORTITRAY_GATEWAY contains invalid characters: '$gw'" ;;
 	*:*) ;;
-	*) die "POSTERN_GATEWAY must be host:port, got '$gw'" ;;
+	*) die "OPENFORTITRAY_GATEWAY must be host:port, got '$gw'" ;;
 	esac
 	host="${gw%:*}"
 	port="${gw##*:}"
 	case "$host" in
-	'' | *:*) die "POSTERN_GATEWAY must be host:port, got '$gw'" ;;
+	'' | *:*) die "OPENFORTITRAY_GATEWAY must be host:port, got '$gw'" ;;
 	esac
 	case "$port" in
-	'' | *[!0-9]*) die "POSTERN_GATEWAY port must be numeric, got '$gw'" ;;
+	'' | *[!0-9]*) die "OPENFORTITRAY_GATEWAY port must be numeric, got '$gw'" ;;
 	esac
 	GATEWAY_HOST="$host"
 	GATEWAY_PORT="$port"
 }
 
-# validate_helper_dir refuses a POSTERN_HELPER_DIR that cannot be embedded safely.
+# validate_helper_dir refuses a OPENFORTITRAY_HELPER_DIR that cannot be embedded safely.
 # The path ends up in three places with three different quoting rules — a sudoers
 # rule, a JSON string in config.json, and a sudo command line — so rather than escape
 # for each, anything outside a conservative charset is rejected. A trailing slash is
-# refused too: it would make the installed path ("$dir//postern-tunnel") differ as a
+# refused too: it would make the installed path ("$dir//openfortitray-tunnel") differ as a
 # string from the one written to config.json, and sudoers matches on the string.
 validate_helper_dir() {
 	[[ "$HELPER_DIR" == /* ]] ||
-		die "POSTERN_HELPER_DIR must be an absolute path, got '$HELPER_DIR'"
+		die "OPENFORTITRAY_HELPER_DIR must be an absolute path, got '$HELPER_DIR'"
 	[[ "$HELPER_DIR" != */ ]] ||
-		die "POSTERN_HELPER_DIR must not end in '/', got '$HELPER_DIR'"
+		die "OPENFORTITRAY_HELPER_DIR must not end in '/', got '$HELPER_DIR'"
 	[[ "$HELPER_DIR" =~ ^[A-Za-z0-9._/+-]+$ ]] ||
-		die "POSTERN_HELPER_DIR contains characters unsafe to embed in a sudoers rule and in config.json: '$HELPER_DIR'"
+		die "OPENFORTITRAY_HELPER_DIR contains characters unsafe to embed in a sudoers rule and in config.json: '$HELPER_DIR'"
 }
 
 # principal_home prints $PRINCIPAL's home directory. Under sudo, $HOME is root's,
@@ -264,7 +264,7 @@ as_principal() {
 }
 
 # config_dir mirrors config.DefaultDir() in the Go app — os.UserConfigDir() plus
-# "postern". Keep the two in step: a mismatch means this installer writes a config
+# "openfortitray". Keep the two in step: a mismatch means this installer writes a config
 # the app silently ignores, and the tray reports "gateway not set" after a
 # successful install.
 #
@@ -274,11 +274,11 @@ config_dir() {
 	local home
 	home="$(principal_home)"
 	if [[ "$OS" == Darwin ]]; then
-		printf '%s\n' "$home/Library/Application Support/postern"
+		printf '%s\n' "$home/Library/Application Support/openfortitray"
 	elif [[ "$(id -u)" -ne 0 && -n "${XDG_CONFIG_HOME:-}" ]]; then
-		printf '%s\n' "$XDG_CONFIG_HOME/postern"
+		printf '%s\n' "$XDG_CONFIG_HOME/openfortitray"
 	else
-		printf '%s\n' "$home/.config/postern"
+		printf '%s\n' "$home/.config/openfortitray"
 	fi
 }
 
@@ -309,7 +309,7 @@ config_helper_path() {
 # config.json names, or the app's built-in default when it names nothing. This, not
 # HELPER_TARGET, is the path that has to be reachable through sudo -n; the two agree
 # on a normal install and can disagree on a re-run with a different
-# POSTERN_HELPER_DIR, which is precisely the case this exists to catch.
+# OPENFORTITRAY_HELPER_DIR, which is precisely the case this exists to catch.
 effective_helper_path() {
 	local configured
 	configured="$(config_helper_path "$(config_dir)/config.json")"
@@ -343,13 +343,13 @@ require_config_helper_match() {
 	printf 'install: error: %s\n' \
 		"  this run would install the helper and the sudoers rule at $HELPER_TARGET" \
 		"Nothing has been installed. Reconcile them one of two ways:" \
-		"  1. re-run with POSTERN_HELPER_DIR=$(dirname "$effective")   (install where the app already looks)" \
+		"  1. re-run with OPENFORTITRAY_HELPER_DIR=$(dirname "$effective")   (install where the app already looks)" \
 		"  2. set \"helper_path\": \"$HELPER_TARGET\" in $file   (point the app at this run's location)" >&2
 	exit 1
 }
 
 # install_config makes sure the app has a gateway to dial before anything
-# privileged happens, so a missing POSTERN_GATEWAY costs the user nothing but a
+# privileged happens, so a missing OPENFORTITRAY_GATEWAY costs the user nothing but a
 # re-run.
 #
 # An existing config.json is never rewritten: it holds the user's own settings
@@ -363,7 +363,7 @@ install_config() {
 	if [[ -e "$file" ]]; then
 		if config_has_gateway "$file"; then
 			[[ -z "$GATEWAY" ]] ||
-				warn "$file already sets a gateway; POSTERN_GATEWAY ignored (edit the file to change it)"
+				warn "$file already sets a gateway; OPENFORTITRAY_GATEWAY ignored (edit the file to change it)"
 			log "using the gateway already configured in $file"
 			# Checked here rather than at the end: an existing config that names a
 			# different helper is a stop-before-you-touch-anything condition.
@@ -374,13 +374,13 @@ install_config() {
 	fi
 
 	[[ -n "$GATEWAY" ]] ||
-		die "POSTERN_GATEWAY is required: re-run as POSTERN_GATEWAY=vpn.example.com:10443 bash scripts/install.sh (it is written to $file)"
+		die "OPENFORTITRAY_GATEWAY is required: re-run as OPENFORTITRAY_GATEWAY=vpn.example.com:10443 bash scripts/install.sh (it is written to $file)"
 	validate_gateway "$GATEWAY"
 
 	as_principal mkdir -p "$dir"
 	# helper_path is written only when it differs from the app's built-in default,
 	# so an ordinary install still produces a two-key config with nothing in it to
-	# go stale. When POSTERN_HELPER_DIR *is* in play the key is mandatory: without
+	# go stale. When OPENFORTITRAY_HELPER_DIR *is* in play the key is mandatory: without
 	# it the app would dial $DEFAULT_HELPER_TARGET while the helper and its sudoers
 	# rule sit somewhere else — an install that verifies clean and never connects.
 	# (validate_helper_dir has already refused any path needing JSON escaping.)
@@ -430,7 +430,7 @@ install_openconnect() {
 # costs no coverage.
 resolve_openconnect() {
 	local p
-	p="${POSTERN_OPENCONNECT:-$(command -v openconnect || true)}"
+	p="${OPENFORTITRAY_OPENCONNECT:-$(command -v openconnect || true)}"
 	[[ -n "$p" ]] || die "openconnect not found after install"
 	[[ -x "$p" ]] || die "$p is not executable"
 	[[ "$p" == /* ]] || die "openconnect path must be absolute, got '$p'"
@@ -443,8 +443,8 @@ resolve_openconnect() {
 		check_chain "$p" abort || true
 	elif ! check_chain "$p" warn; then
 		warn "openconnect at $p is not on a root-owned path (normal for Homebrew)."
-		warn "Anyone who can write there gains root via the postern sudoers rule."
-		warn "On a shared mac, install openconnect root-owned and re-run with POSTERN_OPENCONNECT=<path>."
+		warn "Anyone who can write there gains root via the openfortitray sudoers rule."
+		warn "On a shared mac, install openconnect root-owned and re-run with OPENFORTITRAY_OPENCONNECT=<path>."
 	fi
 	OPENCONNECT_PATH="$p"
 	log "openconnect resolved to $OPENCONNECT_PATH"
@@ -460,7 +460,7 @@ install_binary() {
 		log "installed $BIN_TARGET from $RELEASE_URL"
 	else
 		(cd "$REPO_DIR" && make build)
-		sudo install -o root -m 0755 "$REPO_DIR/postern" "$BIN_TARGET"
+		sudo install -o root -m 0755 "$REPO_DIR/openfortitray" "$BIN_TARGET"
 		log "built from checkout and installed $BIN_TARGET"
 	fi
 }
@@ -524,13 +524,13 @@ install_sudoers() {
 #
 # The invocation goes through as_principal because the rule names $PRINCIPAL: when
 # the whole installer was run under sudo we are already root, and a bare `sudo -n`
-# would succeed for root no matter what /etc/sudoers.d/postern says — a check that
+# would succeed for root no matter what /etc/sudoers.d/openfortitray says — a check that
 # passes on a machine where the app is broken.
 verify() {
 	local app_helper
 	app_helper="$(effective_helper_path)"
 	if [[ "$app_helper" != "$HELPER_TARGET" ]]; then
-		die "$(config_dir)/config.json points the app at $app_helper, but the helper and the sudoers rule were installed at $HELPER_TARGET. Set \"helper_path\": \"$HELPER_TARGET\" in that file, or re-run with POSTERN_HELPER_DIR=$(dirname "$app_helper")"
+		die "$(config_dir)/config.json points the app at $app_helper, but the helper and the sudoers rule were installed at $HELPER_TARGET. Set \"helper_path\": \"$HELPER_TARGET\" in that file, or re-run with OPENFORTITRAY_HELPER_DIR=$(dirname "$app_helper")"
 	fi
 	# "stop" with no tunnel running is a successful no-op, which makes it the
 	# cheapest end-to-end check that the rule, the path and the mode all line up.
@@ -541,7 +541,7 @@ verify() {
 
 resolve_principal
 validate_helper_dir
-# Before anything privileged: a missing or malformed POSTERN_GATEWAY, or a config
+# Before anything privileged: a missing or malformed OPENFORTITRAY_GATEWAY, or a config
 # that names a helper somewhere else, should cost a re-run rather than a
 # half-finished install.
 install_config

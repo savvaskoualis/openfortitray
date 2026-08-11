@@ -10,7 +10,7 @@ func DarwinPlist(exePath string) string {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>io.github.savvaskoualis.postern</string>
+	<string>io.github.savvaskoualis.openfortitray</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
@@ -26,7 +26,7 @@ func DarwinPlist(exePath string) string {
 func LinuxDesktop(exePath string) string {
 	return fmt.Sprintf(`[Desktop Entry]
 Type=Application
-Name=Postern
+Name=OpenFortiTray
 Exec=%s
 X-GNOME-Autostart-enabled=true
 `, exePath)

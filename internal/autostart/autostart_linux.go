@@ -7,7 +7,7 @@ import (
 
 func desktopPath() string {
 	base, _ := os.UserConfigDir()
-	return filepath.Join(base, "autostart", "postern.desktop")
+	return filepath.Join(base, "autostart", "openfortitray.desktop")
 }
 
 // Enable writes the XDG autostart .desktop entry for exePath.

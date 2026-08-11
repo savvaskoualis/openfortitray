@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"fyne.io/systray"
-	"github.com/savvaskoualis/postern/internal/tunnel"
-	"github.com/savvaskoualis/postern/internal/xopen"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
 
 // App is everything the menu needs from the application.
@@ -26,7 +26,7 @@ func Run(app App) {
 
 func onReady(app App) {
 	systray.SetIcon(iconGray)
-	systray.SetTooltip("Postern")
+	systray.SetTooltip("OpenFortiTray")
 
 	status := systray.AddMenuItem("Disconnected", "")
 	status.Disable()
@@ -128,7 +128,7 @@ func render(e tunnel.Event, status, connect, disconnect *systray.MenuItem) {
 		disconnect.Enable()
 	}
 	status.SetTitle(v.title)
-	systray.SetTooltip("Postern — " + v.title)
+	systray.SetTooltip("OpenFortiTray — " + v.title)
 }
 
 // short reduces event detail to a single short line fit for a menu item.

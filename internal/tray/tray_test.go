@@ -6,7 +6,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/savvaskoualis/postern/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 // short() feeds a fixed-width menu item, and its input is process output: many
