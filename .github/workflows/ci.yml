@@ -55,6 +55,31 @@ jobs:
           # go.sum; no separate actions/cache step needed.
           cache: true
 
+      # windows-latest ships MinGW-w64 but does NOT put it on PATH
+      # (actions/runner-images #6103/#8399), so a CGO=1 vet/test/build would
+      # fail for want of a C compiler. Install a known-good gcc via a pinned
+      # setup-msys2 and prepend its bin to PATH ourselves. Linux uses the apt
+      # deps below; macOS uses system frameworks — neither needs this.
+      - name: Set up MinGW-w64 (MSYS2)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 gcc on PATH
+        if: runner.os == 'Windows'
+        # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but the
+        # steps below run in Git Bash (defaults.run.shell: bash). Prepend the
+        # MINGW64 bin dir to PATH so cgo's go toolchain finds gcc, then confirm.
+        run: |
+          printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+
+      - name: Verify C toolchain
+        if: runner.os == 'Windows'
+        run: gcc --version
+
       # fyne renders through OpenGL/GLFW, so building or even type-checking the
       # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
       # dev headers. `go vet`/`go test -race`/`go build` below all compile

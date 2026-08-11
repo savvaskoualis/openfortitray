@@ -162,8 +162,11 @@ jobs:
 
   # windows is a cgo build too, and cgo windows cannot be cross-compiled from
   # Linux without a MinGW cross-toolchain, so it gets its own windows-latest
-  # runner. The runner ships MinGW-w64 gcc on PATH; `go build` finds it with no
-  # extra setup. -H=windowsgui keeps the tray app from popping a console window.
+  # runner. The runner-image ships MinGW-w64 but does NOT put it on PATH
+  # (actions/runner-images #6103/#8399), so a bare `go build` with CGO=1 would
+  # fail for want of a C compiler. We install a known-good gcc via a pinned
+  # setup-msys2 and prepend its bin to PATH ourselves. -H=windowsgui keeps the
+  # tray app from popping a console window.
   build-windows:
     name: Build windows (amd64)
     runs-on: windows-latest
@@ -179,8 +182,23 @@ jobs:
           go-version: stable
           cache: true
 
-      # Confirm the bundled C toolchain is on PATH so a cgo failure names the
-      # cause up front rather than surfacing as a cryptic linker error.
+      # Provides a MinGW-w64 gcc for cgo. Pinned to a full commit SHA like every
+      # other action here.
+      - name: Set up MinGW-w64 (MSYS2)
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 gcc on PATH
+        # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but our
+        # build steps run in Git Bash (defaults.run.shell: bash). Prepend the
+        # MINGW64 bin dir to PATH so cgo's `go build` finds gcc.
+        run: printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+
+      # Confirms gcc is now resolvable, so a cgo failure names the cause up
+      # front rather than surfacing as a cryptic linker error.
       - name: Verify C toolchain
         run: gcc --version
 
