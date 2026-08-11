@@ -118,6 +118,29 @@ func defaultProfile() Profile {
 	}
 }
 
+// normalizeProfile fills fields whose zero value is invalid with their default,
+// so every profile returned by migrate is usable regardless of which keys the
+// on-disk file supplied. It does not rely on json.Unmarshal reusing a
+// pre-populated slice element, so it corrects profiles[1:] too.
+//
+// DTLS is a bool and cannot distinguish an omitted key from an explicit
+// "dtls": false, so it is left as-is: a hand-edited v2 file that omits "dtls"
+// reads as false. Save always writes the key, so files it round-trips are fine.
+func normalizeProfile(p *Profile) {
+	if p.Port == 0 {
+		p.Port = 10443
+	}
+	if p.SAMLPort == 0 {
+		p.SAMLPort = 8020
+	}
+	if p.Auth.Method == "" {
+		p.Auth.Method = AuthSAML
+	}
+	if p.ServerCert.Mode == "" {
+		p.ServerCert.Mode = CertWarn
+	}
+}
+
 func defaults() *Config {
 	return &Config{
 		SchemaVersion:   schemaVersion,
@@ -169,9 +192,17 @@ func migrate(raw []byte) (*Config, bool, error) {
 	}
 
 	if probe.SchemaVersion >= 2 {
+		// Start from defaults for the top-level keys, but with an EMPTY Profiles
+		// slice so json.Unmarshal cannot reuse a pre-populated Profiles[0] (which
+		// would leave profiles[1:] with invalid zero values). Every profile is
+		// normalized post-unmarshal instead.
 		c := defaults()
+		c.Profiles = nil
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, false, fmt.Errorf("parse config.json: %w", err)
+		}
+		for i := range c.Profiles {
+			normalizeProfile(&c.Profiles[i])
 		}
 		return c, false, nil
 	}
@@ -210,6 +241,7 @@ func migrate(raw []byte) (*Config, bool, error) {
 	if legacy.Autostart != nil {
 		c.Autostart = *legacy.Autostart
 	}
+	normalizeProfile(p)
 	return c, true, nil
 }
 

@@ -87,6 +87,25 @@ func TestMigrate(t *testing.T) {
 			},
 		},
 		{
+			name:         "v2 backfills defaults for every profile",
+			raw:          `{"schemaVersion":2,"activeProfile":"A","profiles":[{"name":"A","gateway":"a","port":11000,"saml_port":9000,"auth":{"method":"password"},"server_cert":{"mode":"pin"}},{"name":"B","gateway":"b"}]}`,
+			wantUpgraded: false,
+			check: func(t *testing.T, c *Config) {
+				if len(c.Profiles) != 2 {
+					t.Fatalf("want 2 profiles, got %d", len(c.Profiles))
+				}
+				// First profile keeps its explicit values.
+				if a := c.Profiles[0]; a.Port != 11000 || a.SAMLPort != 9000 || a.Auth.Method != AuthPassword || a.ServerCert.Mode != CertPin {
+					t.Errorf("first profile mangled: %+v", a)
+				}
+				// Second profile omitted port/auth/servercert -> must be backfilled.
+				b := c.Profiles[1]
+				if b.Port != 10443 || b.SAMLPort != 8020 || b.Auth.Method != AuthSAML || b.ServerCert.Mode != CertWarn {
+					t.Errorf("second profile not backfilled: %+v", b)
+				}
+			},
+		},
+		{
 			name:         "v2 omitted top-level keys keep defaults",
 			raw:          `{"schemaVersion":2,"activeProfile":"Only","profiles":[{"name":"Only","gateway":"g"}]}`,
 			wantUpgraded: false,
