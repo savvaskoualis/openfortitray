@@ -76,6 +76,19 @@ Linux)
 *) die "unsupported OS: $OS" ;;
 esac
 
+# On macOS the tray ships as a hand-rolled .app bundle so LSUIElement takes
+# effect (menu-bar only, no Dock icon, reliable status item); on Linux it stays a
+# bare binary. TRAY_TARGET is the executable this install ends up placing the
+# tray at — used by the writable-path preflight and the closing hint — and the
+# LaunchAgent (internal/autostart) points at the bundle executable to match.
+APP_TARGET=/Applications/OpenFortiTray.app
+APP_EXEC="$APP_TARGET/Contents/MacOS/openfortitray"
+if [[ "$OS" == Darwin ]]; then
+	TRAY_TARGET="$APP_EXEC"
+else
+	TRAY_TARGET="$BIN_TARGET"
+fi
+
 # stat_field prints one attribute of a path. BSD and GNU stat disagree on flags,
 # so the difference is confined here. $1 is owner|mode. Both implementations
 # default to lstat (they do not follow symlinks), which is what the walk below
@@ -174,12 +187,12 @@ check_chain() {
 # layouts (user-owned /usr/local) for no security gain.
 preflight_paths() {
 	check_chain "$HELPER_TARGET" abort || true
-	if ! check_chain "$BIN_TARGET" warn; then
-		warn "$BIN_TARGET sits on a path others can write; they could replace the tray app."
+	if ! check_chain "$TRAY_TARGET" warn; then
+		warn "$TRAY_TARGET sits on a path others can write; they could replace the tray app."
 		warn "Not fatal (it runs unprivileged, as the user who already holds the sudoers rule),"
 		warn "but on a shared machine install it somewhere root-owned."
 	fi
-	log "checked the paths to $HELPER_TARGET and $BIN_TARGET"
+	log "checked the paths to $HELPER_TARGET and $TRAY_TARGET"
 }
 
 # resolve_principal decides which user the sudoers rule names. Running the whole
@@ -450,7 +463,29 @@ resolve_openconnect() {
 	log "openconnect resolved to $OPENCONNECT_PATH"
 }
 
+# install_app_bundle builds the macOS .app (make app) and installs it to
+# /Applications so LSUIElement=1 is honoured — a bare /usr/local/bin binary would
+# render the fyne status item unreliably and show a Dock icon. The LaunchAgent
+# points its ProgramArguments at "$APP_EXEC", so login-launch reads the same
+# Info.plist. Prebuilt bundle downloads are deferred to the Fyne 5 packaging work.
+install_app_bundle() {
+	local src="$REPO_DIR/dist/OpenFortiTray.app"
+	if [[ -n "$RELEASE_URL" ]]; then
+		warn "OPENFORTITRAY_RELEASE_URL is ignored on macOS; building the .app from the checkout (prebuilt bundles arrive with Fyne 5 packaging)."
+	fi
+	(cd "$REPO_DIR" && make app)
+	[[ -d "$src" ]] || die "make app did not produce $src"
+	sudo rm -rf "$APP_TARGET"
+	sudo cp -R "$src" "$APP_TARGET"
+	sudo chown -R root:wheel "$APP_TARGET"
+	log "installed $APP_TARGET (menu-bar app, LSUIElement=1)"
+}
+
 install_binary() {
+	if [[ "$OS" == Darwin ]]; then
+		install_app_bundle
+		return
+	fi
 	if [[ -n "$RELEASE_URL" ]]; then
 		local tmp
 		tmp="$(mktemp)"
@@ -553,7 +588,11 @@ install_helper
 install_sudoers
 verify
 
-log "done. Launch the app with: $BIN_TARGET &"
+if [[ "$OS" == Darwin ]]; then
+	log "done. Launch the app with: open '$APP_TARGET'  (or from Launchpad)"
+else
+	log "done. Launch the app with: $TRAY_TARGET &"
+fi
 log "Gateway lives in $(config_dir)/config.json; edit it there to point elsewhere."
 log "First connect opens a browser window for the SAML login."
 log "Quit FortiClient before connecting — two clients must not share the tunnel."

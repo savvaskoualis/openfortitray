@@ -2,7 +2,15 @@ BIN  := openfortitray
 DIST := dist
 PKG  := ./cmd/openfortitray
 
-.PHONY: all build test release clean install
+# macOS .app bundle (Task 10). The bundle id MUST match app.NewWithID in
+# cmd/openfortitray/main.go and the launchd Label in internal/autostart, or the
+# LaunchAgent and the running app disagree about who they are.
+APP        := OpenFortiTray
+APP_BUNDLE := $(DIST)/$(APP).app
+APP_PLIST  := scripts/Info.plist
+ICON_SRC   := internal/tray/assets/icon_gray.png
+
+.PHONY: all build test release clean install app
 
 all: build
 
@@ -29,6 +37,33 @@ release: clean
 	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
 	@ls -l $(DIST)
+
+# app assembles a hand-rolled macOS .app bundle (Task 10). A fyne menu-bar app
+# needs a real bundle with LSUIElement=1 for the status item to render reliably
+# and to keep the process off the Dock. Idempotent: the bundle is rebuilt from
+# scratch each time. macOS only (iconutil/sips and the Cocoa systray are Darwin).
+app: build
+ifneq ($(shell uname -s),Darwin)
+	@echo "make app: macOS only (this is $(shell uname -s)); skipping" && exit 1
+endif
+	rm -rf $(APP_BUNDLE)
+	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
+	cp $(BIN) $(APP_BUNDLE)/Contents/MacOS/$(BIN)
+	cp $(APP_PLIST) $(APP_BUNDLE)/Contents/Info.plist
+	@if command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then \
+		set -e; \
+		work="$$(mktemp -d)"; iconset="$$work/AppIcon.iconset"; mkdir -p "$$iconset"; \
+		for sz in 16 32 128 256 512; do \
+			sips -z $$sz $$sz "$(ICON_SRC)" --out "$$iconset/icon_$${sz}x$${sz}.png" >/dev/null; \
+			sips -z $$((sz*2)) $$((sz*2)) "$(ICON_SRC)" --out "$$iconset/icon_$${sz}x$${sz}@2x.png" >/dev/null; \
+		done; \
+		iconutil -c icns "$$iconset" -o "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"; \
+		rm -rf "$$work"; \
+		echo "make app: generated Contents/Resources/AppIcon.icns from $(ICON_SRC)"; \
+	else \
+		echo "make app: iconutil/sips not found — skipping .icns (not a blocker)"; \
+	fi
+	@echo "make app: assembled $(APP_BUNDLE)"
 
 # Installs on this machine (macOS/Linux): openconnect, binary, privileged
 # helper, sudoers rule. Prompts for sudo.
