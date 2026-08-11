@@ -309,6 +309,13 @@ func main() {
 			OpenconnectPath: tp.openconnectPath,
 			HelperPath:      tp.helperPath,
 			UseSudo:         runtime.GOOS != "windows",
+			// Tunnel-shaping toggles from the active profile. They reach
+			// openconnect on the direct (Windows) path; the privileged helper
+			// path does not yet carry them (see tunnel.Options).
+			DTLS:           tp.prof.DTLS,
+			DualStack:      tp.prof.DualStack,
+			ServerCertMode: string(tp.prof.ServerCert.Mode),
+			ServerCertPin:  tp.prof.ServerCert.Pin,
 		})
 		return run(ctx, cookie, connected)
 	})

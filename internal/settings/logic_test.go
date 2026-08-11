@@ -230,6 +230,207 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
+func TestValidateFingerprint(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{"empty is rejected (required when pinning)", "", true},
+		{"bare hex ok", "abcdef0123456789", false},
+		{"colon-separated hex ok", "AB:CD:EF:01", false},
+		{"sha256 prefix has a colon, still charset-valid", "sha256:AB:CD", true}, // 's','h','a' are not hex
+		{"uppercase hex ok", "ABCDEF", false},
+		{"stray character rejected", "AB:CD:GZ", true},
+		{"spaces rejected", "AB CD", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateFingerprint(tc.in); (err != nil) != tc.wantErr {
+				t.Errorf("validateFingerprint(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+			}
+		})
+	}
+	// The live entry validator tolerates empty (so a non-pin mode never wedges
+	// the form) but still enforces the charset.
+	if err := fingerprintCharset(""); err != nil {
+		t.Errorf("fingerprintCharset(\"\") should be nil, got %v", err)
+	}
+	if err := fingerprintCharset("nothex"); err == nil {
+		t.Error("fingerprintCharset should reject non-hex")
+	}
+}
+
+func TestValidateDomainAndSplitDNS(t *testing.T) {
+	domainTests := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"corp.example.com", false},
+		{"internal", false}, // single label allowed for split-DNS suffixes
+		{"a-b.example.io", false},
+		{"", true},
+		{"-bad.example.com", true}, // label starts with hyphen
+		{"bad-.example.com", true}, // label ends with hyphen
+		{"has space.com", true},
+		{"https://x.com", true},
+		{"x..y", true}, // empty label
+	}
+	for _, tc := range domainTests {
+		t.Run("domain/"+tc.in, func(t *testing.T) {
+			if err := validateDomain(tc.in); (err != nil) != tc.wantErr {
+				t.Errorf("validateDomain(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+			}
+		})
+	}
+
+	// The multi-line field: blanks are skipped, empty is allowed, one bad line
+	// fails the whole field.
+	if err := validateSplitDNSText(""); err != nil {
+		t.Errorf("empty split-DNS should be valid, got %v", err)
+	}
+	if err := validateSplitDNSText("corp.example.com\n\n  internal  \n"); err != nil {
+		t.Errorf("valid split-DNS with blanks/whitespace should pass, got %v", err)
+	}
+	if err := validateSplitDNSText("corp.example.com\nbad domain"); err == nil {
+		t.Error("a bad line should fail the whole split-DNS field")
+	}
+	got := parseSplitDNS("corp.example.com\n\n  internal  \n")
+	if !reflect.DeepEqual(got, []string{"corp.example.com", "internal"}) {
+		t.Errorf("parseSplitDNS = %q, want [corp.example.com internal]", got)
+	}
+	if parseSplitDNS("\n  \n") != nil {
+		t.Error("an all-blank field should parse to nil")
+	}
+}
+
+func TestCertModeRoundTrip(t *testing.T) {
+	for _, m := range []config.ServerCertMode{config.CertWarn, config.CertTrust, config.CertPin} {
+		if got := certMode(certModeLabel(m)); got != m {
+			t.Errorf("certMode(certModeLabel(%q)) = %q, want round-trip", m, got)
+		}
+	}
+	if got := certModeLabel(config.ServerCertMode("bogus")); got != certWarnLabel {
+		t.Errorf("unknown mode should fall back to the warn label, got %q", got)
+	}
+}
+
+// Save must refuse to activate a profile whose auth method has no runtime, and
+// must accept a SAML active profile even if a non-active one is non-SAML.
+func TestValidateAuthGating(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		wantErr bool
+	}{
+		{
+			name: "active SAML profile passes",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{{Name: "Work", Auth: config.AuthConfig{Method: config.AuthSAML}}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "active password profile is rejected",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{{Name: "Work", Auth: config.AuthConfig{Method: config.AuthPassword}}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "active cert profile is rejected",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{{Name: "Work", Auth: config.AuthConfig{Method: config.AuthCert}}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "a non-active non-SAML profile does not block Save",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{
+					{Name: "Work", Auth: config.AuthConfig{Method: config.AuthSAML}},
+					{Name: "Lab", Auth: config.AuthConfig{Method: config.AuthPassword}},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateConfig(tc.cfg); (err != nil) != tc.wantErr {
+				t.Errorf("validateConfig err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The Pin server-cert mode requires a valid fingerprint; the other modes ignore
+// the pin field entirely.
+func TestValidateConfigServerCertPin(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile config.Profile
+		wantErr bool
+	}{
+		{
+			name:    "pin mode with a valid fingerprint passes",
+			profile: config.Profile{Name: "P", ServerCert: config.ServerCert{Mode: config.CertPin, Pin: "AB:CD:01"}},
+			wantErr: false,
+		},
+		{
+			name:    "pin mode with an empty fingerprint is rejected",
+			profile: config.Profile{Name: "P", ServerCert: config.ServerCert{Mode: config.CertPin, Pin: ""}},
+			wantErr: true,
+		},
+		{
+			name:    "pin mode with a bad fingerprint is rejected",
+			profile: config.Profile{Name: "P", ServerCert: config.ServerCert{Mode: config.CertPin, Pin: "not-hex"}},
+			wantErr: true,
+		},
+		{
+			name:    "trust mode ignores the (absent) fingerprint",
+			profile: config.Profile{Name: "P", ServerCert: config.ServerCert{Mode: config.CertTrust}},
+			wantErr: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{ActiveProfile: "P", OpenconnectPath: "openconnect", Profiles: []config.Profile{tc.profile}}
+			if err := validateConfig(cfg); (err != nil) != tc.wantErr {
+				t.Errorf("validateConfig err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateOpenconnectPath(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"", false}, // Save tolerates empty; Load supplies the default
+		{"openconnect", false},
+		{"/usr/local/bin/openconnect", false},
+		{"oc-1.2_beta+x", false},
+		{"has space", true},
+		{"semi;colon", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			if err := validateOpenconnectPath(tc.in); (err != nil) != tc.wantErr {
+				t.Errorf("validateOpenconnectPath(%q) err=%v, wantErr=%v", tc.in, err, tc.wantErr)
+			}
+		})
+	}
+	if err := openconnectPathEntryValidator("  "); err == nil {
+		t.Error("the entry validator should require a non-blank path")
+	}
+}
+
 func TestUniqueName(t *testing.T) {
 	profiles := []config.Profile{{Name: "Work"}, {Name: "Work copy"}, {Name: "Work copy 2"}}
 	if got := uniqueName("Home", profiles); got != "Home" {

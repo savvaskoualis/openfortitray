@@ -455,8 +455,76 @@ type Options struct {
 	// openconnect directly (Windows, where the app is already elevated).
 	UseSudo bool
 
+	// The following mirror the active profile's tunnel-shaping toggles. They are
+	// appended to the DIRECT openconnect argv only (see openconnectFlags /
+	// startArgv). The privileged helper path is deliberately NOT extended with
+	// them: the helper's "start" subcommand takes exactly one argument (the
+	// gateway) and its whole threat model is that a caller cannot smuggle
+	// openconnect options past the NOPASSWD sudoers rule, so threading flags
+	// there needs a coordinated, security-reviewed change to scripts/ (a separate
+	// task). TODO(helper-flags): pass these to the helper once its protocol and
+	// argument validation are extended.
+
+	// DTLS mirrors profile.DTLS. openconnect uses DTLS/ESP by default, so only a
+	// false value emits a flag: --no-dtls.
+	DTLS bool
+	// DualStack mirrors profile.DualStack. openconnect requests IPv6 by default
+	// when the gateway offers it, so dual-stack ON needs no flag; dual-stack OFF
+	// emits --disable-ipv6 to force IPv4-only.
+	DualStack bool
+	// ServerCertMode mirrors profile.ServerCert.Mode ("warn"/"trust"/"pin").
+	ServerCertMode string
+	// ServerCertPin is the fingerprint passed to --servercert when pinning.
+	ServerCertPin string
+
 	// sudoPath overrides the sudo binary; tests use it to substitute a stub.
 	sudoPath string
+}
+
+// Server-certificate modes, mirrored from config.ServerCertMode as plain strings
+// so this package stays free of a config import.
+const (
+	certModeWarn  = "warn"
+	certModeTrust = "trust"
+	certModePin   = "pin"
+)
+
+// openconnectFlags derives the extra openconnect command-line flags from the
+// profile toggles. See the field docs on Options for why these apply to the
+// direct path only.
+//
+// Flag choices (verified against openconnect 9.x / GnuTLS):
+//   - DTLS false  → --no-dtls          (openconnect enables DTLS/ESP by default)
+//   - DualStack false → --disable-ipv6 (openconnect asks for IPv6 by default;
+//     there is no positive "dual-stack" flag — enabling it is the default)
+//   - ServerCert pin  → --servercert <pin> (accept only that fingerprint)
+//   - ServerCert trust: modern openconnect has NO "accept any invalid cert"
+//     option (the old --no-cert-check was removed for security). The only
+//     documented accept mechanism is --servercert with a specific fingerprint,
+//     so trust falls back to that IF a pin is also present; with no pin it emits
+//     NOTHING (a documented no-op at the openconnect layer — the connection will
+//     still reject an unknown cert). We deliberately do not disable validation.
+//   - ServerCert warn (default): no flag (system trust; invalid certs fail).
+func (o Options) openconnectFlags() []string {
+	var flags []string
+	if !o.DTLS {
+		flags = append(flags, "--no-dtls")
+	}
+	if !o.DualStack {
+		flags = append(flags, "--disable-ipv6")
+	}
+	switch o.ServerCertMode {
+	case certModePin:
+		if o.ServerCertPin != "" {
+			flags = append(flags, "--servercert", o.ServerCertPin)
+		}
+	case certModeTrust:
+		// No blanket accept-invalid flag exists; honour an explicit pin if given.
+		if o.ServerCertPin != "" {
+			flags = append(flags, "--servercert", o.ServerCertPin)
+		}
+	}
+	return flags
 }
 
 func (o Options) helperPath() string {
@@ -482,9 +550,10 @@ func (o Options) startArgv() (string, []string) {
 	if o.UseSudo {
 		return o.sudo(), []string{"-n", o.helperPath(), "start", o.Gateway}
 	}
-	return o.OpenconnectPath, []string{
-		"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", o.Gateway,
-	}
+	args := []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter"}
+	args = append(args, o.openconnectFlags()...)
+	args = append(args, o.Gateway)
+	return o.OpenconnectPath, args
 }
 
 // stopArgv returns the command that tears the tunnel down, and whether one is

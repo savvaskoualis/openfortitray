@@ -889,10 +889,50 @@ func TestStartArgv(t *testing.T) {
 		wantName string
 		wantArgs []string
 	}{{
-		name:     "direct run (Windows: already elevated)",
-		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw.example.com:10443"},
+		name:     "direct run (Windows: already elevated), DTLS on and dual-stack on emit no extra flags",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw.example.com:10443", DTLS: true, DualStack: true},
 		wantName: "openconnect",
 		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw.example.com:10443"},
+	}, {
+		name:     "DTLS off appends --no-dtls",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: false, DualStack: true},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--no-dtls", "gw:443"},
+	}, {
+		name:     "dual-stack off appends --disable-ipv6",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: false},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--disable-ipv6", "gw:443"},
+	}, {
+		name:     "pin mode appends --servercert <pin>",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "pin", ServerCertPin: "sha256:AB:CD"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--servercert", "sha256:AB:CD", "gw:443"},
+	}, {
+		name:     "trust mode with a pin appends --servercert <pin>",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "trust", ServerCertPin: "AB:CD"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--servercert", "AB:CD", "gw:443"},
+	}, {
+		name:     "trust mode with no pin emits no cert flag (openconnect has no accept-invalid option)",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "trust"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw:443"},
+	}, {
+		name:     "warn mode emits no cert flag",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "warn"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw:443"},
+	}, {
+		name:     "all toggles together preserve flag order",
+		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: false, DualStack: false, ServerCertMode: "pin", ServerCertPin: "FF"},
+		wantName: "openconnect",
+		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--no-dtls", "--disable-ipv6", "--servercert", "FF", "gw:443"},
+	}, {
+		name:     "helper path is unchanged by the toggles (flags only apply to the direct argv)",
+		opts:     Options{HelperPath: "/opt/h", Gateway: "gw:443", UseSudo: true, DTLS: false, DualStack: false, ServerCertMode: "pin", ServerCertPin: "FF"},
+		wantName: "sudo",
+		wantArgs: []string{"-n", "/opt/h", "start", "gw:443"},
 	}, {
 		name: "privileged run goes through the helper, never openconnect itself",
 		opts: Options{

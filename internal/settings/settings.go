@@ -2,6 +2,7 @@ package settings
 
 import (
 	"image/color"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -44,15 +45,28 @@ type Controller struct {
 
 	list *widget.List
 
-	nameEntry    *widget.Entry
-	gatewayEntry *widget.Entry
-	customPort   *widget.Check
-	portEntry    *widget.Entry
-	authSelect   *widget.Select
-	authNote     *widget.Label
-	realmEntry   *widget.Entry
-	autoConnect  *widget.Check
-	keepAlive    *widget.Check
+	nameEntry     *widget.Entry
+	gatewayEntry  *widget.Entry
+	customPort    *widget.Check
+	portEntry     *widget.Entry
+	authSelect    *widget.Select
+	authNote      *widget.Label
+	usernameEntry *widget.Entry
+	certPathEntry *widget.Entry
+	realmEntry    *widget.Entry
+	autoConnect   *widget.Check
+	keepAlive     *widget.Check
+
+	// Advanced tab.
+	dualStack       *widget.Check
+	dtls            *widget.Check
+	certMode        *widget.RadioGroup
+	certPin         *widget.Entry
+	certPinItem     *widget.FormItem
+	splitDNS        *widget.Entry
+	samlPortEntry   *widget.Entry
+	openconnectPath *widget.Entry
+	helperPath      *widget.Entry
 
 	statusText    *canvas.Text
 	connectBtn    *widget.Button
@@ -129,8 +143,10 @@ func (c *Controller) indexOf(name string) int {
 func (c *Controller) build() {
 	c.buildList()
 	form := c.buildBasicTab()
+	advanced := c.buildAdvancedTab()
 	tabs := container.NewAppTabs(
 		container.NewTabItem("Basic", form),
+		container.NewTabItem("Advanced", advanced),
 	)
 
 	addBtn := widget.NewButton("Add", c.addProfile)
@@ -224,6 +240,27 @@ func (c *Controller) buildBasicTab() *widget.Form {
 	c.authNote = widget.NewLabel("")
 	c.authNote.Importance = widget.WarningImportance
 
+	// Auth sub-fields. Only SAML is wired into the runtime; these are shown so
+	// the roadmap is visible but kept disabled (updateAuthNote toggles them), and
+	// Save refuses to activate a non-SAML profile. They still round-trip to the
+	// config so the shape is forward-designed.
+	c.usernameEntry = widget.NewEntry()
+	c.usernameEntry.SetPlaceHolder("username (password auth — not yet supported)")
+	c.usernameEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Auth.Username = s
+	}
+	c.certPathEntry = widget.NewEntry()
+	c.certPathEntry.SetPlaceHolder("client certificate path (not yet supported)")
+	c.certPathEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Auth.CertPath = s
+	}
+
 	c.realmEntry = widget.NewEntry()
 	c.realmEntry.OnChanged = func(s string) {
 		if c.loading {
@@ -257,6 +294,8 @@ func (c *Controller) buildBasicTab() *widget.Form {
 		widget.NewFormItem("Port", c.portEntry),
 		widget.NewFormItem("Authentication", c.authSelect),
 		widget.NewFormItem("", c.authNote),
+		widget.NewFormItem("Username", c.usernameEntry),
+		widget.NewFormItem("Certificate", c.certPathEntry),
 		widget.NewFormItem("Realm", c.realmEntry),
 		widget.NewFormItem("", c.autoConnect),
 		widget.NewFormItem("", c.keepAlive),
@@ -302,9 +341,23 @@ func (c *Controller) loadProfile(i int) {
 	c.portEntry.SetText(itoa(effectivePort(p.CustomPort, p.Port)))
 	c.applyCustomPortState(p.CustomPort)
 	c.authSelect.SetSelected(authLabel(p.Auth.Method))
+	c.usernameEntry.SetText(p.Auth.Username)
+	c.certPathEntry.SetText(p.Auth.CertPath)
 	c.realmEntry.SetText(p.Realm)
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 	c.keepAlive.SetChecked(p.KeepAlive)
+
+	// Advanced tab.
+	c.dualStack.SetChecked(p.DualStack)
+	c.dtls.SetChecked(p.DTLS)
+	c.certMode.SetSelected(certModeLabel(p.ServerCert.Mode))
+	c.certPin.SetText(p.ServerCert.Pin)
+	c.applyCertMode(p.ServerCert.Mode)
+	c.splitDNS.SetText(strings.Join(p.SplitDNS, "\n"))
+	c.samlPortEntry.SetText(itoa(effectiveSAMLPort(p.SAMLPort)))
+	c.openconnectPath.SetText(effectiveOpenconnectPath(c.work.OpenconnectPath))
+	c.helperPath.SetText(c.work.HelperPath)
+
 	c.loading = false
 	c.updateAuthNote()
 }
@@ -324,13 +377,141 @@ func (c *Controller) applyCustomPortState(on bool) {
 }
 
 // updateAuthNote shows the "(not yet supported)" note for the two methods that
-// are designed in the schema but not wired into the runtime yet.
+// are designed in the schema but not wired into the runtime yet, and reveals the
+// matching sub-field — always disabled, because none of them are functional.
+// SAML has no sub-field and clears the note. Save's validateAuthSupported is the
+// real gate; this is only the visual affordance.
 func (c *Controller) updateAuthNote() {
-	if c.work.Profiles[c.sel].Auth.Method == config.AuthSAML {
+	method := c.work.Profiles[c.sel].Auth.Method
+	// Sub-fields are never editable today: only SAML is implemented.
+	c.usernameEntry.Disable()
+	c.certPathEntry.Disable()
+	switch method {
+	case config.AuthPassword:
+		c.authNote.SetText("(username/password auth not yet supported — use SAML/SSO)")
+		c.usernameEntry.Show()
+		c.certPathEntry.Hide()
+	case config.AuthCert:
+		c.authNote.SetText("(client-certificate auth not yet supported — use SAML/SSO)")
+		c.usernameEntry.Hide()
+		c.certPathEntry.Show()
+	default:
 		c.authNote.SetText("")
-		return
+		c.usernameEntry.Hide()
+		c.certPathEntry.Hide()
 	}
-	c.authNote.SetText("(not yet supported — only SAML/SSO is wired in today)")
+}
+
+// buildAdvancedTab builds the Advanced form: dual-stack, DTLS, the server-cert
+// mode radio (+ conditional fingerprint entry), split-DNS domains, SAML redirect
+// port, the machine-wide openconnect path and the read-only helper path.
+func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
+	c.dualStack = widget.NewCheck("Enable IPv6 / dual-stack", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].DualStack = on
+	})
+	c.dtls = widget.NewCheck("Prefer DTLS (UDP)", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].DTLS = on
+	})
+
+	c.certPin = widget.NewEntry()
+	c.certPin.SetPlaceHolder("e.g. sha256:AB:CD:...")
+	c.certPin.Validator = fingerprintCharset
+	c.certPin.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].ServerCert.Pin = s
+	}
+	c.certPinItem = widget.NewFormItem("Fingerprint", c.certPin)
+
+	c.certMode = widget.NewRadioGroup(certModeLabels, func(label string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].ServerCert.Mode = certMode(label)
+		c.applyCertMode(certMode(label))
+	})
+
+	c.splitDNS = widget.NewMultiLineEntry()
+	c.splitDNS.SetPlaceHolder("one domain per line, e.g.\ncorp.example.com\ninternal")
+	c.splitDNS.Validator = validateSplitDNSText
+	c.splitDNS.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].SplitDNS = parseSplitDNS(s)
+	}
+	// TODO(task11): SplitDNS is only captured + validated here. The scoped
+	// /etc/resolver install/remove that makes these domains resolve through the
+	// tunnel is a separate task; nothing installs a resolver yet.
+	splitDNSNote := widget.NewLabel("Domains routed through the VPN's DNS (scoped resolver — installed in a later release).")
+	splitDNSNote.Wrapping = fyne.TextWrapWord
+
+	c.samlPortEntry = widget.NewEntry()
+	c.samlPortEntry.Validator = validatePortString
+	c.samlPortEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		if n, err := parsePort(s); err == nil {
+			c.work.Profiles[c.sel].SAMLPort = n
+		} else {
+			c.work.Profiles[c.sel].SAMLPort = 0 // flagged invalid; Save's validator catches it
+		}
+	}
+
+	c.openconnectPath = widget.NewEntry()
+	c.openconnectPath.Validator = openconnectPathEntryValidator
+	c.openconnectPath.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.OpenconnectPath = s
+	}
+	openconnectNote := widget.NewLabel("Only used on Windows; macOS/Linux dial through the privileged helper.")
+	openconnectNote.Wrapping = fyne.TextWrapWord
+
+	// Read-only: the sudoers rule is scoped to exactly this path, so editing it
+	// here without re-running install.sh would break sudo. Shown for reference.
+	c.helperPath = widget.NewEntry()
+	c.helperPath.Disable()
+	helperNote := widget.NewLabel("Changing this requires re-running scripts/install.sh.")
+	helperNote.Importance = widget.WarningImportance
+	helperNote.Wrapping = fyne.TextWrapWord
+
+	form := widget.NewForm(
+		widget.NewFormItem("", c.dualStack),
+		widget.NewFormItem("", c.dtls),
+		widget.NewFormItem("Server certificate", c.certMode),
+		c.certPinItem,
+		widget.NewFormItem("Split-DNS domains", c.splitDNS),
+		widget.NewFormItem("", splitDNSNote),
+		widget.NewFormItem("SAML redirect port", c.samlPortEntry),
+		widget.NewFormItem("openconnect binary", c.openconnectPath),
+		widget.NewFormItem("", openconnectNote),
+		widget.NewFormItem("Privileged helper", c.helperPath),
+		widget.NewFormItem("", helperNote),
+	)
+	return container.NewVScroll(form)
+}
+
+// applyCertMode reveals the fingerprint entry only when the Pin mode is chosen.
+// Hiding the FormItem keeps the fingerprint out of sight for the other modes;
+// its validator tolerates empty so a hidden field never blocks the form.
+func (c *Controller) applyCertMode(mode config.ServerCertMode) {
+	if mode == config.CertPin {
+		c.certPinItem.Widget.Show()
+		c.certPin.Enable()
+	} else {
+		c.certPin.Disable()
+		c.certPinItem.Widget.Hide()
+	}
 }
 
 func (c *Controller) save(reconnect bool) {

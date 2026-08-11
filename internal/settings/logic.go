@@ -116,6 +116,41 @@ func authMethod(label string) config.AuthMethod {
 	}
 }
 
+// Server-certificate mode labels shown in the Advanced tab's RadioGroup.
+const (
+	certWarnLabel  = "Warn on invalid"
+	certTrustLabel = "Trust (accept invalid)"
+	certPinLabel   = "Pin fingerprint"
+)
+
+// certModeLabels is the RadioGroup's option list, in display order.
+var certModeLabels = []string{certWarnLabel, certTrustLabel, certPinLabel}
+
+// certModeLabel maps a stored server-certificate mode to its RadioGroup label.
+// An unknown/empty mode falls back to warn (the safe default).
+func certModeLabel(m config.ServerCertMode) string {
+	switch m {
+	case config.CertTrust:
+		return certTrustLabel
+	case config.CertPin:
+		return certPinLabel
+	default:
+		return certWarnLabel
+	}
+}
+
+// certMode maps a RadioGroup label back to a stored mode.
+func certMode(label string) config.ServerCertMode {
+	switch label {
+	case certTrustLabel:
+		return config.CertTrust
+	case certPinLabel:
+		return config.CertPin
+	default:
+		return config.CertWarn
+	}
+}
+
 // hostRe matches a bare host with no scheme and no port. It mirrors the
 // installer's validate_gateway host rule.
 var hostRe = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
@@ -164,6 +199,133 @@ func validatePortValue(n int) error {
 	return nil
 }
 
+// fingerprintRe matches a server-certificate fingerprint: hex digits and the
+// ':' byte separators openconnect prints (e.g. sha256:AB:CD:… or a bare hex
+// string). It intentionally does not enforce a length, so both SHA-1 and
+// SHA-256 forms and openconnect's "sha256:" prefixless hex are accepted.
+var fingerprintRe = regexp.MustCompile(`^[A-Fa-f0-9:]+$`)
+
+// validateFingerprint validates a pinned certificate fingerprint. It is
+// required (non-empty) only when the server-certificate mode is Pin; the live
+// entry validator (fingerprintCharset) accepts empty so the form is not blocked
+// while another mode is selected, and this Save-time check enforces presence.
+func validateFingerprint(s string) error {
+	if s == "" {
+		return errors.New("a fingerprint is required when pinning the server certificate")
+	}
+	if !fingerprintRe.MatchString(s) {
+		return errors.New("fingerprint may contain only hex digits (0-9 a-f) and ':'")
+	}
+	return nil
+}
+
+// fingerprintCharset is the live entry validator for the pin field: it enforces
+// the charset but tolerates empty, because fyne's Form.Validate() runs every
+// entry's validator regardless of whether its mode is selected, and a required
+// error on a field the user is not using would wedge the whole form.
+func fingerprintCharset(s string) error {
+	if s == "" {
+		return nil
+	}
+	if !fingerprintRe.MatchString(s) {
+		return errors.New("fingerprint may contain only hex digits (0-9 a-f) and ':'")
+	}
+	return nil
+}
+
+// domainRe matches a single DNS domain (one or more labels, each 1-63 chars of
+// letters/digits/hyphen, not starting or ending in a hyphen). Single-label names
+// like "internal" are allowed — split-DNS routinely scopes such suffixes.
+var domainRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
+
+// validateDomain checks one split-DNS domain.
+func validateDomain(s string) error {
+	if s == "" {
+		return errors.New("domain is empty")
+	}
+	if len(s) > 253 {
+		return errors.New("domain is too long")
+	}
+	if !domainRe.MatchString(s) {
+		return errors.New("not a valid domain (e.g. corp.example.com)")
+	}
+	return nil
+}
+
+// parseSplitDNS turns the multi-line split-DNS entry text into the []string the
+// config stores: one trimmed, non-empty line per element. An all-blank field
+// yields nil (no domains), which is valid.
+func parseSplitDNS(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// validateSplitDNSText validates the raw multi-line entry: every non-empty line
+// must be a valid domain; a wholly empty field is accepted.
+func validateSplitDNSText(text string) error {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if err := validateDomain(line); err != nil {
+			return fmt.Errorf("split-DNS domain %q: %w", line, err)
+		}
+	}
+	return nil
+}
+
+// openconnectPathRe mirrors the installer's charset for the openconnect binary
+// path: an absolute path or a bare name made of letters, digits and . _ / + -.
+var openconnectPathRe = regexp.MustCompile(`^[A-Za-z0-9._/+-]+$`)
+
+// validateOpenconnectPath validates the (top-level) openconnect binary path. It
+// tolerates empty so a config that never set it still validates — Load supplies
+// the "openconnect" default — and only rejects a non-empty value with stray
+// characters.
+func validateOpenconnectPath(s string) error {
+	if s == "" {
+		return nil
+	}
+	if !openconnectPathRe.MatchString(s) {
+		return errors.New("path may contain only letters, digits and . _ / + -")
+	}
+	return nil
+}
+
+// openconnectPathEntryValidator is the live entry validator: unlike the Save
+// check it requires a value, because the field always shows the resolved default
+// and a user should not be able to blank it in the UI.
+func openconnectPathEntryValidator(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return errors.New("openconnect path is required")
+	}
+	return validateOpenconnectPath(s)
+}
+
+// validateAuthSupported gates Save on the auth method of the profile that will
+// actually be dialed (the active one). Only SAML/SSO is wired into the runtime
+// today (internal/auth); the other methods are forward-designed in the schema
+// but have no Authenticator, so activating one would fail at connect time with
+// an opaque error. Refuse it at Save with a message that names the fix.
+func validateAuthSupported(c *config.Config) error {
+	switch c.Active().Auth.Method {
+	case config.AuthPassword:
+		return errors.New("username/password auth not yet supported — use SAML/SSO")
+	case config.AuthCert:
+		return errors.New("client-certificate auth not yet supported — use SAML/SSO")
+	default:
+		// Empty normalizes to SAML elsewhere; treat unknown as allowed here.
+		return nil
+	}
+}
+
 // validateName checks a profile name is non-empty and unique among the other
 // profiles. self is the index of the profile being named, excluded from the
 // uniqueness check so a profile does not collide with itself.
@@ -188,6 +350,27 @@ func validateName(name string, profiles []config.Profile, self int) error {
 // and the UI would have nothing to edit.
 func canDeleteProfile(count int) bool {
 	return count > 1
+}
+
+// effectiveSAMLPort shows the default SAML redirect port when a profile has
+// none stored yet (0), mirroring config's normalizeProfile default.
+func effectiveSAMLPort(port int) int {
+	if port == 0 {
+		return defaultSAMLPort
+	}
+	return port
+}
+
+// defaultSAMLPort mirrors config.defaultProfile's SAMLPort.
+const defaultSAMLPort = 8020
+
+// effectiveOpenconnectPath shows the "openconnect" default when the top-level
+// path is unset, mirroring config.defaults().
+func effectiveOpenconnectPath(path string) string {
+	if path == "" {
+		return "openconnect"
+	}
+	return path
 }
 
 // effectivePort applies the custom-port-off rule: with the "Use custom port"
@@ -215,6 +398,24 @@ func validateProfile(p config.Profile, all []config.Profile, self int) error {
 			return err
 		}
 	}
+	// SAMLPort 0 means "unset → default 8020" (Load/normalize fill it); only a
+	// genuinely out-of-range value is rejected, so minimally-populated profiles
+	// still validate.
+	if p.SAMLPort != 0 {
+		if err := validatePortValue(p.SAMLPort); err != nil {
+			return fmt.Errorf("SAML port: %w", err)
+		}
+	}
+	if p.ServerCert.Mode == config.CertPin {
+		if err := validateFingerprint(p.ServerCert.Pin); err != nil {
+			return err
+		}
+	}
+	for _, d := range p.SplitDNS {
+		if err := validateDomain(d); err != nil {
+			return fmt.Errorf("split-DNS domain %q: %w", d, err)
+		}
+	}
 	return nil
 }
 
@@ -232,6 +433,14 @@ func validateConfig(c *config.Config) error {
 			}
 			return fmt.Errorf("profile %q: %w", name, err)
 		}
+	}
+	if err := validateOpenconnectPath(c.OpenconnectPath); err != nil {
+		return fmt.Errorf("openconnect path: %w", err)
+	}
+	// The active profile is the one that will be dialed; refuse to save a config
+	// that would try to use an auth method with no runtime behind it.
+	if err := validateAuthSupported(c); err != nil {
+		return err
 	}
 	return nil
 }
