@@ -118,6 +118,17 @@ func defaultProfile() Profile {
 	}
 }
 
+// NewProfile returns a fresh profile with the given name and every other field
+// at its default: an empty gateway (so the empty-gateway guard still trips),
+// port 10443, SAML auth, DTLS on and warn-on-invalid-certificate. It is the
+// single source of a "blank" profile, used by the settings UI's Add button so
+// new profiles match what Load synthesises for a fresh install.
+func NewProfile(name string) Profile {
+	p := defaultProfile()
+	p.Name = name
+	return p
+}
+
 // normalizeProfile fills fields whose zero value is invalid with their default,
 // so every profile returned by migrate is usable regardless of which keys the
 // on-disk file supplied. It does not rely on json.Unmarshal reusing a

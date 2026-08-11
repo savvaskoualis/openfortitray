@@ -20,6 +20,9 @@ type App interface {
 	SetAutostart(on bool) error
 	AutostartEnabled() bool
 	LogPath() string
+	// ShowSettings reveals (and focuses) the settings window. The window is built
+	// once at startup and hidden; this only shows the existing one.
+	ShowSettings()
 	Events() <-chan tunnel.Event
 	// Quit begins teardown (tunnel down) and then quits the fyne app. The tray's
 	// Quit item drives this rather than fyne's built-in quit so the VPN is always
@@ -85,6 +88,8 @@ func newController(app App) *Controller {
 	c.autoItem = fyne.NewMenuItem("Auto-connect at login", c.toggleAutostart)
 	c.autoItem.Checked = app.AutostartEnabled()
 
+	settingsItem := fyne.NewMenuItem("Settings…", func() { app.ShowSettings() })
+
 	logsItem := fyne.NewMenuItem("View logs", func() { _ = xopen.File(app.LogPath()) })
 
 	// Quit carries its own Action, so fyne's addMissingQuitForMenu keeps it
@@ -99,6 +104,7 @@ func newController(app App) *Controller {
 		c.connectItem,
 		c.disconnectItem,
 		fyne.NewMenuItemSeparator(),
+		settingsItem,
 		c.autoItem,
 		logsItem,
 		fyne.NewMenuItemSeparator(),

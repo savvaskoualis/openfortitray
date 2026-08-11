@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
@@ -30,13 +32,44 @@ type app struct {
 	events  chan tunnel.Event
 	logPath string
 
-	fyneApp fyne.App
-	tray    *tray.Controller
+	fyneApp  fyne.App
+	tray     *tray.Controller
+	settings *settings.Controller
 	// quitting stops the event pump touching a tearing-down UI. It is set once,
 	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
 	// drains events without calling fyne.Do — so no fyne.Do is ever queued
 	// against a UI that a.fyneApp.Quit() is about to destroy.
 	quitting atomic.Bool
+
+	// tp is the snapshot of the active profile (and machine-wide paths) the
+	// tunnel actually dials. Connect refreshes it from a.cfg on the UI goroutine
+	// before starting the supervisor; the auth/run funcs read it from the
+	// supervisor's goroutines. The mutex is what makes that cross-goroutine read
+	// safe and is also what lets Save & Reconnect reach a running tunnel with the
+	// newly edited settings (Connect re-snapshots the now-updated active profile).
+	mu sync.Mutex
+	tp tunnelParams
+}
+
+// tunnelParams is the subset of config the tunnel dials with, snapshotted so the
+// supervisor's goroutines never read the live *config.Config the settings window
+// may be rewriting on the UI goroutine.
+type tunnelParams struct {
+	prof            config.Profile
+	openconnectPath string
+	helperPath      string
+}
+
+func (a *app) snapshot() tunnelParams {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tp
+}
+
+func (a *app) setSnapshot(tp tunnelParams) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tp = tp
 }
 
 // Connect starts the tunnel, unless no gateway is configured. The gateway has no
@@ -52,12 +85,20 @@ type app struct {
 // truncated mid-path, which is worse than no path at all. The log line below
 // carries the absolute path for anyone who needs it.
 func (a *app) Connect() {
-	if a.cfg.Active().Gateway == "" {
+	prof := *a.cfg.Active()
+	if prof.Gateway == "" {
 		log.Printf("connect refused: gateway not set — edit %s",
 			filepath.Join(a.cfgDir, "config.json"))
 		a.emit(tunnel.Event{State: tunnel.Error, Detail: "gateway not set — see config.json"})
 		return
 	}
+	// Snapshot the active profile the tunnel will dial, so a Connect that follows
+	// a settings Save picks up the edited profile rather than the startup one.
+	a.setSnapshot(tunnelParams{
+		prof:            prof,
+		openconnectPath: a.cfg.OpenconnectPath,
+		helperPath:      a.cfg.HelperPath,
+	})
 	a.sup.Connect()
 }
 
@@ -74,6 +115,37 @@ func (a *app) Disconnect()                 { a.sup.Disconnect() }
 func (a *app) AutostartEnabled() bool      { return autostart.IsEnabled() }
 func (a *app) LogPath() string             { return a.logPath }
 func (a *app) Events() <-chan tunnel.Event { return a.events }
+
+// ShowSettings reveals the settings window (tray.App). It is built once at
+// startup; this only shows the existing, hidden window.
+func (a *app) ShowSettings() {
+	if a.settings != nil {
+		a.settings.Show()
+	}
+}
+
+// Config returns the live configuration for the settings window to clone
+// (settings.Host). It runs on the UI goroutine.
+func (a *app) Config() *config.Config { return a.cfg }
+
+// Commit takes the settings window's edited config, syncs the OS autostart login
+// item to c.Autostart, persists c, and makes it the live config (settings.Host).
+// It runs on the UI goroutine; the tunnel reads only the snapshot taken at
+// Connect, so replacing a.cfg here does not race the supervisor.
+func (a *app) Commit(c *config.Config) error {
+	if c.Autostart != autostart.IsEnabled() {
+		if err := setLoginItem(c.Autostart); err != nil {
+			log.Printf("autostart: %v", err)
+			return err
+		}
+	}
+	if err := c.Save(a.cfgDir); err != nil {
+		log.Printf("config save: %v", err)
+		return err
+	}
+	*a.cfg = *c
+	return nil
+}
 
 // pump is the one goroutine that reads tunnel events and drives the UI. fyne
 // owns the main thread, so every mutation of a fyne object from here is
@@ -96,6 +168,11 @@ func (a *app) pump() {
 				return
 			}
 			a.tray.Apply(e)
+			// Same consumer, same fyne.Do: mirror the status onto the settings
+			// window's live strip. Safe whether the window is shown or hidden.
+			if a.settings != nil {
+				a.settings.Apply(e)
+			}
 		})
 	}
 }
@@ -185,20 +262,32 @@ func main() {
 		log.SetOutput(f)
 		defer f.Close()
 	}
-	prof := cfg.Active()
-	if prof.Gateway == "" {
+	if prof := cfg.Active(); prof.Gateway == "" {
 		log.Printf("openfortitray: starting, no gateway configured in %s",
 			filepath.Join(cfgDir, "config.json"))
 	} else {
 		log.Printf("openfortitray: starting, gateway %s", prof.GatewayURL())
 	}
 
-	authr := &auth.Authenticator{
-		GatewayURL: prof.GatewayURL(),
-		ListenPort: prof.SAMLPort,
-		Client:     &http.Client{Timeout: 30 * time.Second},
+	events := make(chan tunnel.Event, 16)
+	a := &app{
+		cfg:     cfg,
+		cfgDir:  cfgDir,
+		events:  events,
+		logPath: logPath,
 	}
+
+	// The auth/run funcs read a.snapshot() rather than a value captured at
+	// startup, so a Connect that follows a settings Save (Save & Reconnect) dials
+	// the freshly edited active profile. Connect refreshes the snapshot on the UI
+	// goroutine before starting the supervisor; these run on its goroutines.
 	authFn := tunnel.AuthFunc(func(ctx context.Context) (string, error) {
+		prof := a.snapshot().prof
+		authr := &auth.Authenticator{
+			GatewayURL: prof.GatewayURL(),
+			ListenPort: prof.SAMLPort,
+			Client:     &http.Client{Timeout: 30 * time.Second},
+		}
 		ctx, cancel := context.WithTimeout(ctx, authTimeout)
 		defer cancel()
 		log.Printf("auth: starting SAML login on 127.0.0.1:%d", prof.SAMLPort)
@@ -214,21 +303,18 @@ func main() {
 	// macOS/Linux go through the root-owned helper installed by
 	// scripts/install.sh (see internal/tunnel.Options); on Windows the app is
 	// already elevated and runs openconnect itself.
-	runFn := loggedRun(tunnel.RunOpenconnect(tunnel.Options{
-		Gateway:         fmt.Sprintf("%s:%d", prof.Gateway, prof.Port),
-		OpenconnectPath: cfg.OpenconnectPath,
-		HelperPath:      cfg.HelperPath,
-		UseSudo:         runtime.GOOS != "windows",
-	}))
+	runFn := loggedRun(func(ctx context.Context, cookie string, connected func(ip string)) error {
+		tp := a.snapshot()
+		run := tunnel.RunOpenconnect(tunnel.Options{
+			Gateway:         fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port),
+			OpenconnectPath: tp.openconnectPath,
+			HelperPath:      tp.helperPath,
+			UseSudo:         runtime.GOOS != "windows",
+		})
+		return run(ctx, cookie, connected)
+	})
 
-	events := make(chan tunnel.Event, 16)
-	a := &app{
-		cfg:     cfg,
-		cfgDir:  cfgDir,
-		sup:     tunnel.New(authFn, runFn, events),
-		events:  events,
-		logPath: logPath,
-	}
+	a.sup = tunnel.New(authFn, runFn, events)
 
 	// fyne owns the main thread: NewWithID (not bare New) so tray/preferences
 	// plumbing has a stable app identity. The tray must be built before Run.
@@ -249,6 +335,13 @@ func main() {
 		log.Fatal(err)
 	}
 	a.tray = ctrl
+
+	// Build the settings window once, hidden. It is never ShowAndRun'd, so it
+	// cannot be the master window whose close quits the app; its close button is
+	// intercepted to Hide (see settings.build). The tray's Settings… item shows
+	// this same reused window.
+	win := a.fyneApp.NewWindow("OpenFortiTray — Settings")
+	a.settings = settings.New(a, win)
 
 	// The one event pump. Started before Run so events emitted by the
 	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and

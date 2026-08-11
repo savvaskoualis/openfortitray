@@ -18,6 +18,7 @@ type fakeApp struct {
 	connects      int
 	disconnects   int
 	quits         int
+	settings      int
 	autostartSet  []bool
 	autostartOn   bool
 	setAutostartE error
@@ -26,6 +27,7 @@ type fakeApp struct {
 func (f *fakeApp) Connect()               { f.connects++ }
 func (f *fakeApp) Disconnect()            { f.disconnects++ }
 func (f *fakeApp) Quit()                  { f.quits++ }
+func (f *fakeApp) ShowSettings()          { f.settings++ }
 func (f *fakeApp) AutostartEnabled() bool { return f.autostartOn }
 func (f *fakeApp) LogPath() string        { return "" }
 func (f *fakeApp) Events() <-chan tunnel.Event {
@@ -97,6 +99,16 @@ func TestMenuActionsWireToApp(t *testing.T) {
 	// View logs is present and wired (side-effecting, so not invoked here).
 	if l := itemByLabel(c.menu, "View logs"); l == nil || l.Action == nil {
 		t.Error("View logs item should exist with an action")
+	}
+
+	// Settings… opens the (already-built, hidden) settings window.
+	s := itemByLabel(c.menu, "Settings…")
+	if s == nil || s.Action == nil {
+		t.Fatal("Settings… item should exist with an action")
+	}
+	s.Action()
+	if f.settings != 1 {
+		t.Errorf("Settings… fired %d ShowSettings, want 1", f.settings)
 	}
 }
 

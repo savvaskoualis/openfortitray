@@ -1,0 +1,440 @@
+package settings
+
+import (
+	"image/color"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/widget"
+
+	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+)
+
+// Host is what the settings window needs from the application. Every method is
+// called on the fyne UI goroutine (from a widget Action or from Apply, which the
+// event pump marshals through fyne.Do).
+type Host interface {
+	// Config returns the live configuration. The window edits a deep copy and
+	// only writes back through Commit.
+	Config() *config.Config
+	// Commit takes ownership of c, syncs the OS autostart login item to
+	// c.Autostart, persists c to disk, and makes it the live config. c is an
+	// independent copy the window will not mutate further.
+	Commit(c *config.Config) error
+	// Connect and Disconnect drive the tunnel, exactly as the tray items do.
+	Connect()
+	Disconnect()
+}
+
+// Controller owns the settings window and every widget in it. It is built once
+// at startup (New) and reused: Show/Hide toggle visibility, the red close button
+// is intercepted to Hide (never quit), and Apply feeds the live status strip
+// from the one event pump. All methods run on the UI goroutine.
+type Controller struct {
+	host Host
+	win  fyne.Window
+
+	// work is the in-memory copy being edited; nothing reaches the live config
+	// until Save/Commit. sel is the index into work.Profiles shown in the form.
+	work *config.Config
+	sel  int
+
+	list *widget.List
+
+	nameEntry    *widget.Entry
+	gatewayEntry *widget.Entry
+	customPort   *widget.Check
+	portEntry    *widget.Entry
+	authSelect   *widget.Select
+	authNote     *widget.Label
+	realmEntry   *widget.Entry
+	autoConnect  *widget.Check
+	keepAlive    *widget.Check
+
+	statusText    *canvas.Text
+	connectBtn    *widget.Button
+	disconnectBtn *widget.Button
+
+	// loading suppresses the widgets' OnChanged handlers while loadProfile
+	// populates them, so repainting the form for a newly selected profile does
+	// not write those values straight back into the working copy.
+	loading bool
+}
+
+// New builds the settings window on the given (not-yet-shown) window and wires
+// it to host. The window is left hidden; the tray's Settings… item calls Show.
+func New(host Host, win fyne.Window) *Controller {
+	c := &Controller{host: host, win: win}
+	// Populate the working copy before build: SetContent renders the Form, which
+	// runs the entry validators immediately, and the name validator reads
+	// c.work. reset() then repaints list + form with the loaded values.
+	c.work = cloneConfig(host.Config())
+	c.sel = c.indexOf(c.work.ActiveProfile)
+	c.build()
+	c.reset()
+	return c
+}
+
+// Show refreshes the working copy from the live config (discarding any edits
+// left from a previous session) and reveals the window, focused.
+func (c *Controller) Show() {
+	c.reset()
+	c.win.Show()
+	c.win.RequestFocus()
+}
+
+// Apply renders one tunnel event onto the bottom status strip and mirrors the
+// tray's Connect/Disconnect enabling. It is called only from inside fyne.Do
+// (the shared event pump), so it is already on the UI goroutine and mutates
+// widgets directly. Updating a hidden window's widgets is safe and cheap.
+func (c *Controller) Apply(e tunnel.Event) {
+	text, kind, active := statusFor(e)
+	c.statusText.Text = text
+	c.statusText.Color = colorFor(kind)
+	c.statusText.Refresh()
+	if active {
+		c.connectBtn.Disable()
+		c.disconnectBtn.Enable()
+	} else {
+		c.connectBtn.Enable()
+		c.disconnectBtn.Disable()
+	}
+}
+
+// reset discards the working copy and rebuilds it from the live config, then
+// repaints the list and the form. Used on Show and on Cancel.
+func (c *Controller) reset() {
+	c.work = cloneConfig(c.host.Config())
+	c.sel = c.indexOf(c.work.ActiveProfile)
+	c.list.UnselectAll()
+	c.list.Refresh()
+	c.list.Select(c.sel)
+	c.loadProfile(c.sel)
+}
+
+// indexOf returns the index of the named profile, or 0 (there is always at
+// least one profile in a saved config).
+func (c *Controller) indexOf(name string) int {
+	for i := range c.work.Profiles {
+		if c.work.Profiles[i].Name == name {
+			return i
+		}
+	}
+	return 0
+}
+
+func (c *Controller) build() {
+	c.buildList()
+	form := c.buildBasicTab()
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Basic", form),
+	)
+
+	addBtn := widget.NewButton("Add", c.addProfile)
+	dupBtn := widget.NewButton("Duplicate", c.duplicateProfile)
+	delBtn := widget.NewButton("Delete", c.deleteProfile)
+	activeBtn := widget.NewButton("Set active", c.setActive)
+	listButtons := container.NewGridWithColumns(2, addBtn, dupBtn, delBtn, activeBtn)
+	left := container.NewBorder(nil, listButtons, nil, nil, c.list)
+
+	bottom := c.buildActionStrip()
+
+	content := container.NewBorder(nil, bottom, left, nil, tabs)
+	c.win.SetContent(content)
+	c.win.Resize(fyne.NewSize(680, 460))
+	// The red close button hides the window; the app only ever exits via the
+	// tray's Quit item. Without this, closing the first-shown window would quit
+	// the whole app (fyne's master-window rule).
+	c.win.SetCloseIntercept(c.win.Hide)
+}
+
+func (c *Controller) buildList() {
+	c.list = widget.NewList(
+		func() int { return len(c.work.Profiles) },
+		func() fyne.CanvasObject { return widget.NewLabel("template") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			lbl := o.(*widget.Label)
+			name := c.work.Profiles[i].Name
+			if name == c.work.ActiveProfile {
+				name = "● " + name // active-profile marker
+			}
+			lbl.SetText(name)
+		},
+	)
+	c.list.OnSelected = func(id widget.ListItemID) {
+		c.sel = id
+		c.loadProfile(id)
+	}
+}
+
+func (c *Controller) buildBasicTab() *widget.Form {
+	c.nameEntry = widget.NewEntry()
+	c.nameEntry.Validator = func(s string) error { return validateName(s, c.work.Profiles, c.sel) }
+	c.nameEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Name = s
+		c.list.Refresh()
+	}
+
+	c.gatewayEntry = widget.NewEntry()
+	c.gatewayEntry.SetPlaceHolder("vpn.example.com")
+	c.gatewayEntry.Validator = hostValidator()
+	c.gatewayEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Gateway = s
+	}
+
+	c.portEntry = widget.NewEntry()
+	c.portEntry.Validator = validatePortString
+	c.portEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		if n, err := parsePort(s); err == nil {
+			c.work.Profiles[c.sel].Port = n
+		} else {
+			c.work.Profiles[c.sel].Port = 0 // flagged invalid; Save's validator catches it
+		}
+	}
+
+	c.customPort = widget.NewCheck("Use custom port", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].CustomPort = on
+		c.applyCustomPortState(on)
+	})
+
+	c.authSelect = widget.NewSelect(authLabels, func(label string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Auth.Method = authMethod(label)
+		c.updateAuthNote()
+	})
+	c.authNote = widget.NewLabel("")
+	c.authNote.Importance = widget.WarningImportance
+
+	c.realmEntry = widget.NewEntry()
+	c.realmEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Realm = s
+	}
+
+	c.autoConnect = widget.NewCheck("Auto-connect at login", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Autostart = on
+		if on {
+			c.work.ActiveProfile = c.work.Profiles[c.sel].Name
+			c.list.Refresh()
+		}
+	})
+
+	c.keepAlive = widget.NewCheck("Keep VPN up (auto-reconnect)", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].KeepAlive = on
+	})
+
+	form := widget.NewForm(
+		widget.NewFormItem("Profile name", c.nameEntry),
+		widget.NewFormItem("Gateway host", c.gatewayEntry),
+		widget.NewFormItem("", c.customPort),
+		widget.NewFormItem("Port", c.portEntry),
+		widget.NewFormItem("Authentication", c.authSelect),
+		widget.NewFormItem("", c.authNote),
+		widget.NewFormItem("Realm", c.realmEntry),
+		widget.NewFormItem("", c.autoConnect),
+		widget.NewFormItem("", c.keepAlive),
+	)
+	return form
+}
+
+func (c *Controller) buildActionStrip() fyne.CanvasObject {
+	c.statusText = canvas.NewText("Disconnected", colorFor(statusGray))
+	c.statusText.TextStyle = fyne.TextStyle{Bold: true}
+
+	c.connectBtn = widget.NewButton("Connect", c.host.Connect)
+	c.disconnectBtn = widget.NewButton("Disconnect", c.host.Disconnect)
+	c.disconnectBtn.Disable()
+
+	saveBtn := widget.NewButton("Save", func() { c.save(false) })
+	saveBtn.Importance = widget.HighImportance
+	reconnectBtn := widget.NewButton("Save & Reconnect", func() { c.save(true) })
+	cancelBtn := widget.NewButton("Cancel", c.cancel)
+
+	buttons := container.NewHBox(
+		c.connectBtn, c.disconnectBtn,
+		widget.NewSeparator(),
+		saveBtn, reconnectBtn, cancelBtn,
+	)
+	// Status on the left, actions on the right.
+	return container.NewBorder(widget.NewSeparator(), nil, container.NewPadded(c.statusText), buttons)
+}
+
+// loadProfile paints the form from work.Profiles[i]. loading is set for the
+// duration so the OnChanged handlers do not echo these values back into the
+// working copy.
+func (c *Controller) loadProfile(i int) {
+	if i < 0 || i >= len(c.work.Profiles) {
+		return
+	}
+	c.sel = i
+	p := c.work.Profiles[i]
+	c.loading = true
+	c.nameEntry.SetText(p.Name)
+	c.gatewayEntry.SetText(p.Gateway)
+	c.customPort.SetChecked(p.CustomPort)
+	c.portEntry.SetText(itoa(effectivePort(p.CustomPort, p.Port)))
+	c.applyCustomPortState(p.CustomPort)
+	c.authSelect.SetSelected(authLabel(p.Auth.Method))
+	c.realmEntry.SetText(p.Realm)
+	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
+	c.keepAlive.SetChecked(p.KeepAlive)
+	c.loading = false
+	c.updateAuthNote()
+}
+
+// applyCustomPortState enables the Port entry only when a custom port is in use;
+// otherwise it shows the fixed default and is disabled.
+func (c *Controller) applyCustomPortState(on bool) {
+	if on {
+		c.portEntry.Enable()
+		return
+	}
+	c.portEntry.SetText(itoa(defaultPort))
+	c.portEntry.Disable()
+	if !c.loading {
+		c.work.Profiles[c.sel].Port = defaultPort
+	}
+}
+
+// updateAuthNote shows the "(not yet supported)" note for the two methods that
+// are designed in the schema but not wired into the runtime yet.
+func (c *Controller) updateAuthNote() {
+	if c.work.Profiles[c.sel].Auth.Method == config.AuthSAML {
+		c.authNote.SetText("")
+		return
+	}
+	c.authNote.SetText("(not yet supported — only SAML/SSO is wired in today)")
+}
+
+func (c *Controller) save(reconnect bool) {
+	work := cloneConfig(c.work)
+	normalizePorts(work)
+	if err := validateConfig(work); err != nil {
+		dialog.ShowError(err, c.win)
+		return
+	}
+	if err := c.host.Commit(work); err != nil {
+		dialog.ShowError(err, c.win)
+		return
+	}
+	// Keep the visible working copy consistent with what was just persisted.
+	c.work = cloneConfig(work)
+	if reconnect {
+		// Reaching a running tunnel with the new settings: tear the current one
+		// down and bring it back up so the supervisor re-reads the active profile.
+		c.host.Disconnect()
+		c.host.Connect()
+		return
+	}
+	dialog.ShowInformation("Saved", "Settings saved.", c.win)
+}
+
+func (c *Controller) cancel() {
+	c.reset()
+	c.win.Hide()
+}
+
+func (c *Controller) addProfile() {
+	name := uniqueName("New profile", c.work.Profiles)
+	c.work.Profiles = append(c.work.Profiles, config.NewProfile(name))
+	c.sel = len(c.work.Profiles) - 1
+	c.list.Refresh()
+	c.list.Select(c.sel)
+	c.loadProfile(c.sel)
+	c.win.Canvas().Focus(c.nameEntry)
+}
+
+func (c *Controller) duplicateProfile() {
+	src := c.work.Profiles[c.sel]
+	dup := *cloneProfile(&src)
+	dup.Name = uniqueName(src.Name+" copy", c.work.Profiles)
+	c.work.Profiles = append(c.work.Profiles, dup)
+	c.sel = len(c.work.Profiles) - 1
+	c.list.Refresh()
+	c.list.Select(c.sel)
+	c.loadProfile(c.sel)
+}
+
+func (c *Controller) deleteProfile() {
+	if !canDeleteProfile(len(c.work.Profiles)) {
+		dialog.ShowInformation("Cannot delete",
+			"This is the last profile; at least one must remain.", c.win)
+		return
+	}
+	victim := c.work.Profiles[c.sel]
+	dialog.ShowConfirm("Delete profile",
+		"Delete the profile \""+victim.Name+"\"?",
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			c.work.Profiles = append(c.work.Profiles[:c.sel], c.work.Profiles[c.sel+1:]...)
+			// If the active profile was removed, fall back to the first one.
+			if c.work.ActiveProfile == victim.Name {
+				c.work.ActiveProfile = c.work.Profiles[0].Name
+			}
+			if c.sel >= len(c.work.Profiles) {
+				c.sel = len(c.work.Profiles) - 1
+			}
+			c.list.Refresh()
+			c.list.Select(c.sel)
+			c.loadProfile(c.sel)
+		}, c.win)
+}
+
+func (c *Controller) setActive() {
+	c.work.ActiveProfile = c.work.Profiles[c.sel].Name
+	c.list.Refresh()
+	// The auto-connect checkbox reflects "this profile is active"; refresh it.
+	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == c.work.Profiles[c.sel].Name)
+}
+
+// cloneProfile deep-copies a single profile (its only reference type is the
+// SplitDNS slice), so Duplicate cannot alias the source's slice.
+func cloneProfile(p *config.Profile) *config.Profile {
+	out := *p
+	if p.SplitDNS != nil {
+		out.SplitDNS = append([]string(nil), p.SplitDNS...)
+	}
+	return &out
+}
+
+// colorFor maps a status kind to a fixed colour readable on both light and dark
+// window backgrounds.
+func colorFor(k statusKind) color.Color {
+	switch k {
+	case statusGreen:
+		return color.NRGBA{R: 0x2E, G: 0x7D, B: 0x32, A: 0xFF}
+	case statusYellow:
+		return color.NRGBA{R: 0xB8, G: 0x86, B: 0x0B, A: 0xFF}
+	case statusRed:
+		return color.NRGBA{R: 0xC6, G: 0x28, B: 0x28, A: 0xFF}
+	default:
+		return color.NRGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xFF}
+	}
+}
