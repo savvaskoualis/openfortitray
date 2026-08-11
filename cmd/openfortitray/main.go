@@ -342,6 +342,13 @@ func main() {
 	}
 	a.tray = ctrl
 
+	// Best-effort menu-bar tooltip. fyne has no tooltip API, so this reaches the
+	// systray singleton fyne drives. It must run after the tray is live: fyne
+	// starts the tray during Run and then fires OnStarted (on the UI goroutine),
+	// which is the first moment the native status item exists. tray.SetTooltip is
+	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
+	a.fyneApp.Lifecycle().SetOnStarted(func() { tray.SetTooltip("OpenFortiTray") })
+
 	// Build the settings window once, hidden. It is never ShowAndRun'd, so it
 	// cannot be the master window whose close quits the app; its close button is
 	// intercepted to Hide (see settings.build). The tray's Settings… item shows

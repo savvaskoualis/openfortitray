@@ -85,6 +85,20 @@ func TestMenuActionsWireToApp(t *testing.T) {
 		t.Errorf("Quit item fired %d quits, want 1 (teardown must run, not fyne's default quit)", f.quits)
 	}
 
+	// The title row is the first item: a fixed, disabled, action-less header that
+	// names the app in the popover. It sits above the status line with a
+	// separator between them.
+	if len(c.menu.Items) == 0 {
+		t.Fatal("menu has no items")
+	}
+	title := c.menu.Items[0]
+	if title.Label != "OpenFortiTray" || !title.Disabled || title.Action != nil {
+		t.Errorf("first item = %+v, want a disabled, action-less \"OpenFortiTray\" title", title)
+	}
+	if len(c.menu.Items) < 2 || !c.menu.Items[1].IsSeparator {
+		t.Error("title row must be followed by a separator, then the status line")
+	}
+
 	// The status item exists, is disabled, and carries no action (it is a label).
 	if s := itemByLabel(c.menu, "Disconnected"); s == nil || !s.Disabled || s.Action != nil {
 		t.Errorf("status item = %+v, want a disabled, action-less label", s)

@@ -8,6 +8,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/systray"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
@@ -62,6 +63,20 @@ func Setup(a fyne.App, app App) (*Controller, error) {
 	return c, nil
 }
 
+// SetTooltip sets the menu-bar icon's hover tooltip. fyne's desktop.App exposes
+// no tooltip API, but it drives an internal fyne.io/systray singleton whose
+// SetTooltip targets the same tray instance fyne created. This is best-effort:
+// it must be called only after the tray has actually started (fyne starts it
+// during app.Run, so wire it from the app's OnStarted lifecycle hook, not from
+// Setup — before Run the native status item does not yet exist and the call is
+// a silent no-op). The recover keeps a not-ready or unsupported platform from
+// taking the app down: a missing tooltip is cosmetic, the title row is the
+// guaranteed identifier.
+func SetTooltip(text string) {
+	defer func() { _ = recover() }()
+	systray.SetTooltip(text)
+}
+
 // newController builds the menu items, menu, and icon resources. It touches no
 // desktop driver, so it is exercised directly by the click-wiring test with a
 // fake App and a headless test app (no display needed). Setup adds the desk.
@@ -75,6 +90,13 @@ func newController(app App) *Controller {
 		resYellow: fyne.NewStaticResource("openfortitray_yellow.png", iconYellow),
 		resRed:    fyne.NewStaticResource("openfortitray_red.png", iconRed),
 	}
+
+	// A fixed, disabled header so the popover names the app. fyne's desktop tray
+	// exposes no window title, and the menu-bar icon itself carries no visible
+	// label, so this row (plus the best-effort SetTooltip below) is the app's
+	// only in-menu identity. It never changes: no Action, always disabled.
+	titleItem := fyne.NewMenuItem("OpenFortiTray", nil)
+	titleItem.Disabled = true
 
 	c.statusItem = fyne.NewMenuItem("Disconnected", nil)
 	c.statusItem.Disabled = true
@@ -98,6 +120,8 @@ func newController(app App) *Controller {
 	quitItem := fyne.NewMenuItem("Quit", func() { app.Quit() })
 
 	c.menu = fyne.NewMenu("OpenFortiTray",
+		titleItem,
+		fyne.NewMenuItemSeparator(),
 		c.statusItem,
 		fyne.NewMenuItemSeparator(),
 		c.connectItem,
