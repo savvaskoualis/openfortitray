@@ -30,9 +30,6 @@ func (f *fakeApp) Quit()                  { f.quits++ }
 func (f *fakeApp) ShowSettings()          { f.settings++ }
 func (f *fakeApp) AutostartEnabled() bool { return f.autostartOn }
 func (f *fakeApp) LogPath() string        { return "" }
-func (f *fakeApp) Events() <-chan tunnel.Event {
-	return make(chan tunnel.Event)
-}
 func (f *fakeApp) SetAutostart(on bool) error {
 	f.autostartSet = append(f.autostartSet, on)
 	if f.setAutostartE != nil {

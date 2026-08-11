@@ -23,7 +23,6 @@ type App interface {
 	// ShowSettings reveals (and focuses) the settings window. The window is built
 	// once at startup and hidden; this only shows the existing one.
 	ShowSettings()
-	Events() <-chan tunnel.Event
 	// Quit begins teardown (tunnel down) and then quits the fyne app. The tray's
 	// Quit item drives this rather than fyne's built-in quit so the VPN is always
 	// torn down before the process leaves.

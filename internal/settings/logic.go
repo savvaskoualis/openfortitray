@@ -275,6 +275,20 @@ func cloneConfig(c *config.Config) *config.Config {
 	return &out
 }
 
+// renameProfile sets profile sel's name and, if that profile was the active
+// one, moves ActiveProfile onto the new name so the active pointer tracks the
+// rename. Without this, renaming the active profile orphans ActiveProfile:
+// the "● " marker vanishes and, after Save, config.Active() silently falls back
+// to Profiles[0] — dialing the wrong profile whenever the renamed one is not
+// first.
+func renameProfile(c *config.Config, sel int, newName string) {
+	old := c.Profiles[sel].Name
+	c.Profiles[sel].Name = newName
+	if c.ActiveProfile == old {
+		c.ActiveProfile = newName
+	}
+}
+
 // parsePort parses the Port entry's raw text into an integer.
 func parsePort(s string) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(s))

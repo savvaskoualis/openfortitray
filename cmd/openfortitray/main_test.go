@@ -57,7 +57,7 @@ func TestConnectWithoutGatewayReportsMissingSetting(t *testing.T) {
 	a.Connect()
 
 	select {
-	case e := <-a.Events():
+	case e := <-a.events:
 		if e.State != tunnel.Error {
 			t.Fatalf("state = %v, want Error (terminal, so Connect stays clickable)", e.State)
 		}

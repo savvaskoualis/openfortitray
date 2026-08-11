@@ -177,7 +177,9 @@ func (c *Controller) buildBasicTab() *widget.Form {
 		if c.loading {
 			return
 		}
-		c.work.Profiles[c.sel].Name = s
+		// renameProfile keeps ActiveProfile pointing at this profile if it was
+		// the active one, so renaming the active profile does not orphan it.
+		renameProfile(c.work, c.sel, s)
 		c.list.Refresh()
 	}
 

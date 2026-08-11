@@ -82,6 +82,58 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
+// Renaming a profile must keep ActiveProfile pointing at it when it was the
+// active one; otherwise the active pointer is orphaned and Active() falls back
+// to the first profile — dialing the wrong VPN after Save.
+func TestRenameProfile(t *testing.T) {
+	tests := []struct {
+		name       string
+		active     string
+		sel        int
+		newName    string
+		wantActive string
+	}{
+		{
+			name:       "renaming the active (non-first) profile moves ActiveProfile with it",
+			active:     "Home",
+			sel:        1,
+			newName:    "Home VPN",
+			wantActive: "Home VPN",
+		},
+		{
+			name:       "renaming a non-active profile leaves ActiveProfile alone",
+			active:     "Work",
+			sel:        1,
+			newName:    "Home VPN",
+			wantActive: "Work",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config.Config{
+				ActiveProfile: tc.active,
+				Profiles: []config.Profile{
+					{Name: "Work", Gateway: "work.example.com"},
+					{Name: "Home", Gateway: "home.example.com"},
+				},
+			}
+			renameProfile(c, tc.sel, tc.newName)
+			if c.ActiveProfile != tc.wantActive {
+				t.Errorf("ActiveProfile = %q, want %q", c.ActiveProfile, tc.wantActive)
+			}
+			if c.Profiles[tc.sel].Name != tc.newName {
+				t.Errorf("profile %d name = %q, want %q", tc.sel, c.Profiles[tc.sel].Name, tc.newName)
+			}
+			// The active pointer must resolve to a real, non-fallback profile: the
+			// name Active() returns must equal ActiveProfile (no silent Profiles[0]).
+			if got := c.Active(); got.Name != c.ActiveProfile {
+				t.Errorf("Active() = %q, want it to resolve to ActiveProfile %q (orphaned pointer)",
+					got.Name, c.ActiveProfile)
+			}
+		})
+	}
+}
+
 func TestCanDeleteProfile(t *testing.T) {
 	if canDeleteProfile(1) {
 		t.Error("must refuse deleting the last remaining profile")

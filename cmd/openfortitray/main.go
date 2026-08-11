@@ -111,10 +111,9 @@ func (a *app) emit(e tunnel.Event) {
 	}
 }
 
-func (a *app) Disconnect()                 { a.sup.Disconnect() }
-func (a *app) AutostartEnabled() bool      { return autostart.IsEnabled() }
-func (a *app) LogPath() string             { return a.logPath }
-func (a *app) Events() <-chan tunnel.Event { return a.events }
+func (a *app) Disconnect()            { a.sup.Disconnect() }
+func (a *app) AutostartEnabled() bool { return autostart.IsEnabled() }
+func (a *app) LogPath() string        { return a.logPath }
 
 // ShowSettings reveals the settings window (tray.App). It is built once at
 // startup; this only shows the existing, hidden window.
