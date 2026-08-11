@@ -86,7 +86,17 @@ func (a *app) pump() {
 			continue
 		}
 		e := e
-		fyne.Do(func() { a.tray.Apply(e) })
+		fyne.Do(func() {
+			// Re-check inside the closure: the pre-check above is not atomic with
+			// fyne.Do, and once fyne has drained its queue fyne.Do runs the closure
+			// inline on this goroutine, so an event slipping past the pre-check just
+			// as Quit tears the driver down could otherwise call Apply against a
+			// terminated UI (§7.8). Belt-and-suspenders with the pre-check.
+			if a.quitting.Load() {
+				return
+			}
+			a.tray.Apply(e)
+		})
 	}
 }
 
