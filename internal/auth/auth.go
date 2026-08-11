@@ -3,24 +3,46 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 )
+
+// DefaultUserAgent is sent on the auth_id exchange. FortiGate SSL-VPN gateways
+// reject unrecognized clients (Go's default "Go-http-client/1.1" often draws a
+// 403), so present a FortiClient-like agent matching the browser that just
+// completed the SAML login.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X) FortiClient Postern"
 
 type Authenticator struct {
 	GatewayURL  string
 	ListenPort  int
 	Client      *http.Client
+	UserAgent   string // exchange User-Agent; empty → DefaultUserAgent
 	OpenBrowser func(url string) error
 
 	mu   sync.Mutex
 	addr string // actual listen address once bound (host:port)
+}
+
+// http1Client is the fallback client used when none is injected. FortiGate's
+// SSL-VPN port frequently only speaks HTTP/1.1 and 403s an HTTP/2 request, so
+// HTTP/2 is disabled by giving an empty TLSNextProto map.
+func http1Client() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+		},
+	}
 }
 
 func (a *Authenticator) listenAddr() string {
@@ -33,7 +55,7 @@ func (a *Authenticator) listenAddr() string {
 func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 	client := a.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = http1Client()
 	}
 	openBrowser := a.OpenBrowser
 	if openBrowser == nil {
@@ -70,8 +92,9 @@ func (a *Authenticator) Authenticate(ctx context.Context) (string, error) {
 			}
 			return
 		}
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body><h2>Postern connected — you can close this tab.</h2></body></html>")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!doctype html><html><head><meta charset=\"utf-8\"></head>"+
+			"<body><h2>Postern connected — you can close this tab.</h2></body></html>")
 		select {
 		case done <- result{cookie: cookie}:
 		default:
@@ -105,13 +128,24 @@ func (a *Authenticator) exchange(ctx context.Context, client *http.Client, id st
 	if err != nil {
 		return "", err
 	}
+	ua := a.UserAgent
+	if ua == "" {
+		ua = DefaultUserAgent
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gateway rejected auth id: %s", resp.Status)
+		// FortiGate states the refusal reason in the body; surface a snippet so
+		// the log line identifies the cause (host-check, realm, UA, expired id).
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		snippet := strings.TrimSpace(string(body))
+		return "", fmt.Errorf("gateway rejected auth id: %s (proto %s, body: %q)",
+			resp.Status, resp.Proto, snippet)
 	}
 	for _, c := range resp.Cookies() {
 		if c.Name == "SVPNCOOKIE" && c.Value != "" {

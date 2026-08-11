@@ -641,7 +641,10 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		// Check for rejection regardless of exit status: openconnect can report
 		// a refused cookie and still exit 0.
 		if isAuthRejected(tail) {
-			return ErrAuthRejected
+			// Wrap (not replace) the sentinel so errors.Is still matches while the
+			// log carries openconnect's literal words — the difference between a
+			// genuinely dead cookie and the gateway refusing the session.
+			return fmt.Errorf("%w: %s", ErrAuthRejected, strings.TrimSpace(tail))
 		}
 		// Likewise regardless of exit status, and checked before the generic exit
 		// error below so the wrapping carries the sentinel. Whether this actually
