@@ -22,10 +22,10 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
           cache: true
@@ -49,11 +49,24 @@ jobs:
           file dist/postern-darwin-arm64 | grep -q 'arm64'
           file dist/postern-darwin-amd64 | grep -q 'x86_64'
 
+      # Checksums are computed HERE, on the runner that produced the bytes, so
+      # the verification in the release job actually covers the upload/download
+      # round trip. `shasum -a 256` rather than `sha256sum`: macOS runners ship
+      # BSD tools and have no coreutils sha256sum. The output format is
+      # byte-identical to sha256sum's, so `sha256sum -c` consumes it downstream.
+      - name: Checksum darwin binaries
+        working-directory: dist
+        run: |
+          shasum -a 256 postern-darwin-* > SHA256SUMS.darwin
+          cat SHA256SUMS.darwin
+
       - name: Upload darwin binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-darwin
-          path: dist/postern-darwin-*
+          path: |
+            dist/postern-darwin-*
+            dist/SHA256SUMS.darwin
           if-no-files-found: error
           retention-days: 7
 
@@ -65,10 +78,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
           cache: true
@@ -84,13 +97,22 @@ jobs:
             go build -ldflags="-H=windowsgui" -o dist/postern-windows-amd64.exe ./cmd/postern
           ls -l dist
 
+      # See the darwin job: hashed on the producing runner so the release job's
+      # verification spans the artifact round trip.
+      - name: Checksum linux + windows binaries
+        working-directory: dist
+        run: |
+          sha256sum postern-linux-amd64 postern-windows-amd64.exe > SHA256SUMS.linux-windows
+          cat SHA256SUMS.linux-windows
+
       - name: Upload linux + windows binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-linux-windows
           path: |
             dist/postern-linux-amd64
             dist/postern-windows-amd64.exe
+            dist/SHA256SUMS.linux-windows
           if-no-files-found: error
           retention-days: 7
 
@@ -103,21 +125,37 @@ jobs:
       contents: write
     steps:
       - name: Download all binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: binaries-*
           merge-multiple: true
           path: dist
 
-      - name: Generate SHA256SUMS
-        # Written from inside dist/ so the checksum file holds bare filenames
-        # (`sha256sum -c SHA256SUMS` then works next to the downloaded binaries).
-        # chmod +x because upload-artifact does not preserve the exec bit.
+      - name: Assemble SHA256SUMS
+        # Concatenate the per-runner manifests rather than re-hashing here.
+        # Re-hashing would be circular: it would record whatever bytes arrived,
+        # so a corrupted transfer would produce a self-consistent file that
+        # verifies fine. These hashes were taken before upload, so the -c step
+        # below is a real end-to-end check. Bare filenames (working-directory:
+        # dist) keep `sha256sum -c SHA256SUMS` working for users too.
         working-directory: dist
         run: |
-          chmod +x postern-darwin-arm64 postern-darwin-amd64 postern-linux-amd64
-          sha256sum postern-* > SHA256SUMS
+          cat SHA256SUMS.darwin SHA256SUMS.linux-windows > SHA256SUMS
+          rm SHA256SUMS.darwin SHA256SUMS.linux-windows
           cat SHA256SUMS
+
+      - name: Verify SHA256SUMS
+        # Fails the job on any upload/download corruption instead of publishing
+        # binaries that do not match their own published checksums.
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Make unix binaries executable
+        # upload-artifact does not preserve the exec bit. Done after
+        # verification: chmod changes the mode, not the bytes, so ordering is
+        # cosmetic, but verifying the artifacts exactly as received is clearer.
+        working-directory: dist
+        run: chmod +x postern-darwin-arm64 postern-darwin-amd64 postern-linux-amd64
 
       - name: Create GitHub Release
         # `gh release create` over softprops/action-gh-release: gh is preinstalled
