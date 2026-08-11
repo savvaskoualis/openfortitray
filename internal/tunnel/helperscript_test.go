@@ -294,3 +294,176 @@ func TestHelperAllowlistedFlagsReachOpenconnectArgv(t *testing.T) {
 		t.Errorf("openconnect argv = %q, want %q", strings.TrimSpace(string(got)), want)
 	}
 }
+
+// dnsHelper writes a copy of the privileged helper whose RESOLVER_DIR is
+// redirected into resolverDir, so the dns-set/dns-clear tests exercise the real
+// script (its validation is the security boundary) without touching the real
+// /etc/resolver. It never runs as root — a temp dir is user-writable.
+func dnsHelper(t *testing.T, resolverDir string) string {
+	t.Helper()
+	src, err := os.ReadFile(helperScript(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Single-quote the replacement: a t.TempDir() path can contain characters the
+	// subtest name carried (e.g. parentheses), which would be a shell syntax error
+	// in a bare assignment.
+	patched := strings.Replace(string(src), "RESOLVER_DIR=/etc/resolver", "RESOLVER_DIR='"+resolverDir+"'", 1)
+	if !strings.Contains(patched, "RESOLVER_DIR='"+resolverDir+"'") {
+		t.Fatal("failed to patch RESOLVER_DIR (line changed?)")
+	}
+	helper := filepath.Join(t.TempDir(), "openfortitray-tunnel")
+	if err := os.WriteFile(helper, []byte(patched), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return helper
+}
+
+func runDNSHelper(t *testing.T, helper string, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", append([]string{helper}, args...)...)
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("running helper: %v", err)
+		}
+		code = ee.ExitCode()
+	}
+	return string(out), code
+}
+
+// dns-set writes a scoped resolver per domain, all pointing at the one DNS IP,
+// each carrying our marker so dns-clear can recognise it, mode 0644.
+func TestHelperDNSSetWritesResolverFileWithMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell helper: macOS/Linux only")
+	}
+	resolverDir := t.TempDir()
+	helper := dnsHelper(t, resolverDir)
+
+	out, code := runDNSHelper(t, helper, "dns-set", "10.10.0.4", "hyperio.private", "svc.corp.internal")
+	if code != 0 {
+		t.Fatalf("dns-set exited %d (output: %q)", code, out)
+	}
+	for _, domain := range []string{"hyperio.private", "svc.corp.internal"} {
+		f := filepath.Join(resolverDir, domain)
+		info, err := os.Stat(f)
+		if err != nil {
+			t.Fatalf("dns-set did not create %s: %v", f, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o644 {
+			t.Errorf("%s mode = %o, want 0644", f, perm)
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(b)
+		if !strings.Contains(got, "# openfortitray-managed") {
+			t.Errorf("%s missing the managed marker; got %q", f, got)
+		}
+		if !strings.Contains(got, "nameserver 10.10.0.4") {
+			t.Errorf("%s missing the nameserver line; got %q", f, got)
+		}
+	}
+}
+
+// The security boundary for the DNS subcommands: a malformed IP or a domain
+// carrying a path/metacharacter/leading-dash must be refused with a non-zero
+// exit and, crucially, NO file written — the domain becomes a filename under
+// /etc/resolver, so a '/' or '..' would otherwise aim a root write off target.
+func TestHelperDNSSetRejectsInjection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell helper: macOS/Linux only")
+	}
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"octet out of range", []string{"300.1.2.3", "corp.private"}, "not a valid IPv4/IPv6"},
+		{"ip is a flag", []string{"-nameserver", "corp.private"}, "must not start with '-'"},
+		{"ip has metacharacter", []string{"10.0.0.1;id", "corp.private"}, "invalid characters"},
+		{"ip is a path", []string{"/etc/passwd", "corp.private"}, "invalid characters"},
+		{"domain with slash (path traversal)", []string{"10.10.0.4", "../../etc/cron.d/x"}, "invalid characters"},
+		{"domain with a bare slash", []string{"10.10.0.4", "a/b"}, "invalid characters"},
+		{"domain with a shell metacharacter", []string{"10.10.0.4", "a;rm -rf"}, "invalid characters"},
+		{"domain with a space", []string{"10.10.0.4", "a b"}, "invalid characters"},
+		{"domain starting with a dash", []string{"10.10.0.4", "-x"}, "must not start with '-'"},
+		{"domain is dotdot", []string{"10.10.0.4", ".."}, "must not be '.' or '..'"},
+		{"empty domain", []string{"10.10.0.4", ""}, "must not be empty"},
+		{"no domain at all", []string{"10.10.0.4"}, "usage"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resolverDir := t.TempDir()
+			helper := dnsHelper(t, resolverDir)
+			out, code := runDNSHelper(t, helper, append([]string{"dns-set"}, tc.args...)...)
+			if code == 0 {
+				t.Fatalf("dns-set accepted an injection attempt (exit 0); output: %q", out)
+			}
+			if !strings.Contains(out, tc.wantErr) {
+				t.Errorf("output = %q, want it to mention %q", out, tc.wantErr)
+			}
+			entries, err := os.ReadDir(resolverDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("a rejected dns-set still wrote %d file(s) into the resolver dir; validation must happen first", len(entries))
+			}
+		})
+	}
+}
+
+// dns-clear removes only files WE stamped, never a pre-existing resolver file a
+// VPN client or the admin left behind.
+func TestHelperDNSClearRemovesOnlyMarkedFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell helper: macOS/Linux only")
+	}
+	resolverDir := t.TempDir()
+	helper := dnsHelper(t, resolverDir)
+
+	// One of ours (created via dns-set), and one foreign file with no marker.
+	if _, code := runDNSHelper(t, helper, "dns-set", "10.10.0.4", "hyperio.private"); code != 0 {
+		t.Fatal("setup dns-set failed")
+	}
+	foreign := filepath.Join(resolverDir, "database.windows.net")
+	if err := os.WriteFile(foreign, []byte("nameserver 9.9.9.9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ask to clear both domains: ours must go, the foreign one must remain.
+	out, code := runDNSHelper(t, helper, "dns-clear", "hyperio.private", "database.windows.net")
+	if code != 0 {
+		t.Fatalf("dns-clear exited %d (output: %q)", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(resolverDir, "hyperio.private")); !os.IsNotExist(err) {
+		t.Errorf("dns-clear did not remove our own resolver file (err=%v)", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("dns-clear removed a foreign, unmarked resolver file: %v", err)
+	}
+}
+
+// dns-clear validates its domains too, so a '/'-bearing argument can never reach
+// the rm, and it is idempotent (nothing of ours to remove is success).
+func TestHelperDNSClearValidatesAndIsIdempotent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell helper: macOS/Linux only")
+	}
+	resolverDir := t.TempDir()
+	helper := dnsHelper(t, resolverDir)
+
+	out, code := runDNSHelper(t, helper, "dns-clear", "a/b")
+	if code == 0 || !strings.Contains(out, "invalid characters") {
+		t.Errorf("dns-clear accepted a slash-bearing domain: exit %d, output %q", code, out)
+	}
+	// Nothing of ours present: still succeeds.
+	if out, code := runDNSHelper(t, helper, "dns-clear", "never-set.corp"); code != 0 {
+		t.Errorf("dns-clear on a missing domain must be idempotent: exit %d, output %q", code, out)
+	}
+}

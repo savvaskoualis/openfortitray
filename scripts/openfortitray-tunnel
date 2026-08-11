@@ -69,6 +69,20 @@
 #     where each flag is one of the allowlisted:
 #       --no-dtls | --disable-ipv6 | --servercert <fingerprint>
 #   openfortitray-tunnel stop                          # SIGINT the running openconnect
+#   openfortitray-tunnel dns-set <dns-ip> <domain>...  # install scoped resolvers
+#   openfortitray-tunnel dns-clear <domain>...         # remove OUR scoped resolvers
+#
+# DNS subcommands (macOS split-DNS coexistence). dns-set writes, as root,
+# /etc/resolver/<domain> = "nameserver <dns-ip>" for each domain, so those
+# domains resolve through the VPN-pushed DNS even when a global override
+# (Tailscale MagicDNS, a corp DNS proxy) owns the primary resolver. Both
+# subcommands validate as strictly as "start": the DNS IP must be a bare
+# IPv4/IPv6 address and each domain must match ^[A-Za-z0-9._-]+$ (bounded length,
+# no leading '-', no '/', no whitespace or shell metacharacter) BEFORE anything
+# is written or removed, so a local caller cannot turn the filename into a path
+# trick or smuggle a metacharacter into a root-owned file. dns-clear removes only
+# files carrying RESOLVER_MARKER, so a pre-existing resolver file (e.g. one a VPN
+# client left for database.windows.net) always survives.
 set -eu
 
 # Fixed PATH for the coreutils this script itself calls (cat, ps, kill, rm,
@@ -89,6 +103,21 @@ PIDFILE=/var/run/openfortitray-openconnect.pid
 # Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
 # internal/tunnel allows a little more than this before giving up on us.
 STOP_TIMEOUT=6
+
+# RESOLVER_DIR is macOS's per-domain scoped-resolver directory. A file
+# /etc/resolver/<domain> containing "nameserver <ip>" makes <domain> resolve
+# through <ip> and BEATS a global DNS override (e.g. Tailscale MagicDNS, which
+# points the system's primary resolver at 100.100.100.100): corp-internal names
+# then resolve through the VPN-pushed DNS while the tunnel is up, exactly as
+# FortiClient coexists. dns-set/dns-clear write and remove these files. It is
+# hard-coded and NEVER taken from the environment — a caller-controlled path here
+# would let an unprivileged process aim root writes (or deletes) at an arbitrary
+# directory. The Go tests string-substitute it to a temp dir, like PIDFILE.
+RESOLVER_DIR=/etc/resolver
+# RESOLVER_MARKER is the first line of every resolver file WE create, so
+# dns-clear can tell ours from a pre-existing /etc/resolver/<domain> that a VPN
+# client or the admin installed and must NOT be removed.
+RESOLVER_MARKER='# openfortitray-managed'
 
 die() {
 	echo "openfortitray-tunnel: $1" >&2
@@ -161,6 +190,74 @@ validate_flags() {
 			;;
 		esac
 	done
+}
+
+# is_ipv4 succeeds only for exactly four dot-separated decimal octets, each
+# 0-255. Run in a subshell so IFS/set -f changes never leak into the caller.
+is_ipv4() (
+	set -f
+	IFS=.
+	# shellcheck disable=SC2086 # deliberate word-split on '.' into octets
+	set -- $1
+	[ $# -eq 4 ] || return 1
+	for _o in "$@"; do
+		case "$_o" in
+		'' | *[!0-9]*) return 1 ;;
+		esac
+		# Bound the length first: "$_o" -le 255 on a 100-digit string is still a
+		# valid arithmetic comparison, but a stray leading run of digits should
+		# not sneak through, and a bounded numeric compare is the clean check.
+		[ "${#_o}" -le 3 ] || return 1
+		[ "$_o" -le 255 ] || return 1
+	done
+	return 0
+)
+
+# is_ipv6 is a deliberately loose but safe check: the value only ever gets
+# written into a resolver file, so what matters for security is charset (hex and
+# colons only — no path, flag, whitespace or metacharacter), a colon shape, and a
+# length bound. It does not attempt full RFC 4291 validation.
+is_ipv6() {
+	case "$1" in
+	*[!0-9A-Fa-f:]*) return 1 ;; # anything outside hex/colon
+	*:*:*) ;;                    # must look like an IPv6 (>= two colons)
+	*) return 1 ;;
+	esac
+	[ "${#1}" -le 45 ] || return 1
+	return 0
+}
+
+# validate_dns_ip rejects anything that is not a bare IPv4 or IPv6 address. The
+# value is written verbatim into a root-owned resolver file, so — exactly like
+# validate_gateway — it must not be a path, start like a flag, or carry a shell
+# metacharacter or newline.
+validate_dns_ip() {
+	case "$1" in
+	'') die "dns-set requires a DNS server IP" ;;
+	-*) die "DNS server IP must not start with '-'" ;;
+	*[!0-9A-Fa-f.:]*) die "DNS server IP contains invalid characters" ;;
+	esac
+	if is_ipv4 "$1" || is_ipv6 "$1"; then
+		return 0
+	fi
+	die "DNS server IP is not a valid IPv4/IPv6 address: '$1'"
+}
+
+# validate_domain enforces a strict hostname/domain shape on every dns-set/
+# dns-clear argument. The value becomes the FILENAME /etc/resolver/<domain>, so a
+# '/', a leading '-', '.'/'..', whitespace or any shell metacharacter must be
+# refused: without this a caller could aim a root write — or a root delete — at
+# an arbitrary path. Charset is ^[A-Za-z0-9._-]+$, bounded length.
+validate_domain() {
+	case "$1" in
+	'') die "domain must not be empty" ;;
+	-*) die "domain must not start with '-'" ;;
+	. | ..) die "domain must not be '.' or '..'" ;;
+	*[!A-Za-z0-9._-]*) die "domain contains invalid characters: '$1'" ;;
+	esac
+	if [ "${#1}" -gt 253 ]; then
+		die "domain is too long: '$1'"
+	fi
 }
 
 # running_openconnect_pid echoes the pid from the pidfile if it is a live
@@ -271,11 +368,69 @@ cmd_stop() {
 	exit 0 # stop is idempotent: "already gone" is success
 }
 
-[ $# -ge 1 ] || die "usage: openfortitray-tunnel {start <host:port>|stop}"
+# cmd_dns_set installs a scoped resolver for each domain, all pointing at the one
+# DNS IP the caller discovered from the live tunnel. Every argument is validated
+# BEFORE any file is written, so a bad argument in the middle leaves nothing
+# half-installed. Each file is written to a temp name and moved into place, so a
+# reader never observes a half-written resolver, and stamped with RESOLVER_MARKER
+# so dns-clear can recognise it as ours later.
+cmd_dns_set() {
+	[ $# -ge 2 ] || die "usage: openfortitray-tunnel dns-set <dns-ip> <domain> [domain ...]"
+	_ip=$1
+	shift
+	validate_dns_ip "$_ip"
+	for _d in "$@"; do
+		validate_domain "$_d"
+	done
+
+	umask 022
+	mkdir -p "$RESOLVER_DIR" || die "cannot create $RESOLVER_DIR"
+	for _d in "$@"; do
+		_f=$RESOLVER_DIR/$_d
+		_tmp=$_f.openfortitray.tmp
+		{
+			printf '%s\n' "$RESOLVER_MARKER"
+			printf 'nameserver %s\n' "$_ip"
+		} >"$_tmp" || die "cannot write $_tmp"
+		chmod 0644 "$_tmp" || {
+			rm -f "$_tmp"
+			die "cannot chmod $_tmp"
+		}
+		mv -f "$_tmp" "$_f" || {
+			rm -f "$_tmp"
+			die "cannot install $_f"
+		}
+	done
+	exit 0
+}
+
+# cmd_dns_clear removes ONLY the scoped resolvers we created — those whose first
+# line is RESOLVER_MARKER. A resolver file without the marker was put there by
+# something else (a VPN client, corp tooling, the admin) and is left untouched.
+# Idempotent: a missing or foreign file is not an error. Every domain is
+# validated first, so a '/'-bearing argument can never reach the rm.
+cmd_dns_clear() {
+	[ $# -ge 1 ] || die "usage: openfortitray-tunnel dns-clear <domain> [domain ...]"
+	for _d in "$@"; do
+		validate_domain "$_d"
+	done
+	for _d in "$@"; do
+		_f=$RESOLVER_DIR/$_d
+		[ -f "$_f" ] || continue
+		if head -n 1 "$_f" 2>/dev/null | grep -qxF "$RESOLVER_MARKER"; then
+			rm -f "$_f" || die "cannot remove $_f"
+		fi
+	done
+	exit 0
+}
+
+[ $# -ge 1 ] || die "usage: openfortitray-tunnel {start <host:port>|stop|dns-set|dns-clear}"
 sub=$1
 shift
 case "$sub" in
 start) cmd_start "$@" ;;
 stop) cmd_stop "$@" ;;
+dns-set) cmd_dns_set "$@" ;;
+dns-clear) cmd_dns_clear "$@" ;;
 *) die "unknown subcommand: $sub" ;;
 esac
