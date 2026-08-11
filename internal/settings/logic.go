@@ -117,21 +117,30 @@ func authMethod(label string) config.AuthMethod {
 }
 
 // Server-certificate mode labels shown in the Advanced tab's RadioGroup.
+//
+// The old "Trust (accept invalid)" option was removed. In that mode the
+// fingerprint field is hidden, so the mode accepted no pin, silently did
+// nothing useful, and the connection failed anyway — a misleading footgun that
+// looked like it relaxed certificate checking but did not. Only the two honest
+// modes remain: warn on an invalid certificate, or pin an exact fingerprint.
+//
+// config.CertTrust still exists in the schema, so a legacy or hand-edited
+// config that stored "trust" does not error: certModeLabel maps it to the safe
+// default (Warn on invalid), and the next Save rewrites the stored mode to
+// "warn" accordingly.
 const (
-	certWarnLabel  = "Warn on invalid"
-	certTrustLabel = "Trust (accept invalid)"
-	certPinLabel   = "Pin fingerprint"
+	certWarnLabel = "Warn on invalid"
+	certPinLabel  = "Pin fingerprint"
 )
 
 // certModeLabels is the RadioGroup's option list, in display order.
-var certModeLabels = []string{certWarnLabel, certTrustLabel, certPinLabel}
+var certModeLabels = []string{certWarnLabel, certPinLabel}
 
 // certModeLabel maps a stored server-certificate mode to its RadioGroup label.
-// An unknown/empty mode falls back to warn (the safe default).
+// The retired "trust" mode, an unknown mode and an empty mode all fall back to
+// the warn label (the safe default).
 func certModeLabel(m config.ServerCertMode) string {
 	switch m {
-	case config.CertTrust:
-		return certTrustLabel
 	case config.CertPin:
 		return certPinLabel
 	default:
@@ -139,11 +148,10 @@ func certModeLabel(m config.ServerCertMode) string {
 	}
 }
 
-// certMode maps a RadioGroup label back to a stored mode.
+// certMode maps a RadioGroup label back to a stored mode. Only the two offered
+// labels exist; anything else is treated as warn.
 func certMode(label string) config.ServerCertMode {
 	switch label {
-	case certTrustLabel:
-		return config.CertTrust
 	case certPinLabel:
 		return config.CertPin
 	default:
@@ -442,6 +450,93 @@ func validateConfig(c *config.Config) error {
 	if err := validateAuthSupported(c); err != nil {
 		return err
 	}
+	return nil
+}
+
+// Tab identifiers used to route a Connect issue to the settings window's tab
+// container. Stable constants, so routing never depends on a tab's display
+// title.
+const (
+	TabBasic    = "Basic"
+	TabAdvanced = "Advanced"
+)
+
+// Field keys naming the exact widget a Connect issue points at, so the settings
+// window can focus it and mark it invalid. Stable across the UI.
+const (
+	FieldGateway    = "gateway"
+	FieldPort       = "port"
+	FieldAuth       = "auth"
+	FieldServerCert = "servercert"
+	FieldSplitDNS   = "splitdns"
+)
+
+// Issue is a single, blocking reason the active profile cannot connect, carried
+// with enough location for the settings window to guide the user straight to
+// the fix: which profile, which tab, which field, and a message that names the
+// exact next action. It is produced by FirstConnectIssue and consumed by the
+// window's Connect router (Controller.ShowIssue).
+type Issue struct {
+	ProfileName string // the active profile this issue belongs to
+	Tab         string // TabBasic | TabAdvanced
+	Field       string // one of the Field* keys
+	Message     string // one sentence: what is wrong and where to fix it
+}
+
+// FirstConnectIssue reports the first blocking problem that would stop the
+// active profile from dialing, or nil when it is ready to connect. It inspects
+// only the active profile — the one Connect dials — and reuses the same
+// validators Save runs (validateHost, validatePortValue, validateAuthSupported,
+// validateFingerprint, validateDomain), so the Connect path and Save can never
+// disagree about what "valid" means.
+//
+// Issues are returned in a fixed, user-facing order so the guidance always
+// points at the most fundamental fix first — gateway, then port, then auth
+// method, then the Advanced-tab settings — and only the first is surfaced
+// (first-issue-wins), because fixing it and reconnecting re-runs this check for
+// whatever remains.
+func FirstConnectIssue(cfg *config.Config) *Issue {
+	prof := cfg.Active()
+	name := prof.Name
+
+	// Gateway: the one connection setting with no built-in default. Empty or
+	// malformed, there is nothing to dial.
+	if prof.Gateway == "" {
+		return &Issue{name, TabBasic, FieldGateway,
+			"Enter your FortiGate gateway host in Basic ▸ Gateway host — for example vpn.example.com."}
+	}
+	if validateHost(prof.Gateway) != nil {
+		return &Issue{name, TabBasic, FieldGateway,
+			"The gateway must be a bare host in Basic ▸ Gateway host — no https:// and no port, for example vpn.example.com."}
+	}
+
+	// Port: only meaningful with a custom port; otherwise it is the fixed
+	// default and cannot be wrong.
+	if prof.CustomPort && validatePortValue(prof.Port) != nil {
+		return &Issue{name, TabBasic, FieldPort,
+			"The custom port must be a whole number between 1 and 65535 — fix it in Basic ▸ Port."}
+	}
+
+	// Authentication: only SAML / SSO is wired into the runtime today.
+	if validateAuthSupported(cfg) != nil {
+		return &Issue{name, TabBasic, FieldAuth,
+			"Username and password sign-in isn't supported yet — choose SAML / SSO in Basic ▸ Authentication."}
+	}
+
+	// Advanced: a pinned server certificate needs a fingerprint to pin to.
+	if prof.ServerCert.Mode == config.CertPin && validateFingerprint(prof.ServerCert.Pin) != nil {
+		return &Issue{name, TabAdvanced, FieldServerCert,
+			"Pinning the server certificate needs a fingerprint — enter it in Advanced ▸ Fingerprint, or switch the mode to Warn on invalid."}
+	}
+
+	// Advanced: every split-DNS domain must be a valid host name.
+	for _, d := range prof.SplitDNS {
+		if validateDomain(d) != nil {
+			return &Issue{name, TabAdvanced, FieldSplitDNS,
+				fmt.Sprintf("The split-DNS domain %q isn't valid — fix it in Advanced ▸ Split-DNS domains, one domain per line (for example corp.example.com).", d)}
+		}
+	}
+
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"errors"
 	"image/color"
 	"strings"
 
@@ -8,6 +9,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
@@ -44,6 +46,14 @@ type Controller struct {
 	sel  int
 
 	list *widget.List
+
+	// tabs is the Basic/Advanced container; ShowIssue switches it to the tab an
+	// issue lives on. banner is the persistent inline strip at the top of the
+	// window that names a blocking Connect issue and its fix; it is hidden until
+	// ShowIssue raises it and stays up until dismissed or a successful Save.
+	tabs        *container.AppTabs
+	banner      *fyne.Container
+	bannerLabel *widget.Label
 
 	nameEntry     *widget.Entry
 	gatewayEntry  *widget.Entry
@@ -144,10 +154,11 @@ func (c *Controller) build() {
 	c.buildList()
 	form := c.buildBasicTab()
 	advanced := c.buildAdvancedTab()
-	tabs := container.NewAppTabs(
+	c.tabs = container.NewAppTabs(
 		container.NewTabItem("Basic", form),
 		container.NewTabItem("Advanced", advanced),
 	)
+	c.buildBanner()
 
 	addBtn := widget.NewButton("Add", c.addProfile)
 	dupBtn := widget.NewButton("Duplicate", c.duplicateProfile)
@@ -158,7 +169,8 @@ func (c *Controller) build() {
 
 	bottom := c.buildActionStrip()
 
-	content := container.NewBorder(nil, bottom, left, nil, tabs)
+	// The banner sits at the top; while hidden BorderLayout gives it no space.
+	content := container.NewBorder(c.banner, bottom, left, nil, c.tabs)
 	c.win.SetContent(content)
 	c.win.Resize(fyne.NewSize(680, 460))
 	// The red close button hides the window; the app only ever exits via the
@@ -323,6 +335,113 @@ func (c *Controller) buildActionStrip() fyne.CanvasObject {
 	)
 	// Status on the left, actions on the right.
 	return container.NewBorder(widget.NewSeparator(), nil, container.NewPadded(c.statusText), buttons)
+}
+
+// buildBanner constructs the persistent inline banner shown at the top of the
+// window when Connect is refused: a warning icon, a bold wrapping message, and a
+// dismiss button, over a subtle amber background that reads on both light and
+// dark themes. It starts hidden; ShowIssue fills and reveals it.
+func (c *Controller) buildBanner() {
+	c.bannerLabel = widget.NewLabel("")
+	c.bannerLabel.Wrapping = fyne.TextWrapWord
+	c.bannerLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	bg := canvas.NewRectangle(color.NRGBA{R: 0xB8, G: 0x86, B: 0x0B, A: 0x33})
+	icon := widget.NewIcon(theme.WarningIcon())
+	dismiss := widget.NewButtonWithIcon("", theme.CancelIcon(), c.hideBanner)
+	dismiss.Importance = widget.LowImportance
+
+	inner := container.NewBorder(nil, nil, icon, dismiss, container.NewPadded(c.bannerLabel))
+	c.banner = container.NewStack(bg, container.NewPadded(inner))
+	c.banner.Hide()
+}
+
+// showBanner fills the banner with msg and reveals it.
+func (c *Controller) showBanner(msg string) {
+	c.bannerLabel.SetText(msg)
+	c.banner.Show()
+	c.banner.Refresh()
+}
+
+// hideBanner dismisses the banner. Wired to the dismiss button and called after
+// a successful Save (the issue it named is resolved).
+func (c *Controller) hideBanner() {
+	c.banner.Hide()
+	c.banner.Refresh()
+}
+
+// ShowIssue reveals the settings window and guides the user straight to the
+// field blocking Connect. It re-syncs the form to the saved config first —
+// Connect dials what is saved, not any unsaved edits, so the guidance must
+// match the saved profile — then selects the issue's profile, switches to its
+// tab, marks the offending field invalid and focuses it, and raises the
+// persistent banner naming the exact fix.
+//
+// It mutates widgets, so it must run on the UI goroutine. Both Connect entry
+// points that reach it (the tray's Connect item and the window's Connect
+// button) already run there, so it takes no lock and does no fyne.Do of its own.
+func (c *Controller) ShowIssue(issue *Issue) {
+	if issue == nil {
+		return
+	}
+	c.reset()
+	c.sel = c.indexOf(issue.ProfileName)
+	c.list.Select(c.sel) // fires OnSelected → loadProfile paints the form
+	c.selectTab(issue.Tab)
+	c.markField(issue)
+	c.showBanner(issue.Message)
+	c.win.Show()
+	c.win.RequestFocus()
+}
+
+// selectTab switches the Basic/Advanced container to the tab an issue lives on.
+func (c *Controller) selectTab(tab string) {
+	if c.tabs == nil {
+		return
+	}
+	if tab == TabAdvanced {
+		c.tabs.SelectIndex(1)
+		return
+	}
+	c.tabs.SelectIndex(0)
+}
+
+// markField puts the issue's field into its validation-error state and focuses
+// it. Entries are marked via AlwaysShowValidationError with an explicit error,
+// so even the empty-gateway case — which the entry's own validator deliberately
+// accepts (an unconfigured profile is savable) — still shows as invalid. The
+// auth control is a Select with no error affordance, so it is only focused; the
+// banner carries the "choose SAML / SSO" instruction.
+func (c *Controller) markField(issue *Issue) {
+	var focus fyne.Focusable
+	switch issue.Field {
+	case FieldGateway:
+		markEntryInvalid(c.gatewayEntry, "a gateway host is required")
+		focus = c.gatewayEntry
+	case FieldPort:
+		markEntryInvalid(c.portEntry, "enter a port between 1 and 65535")
+		focus = c.portEntry
+	case FieldAuth:
+		focus = c.authSelect
+	case FieldServerCert:
+		markEntryInvalid(c.certPin, "a fingerprint is required to pin the certificate")
+		focus = c.certPin
+	case FieldSplitDNS:
+		markEntryInvalid(c.splitDNS, "one domain per line, e.g. corp.example.com")
+		focus = c.splitDNS
+	}
+	if focus != nil {
+		c.win.Canvas().Focus(focus)
+	}
+}
+
+// markEntryInvalid forces an entry into its error state. AlwaysShowValidationError
+// makes SetValidationError stick even when the entry validator would accept the
+// current text (as the gateway validator accepts empty); the error clears the
+// moment the user types a value the validator accepts.
+func markEntryInvalid(e *widget.Entry, msg string) {
+	e.AlwaysShowValidationError = true
+	e.SetValidationError(errors.New(msg))
 }
 
 // loadProfile paints the form from work.Profiles[i]. loading is set for the
@@ -527,6 +646,8 @@ func (c *Controller) save(reconnect bool) {
 	}
 	// Keep the visible working copy consistent with what was just persisted.
 	c.work = cloneConfig(work)
+	// The config now validates, so any Connect-issue banner it raised is stale.
+	c.hideBanner()
 	if reconnect {
 		// Reaching a running tunnel with the new settings: tear the current one
 		// down and bring it back up so the supervisor re-reads the active profile.

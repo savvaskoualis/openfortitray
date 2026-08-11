@@ -2,6 +2,7 @@ package settings
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
@@ -305,13 +306,136 @@ func TestValidateDomainAndSplitDNS(t *testing.T) {
 }
 
 func TestCertModeRoundTrip(t *testing.T) {
-	for _, m := range []config.ServerCertMode{config.CertWarn, config.CertTrust, config.CertPin} {
+	// Only the two offered modes round-trip; "Trust (accept invalid)" was removed.
+	for _, m := range []config.ServerCertMode{config.CertWarn, config.CertPin} {
 		if got := certMode(certModeLabel(m)); got != m {
 			t.Errorf("certMode(certModeLabel(%q)) = %q, want round-trip", m, got)
 		}
 	}
+	// The retired trust mode and any unknown mode fall back to the warn label, so
+	// a legacy config that stored "trust" is displayed (and re-saved) as warn.
+	if got := certModeLabel(config.CertTrust); got != certWarnLabel {
+		t.Errorf("retired trust mode should map to the warn label, got %q", got)
+	}
 	if got := certModeLabel(config.ServerCertMode("bogus")); got != certWarnLabel {
 		t.Errorf("unknown mode should fall back to the warn label, got %q", got)
+	}
+	// The RadioGroup must no longer offer a Trust option.
+	for _, l := range certModeLabels {
+		if l == "Trust (accept invalid)" {
+			t.Error("the Trust (accept invalid) option must be removed from the cert-mode radio")
+		}
+	}
+}
+
+// FirstConnectIssue must point Connect's caller at the first blocking problem in
+// the active profile — the right tab, the right field, a message that names the
+// fix — or return nil when the profile is ready to dial.
+func TestFirstConnectIssue(t *testing.T) {
+	tests := []struct {
+		name       string
+		profile    config.Profile
+		wantNil    bool
+		wantTab    string
+		wantField  string
+		wantMsgSub string
+	}{
+		{
+			name:    "a ready SAML profile has no issue",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Port: 10443, Auth: config.AuthConfig{Method: config.AuthSAML}},
+			wantNil: true,
+		},
+		{
+			name:    "empty gateway routes to Basic gateway",
+			profile: config.Profile{Name: "Work", Gateway: ""},
+			wantTab: TabBasic, wantField: FieldGateway, wantMsgSub: "gateway host",
+		},
+		{
+			name:    "malformed gateway routes to Basic gateway",
+			profile: config.Profile{Name: "Work", Gateway: "https://vpn.example.com"},
+			wantTab: TabBasic, wantField: FieldGateway, wantMsgSub: "bare host",
+		},
+		{
+			name:    "out-of-range custom port routes to Basic port",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", CustomPort: true, Port: 70000},
+			wantTab: TabBasic, wantField: FieldPort, wantMsgSub: "port",
+		},
+		{
+			name:    "unsupported password auth routes to Basic auth",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Auth: config.AuthConfig{Method: config.AuthPassword}},
+			wantTab: TabBasic, wantField: FieldAuth, wantMsgSub: "SAML",
+		},
+		{
+			name:    "pin mode without a fingerprint routes to Advanced server certificate",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Auth: config.AuthConfig{Method: config.AuthSAML}, ServerCert: config.ServerCert{Mode: config.CertPin}},
+			wantTab: TabAdvanced, wantField: FieldServerCert, wantMsgSub: "fingerprint",
+		},
+		{
+			name:    "invalid split-DNS domain routes to Advanced split-DNS",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Auth: config.AuthConfig{Method: config.AuthSAML}, SplitDNS: []string{"bad domain"}},
+			wantTab: TabAdvanced, wantField: FieldSplitDNS, wantMsgSub: "split-DNS",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{ActiveProfile: tc.profile.Name, Profiles: []config.Profile{tc.profile}}
+			got := FirstConnectIssue(cfg)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("want no issue, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("want an issue, got nil")
+			}
+			if got.ProfileName != tc.profile.Name {
+				t.Errorf("ProfileName = %q, want %q", got.ProfileName, tc.profile.Name)
+			}
+			if got.Tab != tc.wantTab {
+				t.Errorf("Tab = %q, want %q", got.Tab, tc.wantTab)
+			}
+			if got.Field != tc.wantField {
+				t.Errorf("Field = %q, want %q", got.Field, tc.wantField)
+			}
+			if !strings.Contains(got.Message, tc.wantMsgSub) {
+				t.Errorf("Message = %q, want it to contain %q", got.Message, tc.wantMsgSub)
+			}
+		})
+	}
+}
+
+// A profile broken in several ways must surface only the most fundamental fix
+// first (gateway → port → auth → Advanced), and reveal the next as each is
+// fixed. First-issue-wins is what makes the reconnect-after-fix loop terminate.
+func TestFirstConnectIssueOrderingFirstWins(t *testing.T) {
+	p := config.Profile{
+		Name:       "Work",
+		Gateway:    "",                                             // gateway issue (most fundamental)
+		Auth:       config.AuthConfig{Method: config.AuthPassword}, // and an auth issue
+		ServerCert: config.ServerCert{Mode: config.CertPin},        // and a server-cert issue
+		SplitDNS:   []string{"bad domain"},                         // and a split-DNS issue
+	}
+	cfg := &config.Config{ActiveProfile: "Work", Profiles: []config.Profile{p}}
+
+	if got := FirstConnectIssue(cfg); got == nil || got.Field != FieldGateway {
+		t.Fatalf("want the gateway issue first, got %+v", got)
+	}
+	cfg.Profiles[0].Gateway = "vpn.example.com"
+	if got := FirstConnectIssue(cfg); got == nil || got.Field != FieldAuth {
+		t.Fatalf("want the auth issue next, got %+v", got)
+	}
+	cfg.Profiles[0].Auth.Method = config.AuthSAML
+	if got := FirstConnectIssue(cfg); got == nil || got.Field != FieldServerCert {
+		t.Fatalf("want the server-certificate issue next, got %+v", got)
+	}
+	cfg.Profiles[0].ServerCert = config.ServerCert{Mode: config.CertWarn}
+	if got := FirstConnectIssue(cfg); got == nil || got.Field != FieldSplitDNS {
+		t.Fatalf("want the split-DNS issue last, got %+v", got)
+	}
+	cfg.Profiles[0].SplitDNS = nil
+	if got := FirstConnectIssue(cfg); got != nil {
+		t.Fatalf("want no issue once everything is fixed, got %+v", got)
 	}
 }
 

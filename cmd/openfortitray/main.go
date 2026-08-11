@@ -35,6 +35,12 @@ type app struct {
 	fyneApp  fyne.App
 	tray     *tray.Controller
 	settings *settings.Controller
+	// onConnectIssue routes a blocking config issue to the settings window when
+	// Connect is refused (see Connect). In production it is set to the settings
+	// controller's ShowIssue once the window is built; it stays nil until then,
+	// and tests substitute a recorder to assert Connect routes rather than dials.
+	// It runs on the UI goroutine, where every Connect entry point calls it.
+	onConnectIssue func(*settings.Issue)
 	// quitting stops the event pump touching a tearing-down UI. It is set once,
 	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
 	// drains events without calling fyne.Do — so no fyne.Do is ever queued
@@ -72,43 +78,39 @@ func (a *app) setSnapshot(tp tunnelParams) {
 	a.tp = tp
 }
 
-// Connect starts the tunnel, unless no gateway is configured. The gateway has no
-// built-in default (it is deployment-specific), so a fresh install would
-// otherwise hand openconnect a bare ":10443" — the SAML browser window would
-// open against a nonexistent host and the failure would surface as an opaque
-// connection error. Reporting the missing setting instead, as the terminal Error
-// state, tells the user the one thing they have to do.
+// Connect starts the tunnel, unless the active profile has a blocking config
+// issue. The gateway, for instance, has no built-in default (it is
+// deployment-specific), so a fresh install would otherwise hand openconnect a
+// bare ":10443" — the SAML browser window would open against a nonexistent host
+// and the failure would surface as an opaque connection error.
 //
-// The menu text names the file but not its directory, because tray.short() clips
-// the detail at 60 runes and the full path ("~/Library/Application
-// Support/openfortitray/config.json") does not fit — the user would see the sentence
-// truncated mid-path, which is worse than no path at all. The log line below
-// carries the absolute path for anyone who needs it.
+// Rather than start a doomed tunnel and report a red Error, Connect asks
+// settings.FirstConnectIssue what would go wrong and, if anything would, routes
+// the user to the exact fix: the settings window opens on the right tab with the
+// offending field focused and flagged, and a banner names the next action (see
+// Controller.ShowIssue). No JSON editing, no cryptic error. Only when the active
+// profile is ready to dial does it snapshot the profile and start the tunnel.
+//
+// It runs on the UI goroutine — the tray's Connect item, the window's Connect
+// button and the autostart-at-launch call all reach it there — so routing to the
+// window is a direct call, not a marshalled one.
 func (a *app) Connect() {
-	prof := *a.cfg.Active()
-	if prof.Gateway == "" {
-		log.Printf("connect refused: gateway not set — edit %s",
-			filepath.Join(a.cfgDir, "config.json"))
-		a.emit(tunnel.Event{State: tunnel.Error, Detail: "gateway not set — see config.json"})
+	if issue := settings.FirstConnectIssue(a.cfg); issue != nil {
+		log.Printf("connect deferred: %s (%s ▸ %s)", issue.Message, issue.Tab, issue.Field)
+		if a.onConnectIssue != nil {
+			a.onConnectIssue(issue)
+		}
 		return
 	}
 	// Snapshot the active profile the tunnel will dial, so a Connect that follows
 	// a settings Save picks up the edited profile rather than the startup one.
+	prof := *a.cfg.Active()
 	a.setSnapshot(tunnelParams{
 		prof:            prof,
 		openconnectPath: a.cfg.OpenconnectPath,
 		helperPath:      a.cfg.HelperPath,
 	})
 	a.sup.Connect()
-}
-
-// emit delivers an event the supervisor did not produce, without blocking on a
-// slow UI (the same drop-on-full rule the supervisor uses).
-func (a *app) emit(e tunnel.Event) {
-	select {
-	case a.events <- e:
-	default:
-	}
 }
 
 func (a *app) Disconnect()            { a.sup.Disconnect() }
@@ -262,8 +264,7 @@ func main() {
 		defer f.Close()
 	}
 	if prof := cfg.Active(); prof.Gateway == "" {
-		log.Printf("openfortitray: starting, no gateway configured in %s",
-			filepath.Join(cfgDir, "config.json"))
+		log.Printf("openfortitray: starting, no gateway configured — Connect opens Settings to add one")
 	} else {
 		log.Printf("openfortitray: starting, gateway %s", prof.GatewayURL())
 	}
@@ -355,6 +356,9 @@ func main() {
 	// this same reused window.
 	win := a.fyneApp.NewWindow("OpenFortiTray — Settings")
 	a.settings = settings.New(a, win)
+	// Route a refused Connect (invalid active profile) to the settings window,
+	// which opens on the offending field with a banner naming the fix.
+	a.onConnectIssue = a.settings.ShowIssue
 
 	// The one event pump. Started before Run so events emitted by the
 	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and
