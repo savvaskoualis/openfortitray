@@ -1,0 +1,140 @@
+name: Release
+
+# Fires on version tags only (v1.2.3, v0.1.0-rc1, ...). Build flags below mirror
+# the Makefile `release` target exactly — if you change one, change both.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege at the top; only the publishing job widens to contents: write.
+permissions:
+  contents: read
+
+jobs:
+  # darwin needs cgo (fyne.io/systray drives the Cocoa status bar), so both
+  # slices must be built on a macOS runner. macos-14 is Apple Silicon: arm64 is
+  # native and the amd64 slice cross-builds because the macOS SDK is a fat SDK.
+  # If a future SDK drops x86_64, delete the amd64 step — it only serves
+  # pre-2020 Intel macs.
+  build-darwin:
+    name: Build darwin (arm64 + amd64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      # NOTE: no -X main.version stamp — cmd/postern declares no `version` var
+      # today. If one is added, append
+      #   -ldflags "-X main.version=${GITHUB_REF_NAME}"
+      # to each build below (and merge it with the windows -H=windowsgui flag).
+      - name: Build
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -o dist/postern-darwin-arm64 ./cmd/postern
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            go build -o dist/postern-darwin-amd64 ./cmd/postern
+          ls -l dist
+
+      - name: Verify architectures
+        # Cheap guard against a silently-native amd64 build.
+        run: |
+          file dist/postern-darwin-arm64 | grep -q 'arm64'
+          file dist/postern-darwin-amd64 | grep -q 'x86_64'
+
+      - name: Upload darwin binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-darwin
+          path: dist/postern-darwin-*
+          if-no-files-found: error
+          retention-days: 7
+
+  # linux systray is pure Go (D-Bus StatusNotifierItem via godbus) and windows
+  # needs no cgo either, so both cross-build from ubuntu with CGO_ENABLED=0.
+  # cgo off also keeps the linux binary free of a glibc version floor.
+  build-linux-windows:
+    name: Build linux + windows (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Build
+        # -H=windowsgui on windows only: without it, launching the tray app pops
+        # a console window alongside it.
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -o dist/postern-linux-amd64 ./cmd/postern
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -ldflags="-H=windowsgui" -o dist/postern-windows-amd64.exe ./cmd/postern
+          ls -l dist
+
+      - name: Upload linux + windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-windows
+          path: |
+            dist/postern-linux-amd64
+            dist/postern-windows-amd64.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [build-darwin, build-linux-windows]
+    runs-on: ubuntu-latest
+    # The only job that writes: it creates the release and uploads the assets.
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256SUMS
+        # Written from inside dist/ so the checksum file holds bare filenames
+        # (`sha256sum -c SHA256SUMS` then works next to the downloaded binaries).
+        # chmod +x because upload-artifact does not preserve the exec bit.
+        working-directory: dist
+        run: |
+          chmod +x postern-darwin-arm64 postern-darwin-amd64 postern-linux-amd64
+          sha256sum postern-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        # `gh release create` over softprops/action-gh-release: gh is preinstalled
+        # on GitHub-hosted runners, so publishing — the one step holding a
+        # contents: write token — runs no third-party code that would need
+        # SHA-pinning and auditing on every bump. Costs us nothing here: the
+        # action's extras (changelog templating, draft flows) are unused.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            dist/postern-darwin-arm64 \
+            dist/postern-darwin-amd64 \
+            dist/postern-linux-amd64 \
+            dist/postern-windows-amd64.exe \
+            dist/SHA256SUMS
