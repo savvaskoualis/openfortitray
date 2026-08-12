@@ -1085,7 +1085,9 @@ func TestRunOpenconnectViaHelperStopsThroughHelper(t *testing.T) {
 	// Stands in for sudo: logs its arguments, then behaves like the helper.
 	// "start" ignores SIGINT/SIGTERM, so the only way out is "stop".
 	sudo := writeScript(t, dir, "sudo", `#!/bin/sh
-echo "$@" >> `+argvLog+`
+# printf, not echo: dash's echo treats a leading "-n" arg (sudo's flag) as its
+# own suppress-newline option, eating it and the trailing newline on Linux.
+printf '%s\n' "$*" >> `+argvLog+`
 case "$3" in
 start)
 	trap '' INT TERM
