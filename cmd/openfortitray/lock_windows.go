@@ -5,9 +5,8 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 // ErrAlreadyRunning is returned by acquireInstanceLock when another live instance
@@ -15,74 +14,51 @@ import (
 // SAML login + connect.
 var ErrAlreadyRunning = errors.New("another openfortitray instance is already running")
 
-// instanceLock holds the process-wide single-instance lock. Windows has no
-// flock(2), so this is a pidfile: the file exists while an instance runs, and a
-// stale one left by a crash is reclaimed by checking whether the recorded pid is
-// still alive (see acquireInstanceLock).
+// mutexName is the single-instance mutex. It lives in the session-local
+// namespace (no "Global\") — every instance runs elevated in the same user
+// session, so they share it, while different users/sessions stay independent.
+const mutexName = `Local\io.github.savvaskoualis.openfortitray.single-instance`
+
+// instanceLock holds the process-wide single-instance lock as a named mutex —
+// the correct Windows primitive. Unlike the old pidfile, the kernel releases the
+// mutex automatically when the owning process dies, so a crash never leaves a
+// stale lock that blocks every future launch; and there is no pid-reuse hazard
+// (os.FindProcess cannot tell a dead pid from a reused one on Windows, which is
+// exactly what made the pidfile approach wedge after a crash).
 type instanceLock struct {
-	path string
-	f    *os.File
+	h windows.Handle
 }
 
-// acquireInstanceLock creates path exclusively so only one instance runs. If the
-// file already exists it reads the recorded pid: a live pid means another
-// instance is running (ErrAlreadyRunning); a dead pid means a previous instance
-// crashed without cleaning up, so the stale file is removed and the lock retaken.
-func acquireInstanceLock(path string) (*instanceLock, error) {
-	for {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			_, _ = f.WriteString(strconv.Itoa(os.Getpid()) + "\n")
-			_ = f.Sync()
-			return &instanceLock{path: path, f: f}, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("open lock file %s: %w", path, err)
-		}
-		pid := readLockPIDFromPath(path)
-		if pid > 0 && pidAlive(pid) {
-			return nil, fmt.Errorf("%w (pid %d)", ErrAlreadyRunning, pid)
-		}
-		// Stale lock from a dead pid: reclaim it and try again.
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("clear stale lock %s: %w", path, err)
-		}
-	}
-}
-
-// readLockPIDFromPath reads the pid recorded in a lock file. Returns 0 if it
-// cannot be read or parsed.
-func readLockPIDFromPath(path string) int {
-	data, err := os.ReadFile(path)
+// acquireInstanceLock creates the named mutex. CreateMutex returns a valid handle
+// even when the mutex already exists; ERROR_ALREADY_EXISTS is the signal that
+// another instance owns it. The path argument is unused on Windows (kept for the
+// cross-platform signature). We hold the handle open for the process lifetime;
+// release() (or process exit) frees it.
+func acquireInstanceLock(_ string) (*instanceLock, error) {
+	name, err := windows.UTF16PtrFromString(mutexName)
 	if err != nil {
-		return 0
+		return nil, fmt.Errorf("single-instance mutex name: %w", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0
+	h, err := windows.CreateMutex(nil, false, name)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if h != 0 {
+			_ = windows.CloseHandle(h)
+		}
+		return nil, ErrAlreadyRunning
 	}
-	return pid
+	if h == 0 {
+		return nil, fmt.Errorf("create single-instance mutex: %w", err)
+	}
+	return &instanceLock{h: h}, nil
 }
 
-// pidAlive reports whether a process with the given pid currently exists. On
-// Windows os.FindProcess opens the process handle and fails for a pid that is not
-// running, which is exactly the liveness signal we need.
-func pidAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	_ = p.Release()
-	return true
-}
-
-// release removes the pidfile and closes it. Safe on a nil lock.
+// release closes the mutex handle, letting the kernel free the named mutex. Safe
+// on a nil lock.
 func (l *instanceLock) release() error {
-	if l == nil || l.f == nil {
+	if l == nil || l.h == 0 {
 		return nil
 	}
-	err := l.f.Close()
-	l.f = nil
-	_ = os.Remove(l.path)
+	err := windows.CloseHandle(l.h)
+	l.h = 0
 	return err
 }
