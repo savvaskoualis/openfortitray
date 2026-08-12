@@ -1,0 +1,433 @@
+name: Release
+
+# Fires on version tags only (v1.2.3, v0.1.0-rc1, ...). Build flags below mirror
+# the Makefile `release` target's per-OS builds — if you change one, change both.
+#
+# Since the fyne v2 tray migration, cmd/openfortitray is a cgo + OpenGL/GLFW
+# build on every OS, so the old "cross-build linux + windows from one ubuntu
+# host with CGO_ENABLED=0" model is dead. Each OS is now built on its own
+# native runner with CGO_ENABLED=1. macOS additionally ships a real .app
+# bundle (fyne menu-bar apps need one) inside a drag-to-/Applications .dmg,
+# the primary macOS download.
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual dry-run: build all artifacts (incl. the .dmg and the Windows
+  # installer) without publishing, so the packaging path can be verified on a
+  # branch before a real tag. The publish job is gated to tag refs below.
+  workflow_dispatch:
+
+# Least privilege at the top; only the publishing job widens to contents: write.
+permissions:
+  contents: read
+
+# bash everywhere, including the windows runner (Git Bash), so the checksum
+# steps share one implementation and emit the sha256sum -c format downstream.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # darwin needs cgo (fyne drives the Cocoa status bar and renders via OpenGL),
+  # so both slices must be built on a macOS runner. macos-14 is Apple Silicon:
+  # arm64 is native and the amd64 slice cross-builds because the macOS SDK is a
+  # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
+  # guard — it only serves pre-2020 Intel macs.
+  build-darwin:
+    name: Build darwin (arm64 + amd64 + .dmg)
+    runs-on: macos-14
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          cache: true
+
+      # cgo on darwin needs the Xcode Command Line Tools (clang + the macOS
+      # SDK). They ship on the macos-14 runner by default; this fails fast with
+      # a clear message if that ever changes rather than deep inside `go build`.
+      - name: Verify Xcode Command Line Tools
+        run: |
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-path
+
+      # The build version is stamped into main.version (shown in the tray header)
+      # via -X main.version=${GITHUB_REF_NAME}, merged into the -ldflags below
+      # (alongside -s -w, and -H=windowsgui on the windows job).
+      - name: Build darwin binaries
+        # -s -w strips the symbol table and DWARF to claw back some of fyne's
+        # size (a fyne binary is ~15-30 MB heavier than the old systray one).
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
+          ls -l dist
+
+      - name: Verify architectures
+        # Cheap guard against a silently-native amd64 build.
+        run: |
+          file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
+          file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
+
+      # A fyne menu-bar app needs a real .app bundle (Info.plist + LSUIElement)
+      # to host the status item reliably and stay off the Dock. `make dmg`
+      # depends on `make app` (which rebuilds the host-arch arm64 binary and
+      # assembles the bundle with the hand-rolled Info.plist + generated .icns),
+      # then wraps it in a double-click, drag-to-/Applications disk image — the
+      # primary macOS download, superseding the old OpenFortiTray.app.zip.
+      # VERSION stamps the filename to OpenFortiTray-<tag>.dmg. The runner is
+      # headless, so `make dmg` uses its hdiutil builder (create-dmg is not
+      # installed here): a valid, mountable UDZO image with the Applications
+      # symlink, just a plainer window than a create-dmg layout.
+      - name: Build OpenFortiTray.dmg
+        run: |
+          make dmg VERSION="${GITHUB_REF_NAME}"
+          ls -l dist
+
+      # Checksums are computed HERE, on the runner that produced the bytes, so
+      # the verification in the release job actually covers the upload/download
+      # round trip. `shasum -a 256` rather than `sha256sum`: macOS runners ship
+      # BSD tools and have no coreutils sha256sum. The output format is
+      # byte-identical to sha256sum's, so `sha256sum -c` consumes it downstream.
+      - name: Checksum darwin artifacts
+        working-directory: dist
+        run: |
+          shasum -a 256 \
+            openfortitray-darwin-arm64 \
+            openfortitray-darwin-amd64 \
+            "OpenFortiTray-${GITHUB_REF_NAME}.dmg" > SHA256SUMS.darwin
+          cat SHA256SUMS.darwin
+
+      - name: Upload darwin artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-darwin
+          path: |
+            dist/openfortitray-darwin-arm64
+            dist/openfortitray-darwin-amd64
+            dist/OpenFortiTray-${{ github.ref_name }}.dmg
+            dist/SHA256SUMS.darwin
+          if-no-files-found: error
+          retention-days: 7
+
+  # linux is now a cgo build (fyne -> GLFW -> OpenGL), so it must build on a
+  # linux runner with the GL + X11 dev headers, not cross-compiled with cgo
+  # off. Consequence: the linux binary now carries a glibc version floor from
+  # ubuntu-latest (it no longer runs on arbitrarily old glibc). Runtime still
+  # needs an SNI-capable panel (unchanged) plus a working GL stack.
+  build-linux:
+    name: Build linux (amd64)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install GL/X11 build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+
+      - name: Build linux binary
+        # -s -w trims fyne's size. Ships the bare binary: there is no
+        # linux/.desktop asset in the repo, so no .tar.xz is assembled here.
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
+          ls -l dist
+
+      - name: Checksum linux binary
+        working-directory: dist
+        run: |
+          sha256sum openfortitray-linux-amd64 > SHA256SUMS.linux
+          cat SHA256SUMS.linux
+
+      - name: Upload linux binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-linux
+          path: |
+            dist/openfortitray-linux-amd64
+            dist/SHA256SUMS.linux
+          if-no-files-found: error
+          retention-days: 7
+
+  # windows is a cgo build too, and cgo windows cannot be cross-compiled from
+  # Linux without a MinGW cross-toolchain, so it gets its own windows-latest
+  # runner. The runner-image ships MinGW-w64 but does NOT put it on PATH
+  # (actions/runner-images #6103/#8399), so a bare `go build` with CGO=1 would
+  # fail for want of a C compiler. We install a known-good gcc via a pinned
+  # setup-msys2 and prepend its bin to PATH ourselves. -H=windowsgui keeps the
+  # tray app from popping a console window.
+  build-windows:
+    name: Build windows (amd64)
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          cache: true
+
+      # Provides a MinGW-w64 gcc for cgo. Pinned to a full commit SHA like every
+      # other action here.
+      - name: Set up MinGW-w64 (MSYS2)
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 gcc on PATH
+        # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but our
+        # build steps run in Git Bash (defaults.run.shell: bash). Prepend the
+        # MINGW64 bin dir to PATH so cgo's `go build` finds gcc.
+        run: printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+
+      # Confirms gcc is now resolvable, so a cgo failure names the cause up
+      # front rather than surfacing as a cryptic linker error.
+      - name: Verify C toolchain
+        run: gcc --version
+
+      # Embed the Windows application manifest AND the app icon into a .syso so
+      # the exe ALWAYS runs elevated (requireAdministrator) from any launch
+      # path — Start-menu shortcut, manual launch, or the /RL HIGHEST login
+      # task — because openconnect needs Administrator to create the wintun
+      # adapter and there is no privileged helper on Windows, and so the exe
+      # carries a real application icon (-ico) instead of the generic file icon
+      # in Explorer/taskbar. Go auto-links a GOOS/GOARCH-scoped *.syso in the
+      # main package dir into the windows exe; we generate it here from the
+      # checked-in manifest + committed .ico rather than commit a binary blob
+      # (the .syso is gitignored). rsrc is pure Go (no cgo, no MinGW needed) and
+      # pinned to a full version like every action above. -arch amd64 matches
+      # the single arch built below. Mirrors the Makefile `winres` target.
+      - name: Embed Windows manifest + icon (generate .syso)
+        run: |
+          go run github.com/akavel/rsrc@v0.10.2 \
+            -manifest cmd/openfortitray/openfortitray.manifest \
+            -ico assets/icons/openfortitray.ico \
+            -arch amd64 \
+            -o cmd/openfortitray/resource_windows_amd64.syso
+
+      - name: Build windows binary
+        # -s -w trims size; -H=windowsgui suppresses the console window.
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOARCH=amd64 \
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
+          ls -l dist
+
+      # Bundle Mesa's llvmpipe software OpenGL next to the exe so the tray runs
+      # on GPU-less Windows — VMs, RDP sessions, minimal/Server installs — where
+      # there is no GL driver and fyne/GLFW otherwise dies at launch with
+      # "APIUnavailable: WGL: The driver does not appear to support OpenGL".
+      # Windows resolves an application-directory opengl32.dll before the system
+      # one (per-process), so placing Mesa's opengl32.dll here makes THIS process
+      # render in software; a light tray + settings window is fine in llvmpipe.
+      #
+      # In modern Mesa (26.x) opengl32.dll is a thin WGL front-end (~140 KB) that
+      # loads its gallium/llvmpipe backend from libgallium_wgl.dll (~60 MB), so
+      # BOTH DLLs must ship together — opengl32.dll alone would fail to load a
+      # driver. (This deviates from the older single-DLL Mesa layout.)
+      #
+      # SUPPLY CHAIN: this is a shipped third-party binary, so the Mesa release
+      # is PINNED to an exact version and the downloaded archive is sha256-
+      # verified before extraction (the job fails on mismatch). Never "latest".
+      # windows-latest ships 7-Zip (7z) on PATH and Git Bash provides sha256sum.
+      - name: Bundle Mesa software OpenGL (llvmpipe)
+        env:
+          MESA_VERSION: '26.1.6'
+          MESA_ARCHIVE: 'mesa3d-26.1.6-release-msvc.7z'
+          MESA_SHA256: '86b506ad38b8dae9d37bdade656a9003518d717bf4ff5475ff3f746e4ee768eb'
+        run: |
+          set -euo pipefail
+          url="https://github.com/pal1000/mesa-dist-win/releases/download/${MESA_VERSION}/${MESA_ARCHIVE}"
+          echo "Downloading pinned Mesa ${MESA_VERSION}: ${url}"
+          curl -fsSL -o "${MESA_ARCHIVE}" "${url}"
+          echo "${MESA_SHA256}  ${MESA_ARCHIVE}" | sha256sum -c -
+          # -e extracts the two DLLs flat (no x64/ prefix) into dist/, next to
+          # the exe. 7z fails the step if either member is missing.
+          7z e -y "${MESA_ARCHIVE}" x64/opengl32.dll x64/libgallium_wgl.dll -odist
+          rm -f "${MESA_ARCHIVE}"
+          test -s dist/opengl32.dll
+          test -s dist/libgallium_wgl.dll
+          ls -l dist/opengl32.dll dist/libgallium_wgl.dll
+
+      # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
+      # the app so Windows is turnkey. There is no reliable way to install
+      # openconnect on a locked-down Cloud PC (winget is a dead stub; MSYS2 has no
+      # openconnect package), so we BUILD it once from source
+      # (.github/workflows/build-openconnect.yml) and download the pinned,
+      # sha256-verified result here — same pattern as the Mesa bundle. The prebuilt
+      # zip was itself validated in the build workflow by a stripped-PATH
+      # `openconnect --version` self-check, so an incomplete DLL closure could never
+      # have been published. The app resolves this bundled binary at runtime
+      # (resolveOpenconnectPath). Re-run build-openconnect + re-pin below only to
+      # bump the openconnect/wintun version.
+      - name: Bundle openconnect (prebuilt, pinned + verified)
+        env:
+          OC_BUNDLE_URL: 'https://github.com/savvaskoualis/openfortitray/releases/download/deps-openconnect-9.12/openconnect-win-amd64-9.12.zip'
+          OC_BUNDLE_SHA256: '147008a42e68dcfcf7a311340e1aabc71f5affe026c7996c25948fea5cb2c595'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o oc-bundle.zip "$OC_BUNDLE_URL"
+          echo "${OC_BUNDLE_SHA256}  oc-bundle.zip" | sha256sum -c -
+          mkdir -p dist
+          # The zip contains a top-level openconnect/ dir, so it extracts to
+          # dist/openconnect/ — exactly what openfortitray.iss installs into {app}.
+          unzip -o oc-bundle.zip -d dist
+          rm -f oc-bundle.zip
+          test -s dist/openconnect/openconnect.exe
+          test -s dist/openconnect/libopenconnect-5.dll
+          test -s dist/openconnect/wintun.dll
+          test -s dist/openconnect/vpnc-script-win.js
+          echo "== bundled openconnect =="
+          ls -l dist/openconnect | head -50
+
+      # Inno Setup is preinstalled on windows-latest (6.7.x); the build step below
+      # calls ISCC.exe by its fixed install path. We deliberately do NOT
+      # `choco install` a pinned version — choco refuses to "downgrade" over the
+      # newer preinstalled build and fails the job.
+      - name: Verify Inno Setup present
+        run: |
+          test -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            || { echo "ISCC.exe not found at the expected path"; exit 1; }
+
+      # ISCC compiles scripts/openfortitray.iss. Source/OutputDir in the .iss are
+      # resolved relative to the script (scripts/), so ..\dist picks up the exe
+      # just built above and drops OpenFortiTray-<version>-Setup.exe back into
+      # dist/. Version comes from the tag with the leading v stripped (Inno's
+      # AppVersion wants a number); fall back to 0.0.0-dev for non-tag runs so
+      # ISCC never fails on an empty define. The //D form stops Git Bash's MSYS
+      # path mangling from rewriting the /D switch.
+      - name: Build Windows installer (Inno Setup)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="0.0.0-dev"
+          echo "SETUP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            //DMyAppVersion="$VERSION" scripts/openfortitray.iss
+          ls -l dist
+
+      - name: Checksum windows artifacts
+        # Git Bash on the windows runner provides coreutils sha256sum, so the
+        # manifest format matches the other runners' and `sha256sum -c` verifies.
+        # The bare exe (for scripted/CLI installs), the Setup.exe wizard, and
+        # the two bundled Mesa GL DLLs are hashed here, on the runner that
+        # produced them. The DLLs are published as loose assets too so a
+        # bare-exe (install.ps1) download can place them beside the exe.
+        working-directory: dist
+        run: |
+          sha256sum \
+            openfortitray-windows-amd64.exe \
+            "OpenFortiTray-${SETUP_VERSION}-Setup.exe" \
+            opengl32.dll \
+            libgallium_wgl.dll > SHA256SUMS.windows
+          cat SHA256SUMS.windows
+
+      - name: Upload windows artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binaries-windows
+          path: |
+            dist/openfortitray-windows-amd64.exe
+            dist/OpenFortiTray-${{ env.SETUP_VERSION }}-Setup.exe
+            dist/opengl32.dll
+            dist/libgallium_wgl.dll
+            dist/SHA256SUMS.windows
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [build-darwin, build-linux, build-windows]
+    # Publish only for a real tag push; workflow_dispatch dry-runs build and
+    # verify the artifacts but never create a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The only job that writes: it creates the release and uploads the assets.
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble SHA256SUMS
+        # Concatenate the per-runner manifests rather than re-hashing here.
+        # Re-hashing would be circular: it would record whatever bytes arrived,
+        # so a corrupted transfer would produce a self-consistent file that
+        # verifies fine. These hashes were taken before upload, so the -c step
+        # below is a real end-to-end check. Bare filenames (working-directory:
+        # dist) keep `sha256sum -c SHA256SUMS` working for users too.
+        working-directory: dist
+        run: |
+          cat SHA256SUMS.darwin SHA256SUMS.linux SHA256SUMS.windows > SHA256SUMS
+          rm SHA256SUMS.darwin SHA256SUMS.linux SHA256SUMS.windows
+          cat SHA256SUMS
+
+      - name: Verify SHA256SUMS
+        # Fails the job on any upload/download corruption instead of publishing
+        # binaries that do not match their own published checksums.
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Make unix binaries executable
+        # upload-artifact does not preserve the exec bit. Done after
+        # verification: chmod changes the mode, not the bytes, so ordering is
+        # cosmetic, but verifying the artifacts exactly as received is clearer.
+        # The .dmg (a disk image) and the .exe are left alone.
+        working-directory: dist
+        run: chmod +x openfortitray-darwin-arm64 openfortitray-darwin-amd64 openfortitray-linux-amd64
+
+      - name: Create GitHub Release
+        # `gh release create` over softprops/action-gh-release: gh is preinstalled
+        # on GitHub-hosted runners, so publishing — the one step holding a
+        # contents: write token — runs no third-party code that would need
+        # SHA-pinning and auditing on every bump. --verify-tag refuses to publish
+        # if the tag is not present on the remote.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The Setup.exe filename carries the version with the leading v
+          # stripped (matching the .iss OutputBaseFilename), unlike the tag-named
+          # .dmg — so it is derived separately here.
+          SETUP_VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            "dist/OpenFortiTray-${GITHUB_REF_NAME}.dmg" \
+            "dist/OpenFortiTray-${SETUP_VERSION}-Setup.exe" \
+            dist/openfortitray-darwin-arm64 \
+            dist/openfortitray-darwin-amd64 \
+            dist/openfortitray-linux-amd64 \
+            dist/openfortitray-windows-amd64.exe \
+            dist/opengl32.dll \
+            dist/libgallium_wgl.dll \
+            dist/SHA256SUMS
