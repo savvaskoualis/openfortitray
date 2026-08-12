@@ -47,6 +47,16 @@ func (c Checker) DownloadAndVerify(ctx context.Context, asset, sums Asset) (path
 	}
 	expected = strings.ToLower(expected)
 
+	// The on-disk filename is derived from the asset name (release-controlled
+	// text), and the applier interpolates the resulting path into a command line.
+	// Constrain it to a plain, shell/PowerShell-safe filename BEFORE it can reach
+	// any of that — fail closed on anything exotic. This is what makes the later
+	// single-quoting sufficient rather than load-bearing on its own.
+	name, err := safeAssetFilename(asset.Name)
+	if err != nil {
+		return "", err
+	}
+
 	// 2. Create a private temp dir (0700) and an exclusive 0600 file within it.
 	dir, err := os.MkdirTemp("", "openfortitray-dl-")
 	if err != nil {
@@ -63,7 +73,7 @@ func (c Checker) DownloadAndVerify(ctx context.Context, asset, sums Asset) (path
 		return "", fmt.Errorf("update: chmod temp dir: %w", err)
 	}
 
-	filePath := filepath.Join(dir, filepath.Base(asset.Name))
+	filePath := filepath.Join(dir, name)
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("update: create temp file: %w", err)
@@ -88,7 +98,10 @@ func (c Checker) DownloadAndVerify(ctx context.Context, asset, sums Asset) (path
 	}
 
 	h := sha256.New()
-	written, copyErr := io.Copy(f, io.TeeReader(resp.Body, h))
+	// Cap the stream well above any real installer (~10-25 MB). A compromised but
+	// TLS-valid origin cannot exhaust the disk; a stream truncated at the cap
+	// simply fails the sha gate below, so this never weakens verification.
+	written, copyErr := io.Copy(f, io.TeeReader(io.LimitReader(resp.Body, maxAssetBytes), h))
 	closeErr := f.Close()
 	if copyErr != nil {
 		err = fmt.Errorf("update: stream asset %q: %w", asset.Name, copyErr)
@@ -115,6 +128,35 @@ func (c Checker) DownloadAndVerify(ctx context.Context, asset, sums Asset) (path
 	return filePath, nil
 }
 
+// maxAssetBytes caps the downloaded payload stream. Real installers are
+// ~10-25 MB; 512 MiB is comfortably above that and far below anything that
+// could exhaust a disk.
+const maxAssetBytes = 512 << 20
+
+// safeAssetFilename returns the base filename of a release asset, but only if it
+// is a plain, shell/PowerShell-safe name: [A-Za-z0-9._-], non-empty, not "." or
+// ".." and not starting with a dot. Because this name becomes the on-disk file
+// the applier later runs (its path is interpolated into a command), constraining
+// it here — fail closed — is what keeps the applier's quoting from being the sole
+// defense against release-controlled text.
+func safeAssetFilename(assetName string) (string, error) {
+	base := filepath.Base(assetName)
+	if base == "" || base == "." || base == ".." || strings.HasPrefix(base, ".") {
+		return "", fmt.Errorf("update: unsafe asset filename %q", assetName)
+	}
+	for _, r := range base {
+		switch {
+		case r >= '0' && r <= '9',
+			r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r == '.', r == '_', r == '-':
+		default:
+			return "", fmt.Errorf("update: asset filename %q has an unsafe character %q", assetName, r)
+		}
+	}
+	return base, nil
+}
+
 // downloadClient returns a shallow copy of the injected HTTP client with a
 // CheckRedirect that refuses any redirect whose target scheme is not https.
 // Copying avoids mutating the caller's client (and any client shared with the
@@ -125,6 +167,11 @@ func (c Checker) downloadClient() *http.Client {
 		base = http.DefaultClient
 	}
 	cp := *base
+	// The download is bounded by the caller's context, not a whole-request
+	// Timeout: http.Client.Timeout covers the entire body read, so a short
+	// timeout inherited from the API client would abort a large installer
+	// mid-stream. Clear it and let ctx govern.
+	cp.Timeout = 0
 	cp.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if req.URL.Scheme != "https" {
 			return fmt.Errorf("update: refusing non-https redirect to %s", req.URL.Redacted())

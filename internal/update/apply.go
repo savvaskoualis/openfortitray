@@ -79,45 +79,55 @@ func buildBrewScript(pid int, brewPath string) (string, error) {
 // via the elevated logon task. installerPath is validated by validateInstallerPath
 // before interpolation and single-quoted (PowerShell single-quote literal).
 func buildWindowsScript(pid int, installerPath string) (string, error) {
-	if err := validateInstallerPath(installerPath); err != nil {
+	clean, err := validateInstallerPath(installerPath)
+	if err != nil {
 		return "", err
 	}
 	return fmt.Sprintf(
 		"Wait-Process -Id %d -ErrorAction SilentlyContinue\n"+
 			"Start-Process -FilePath '%s' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait\n"+
 			"schtasks /Run /TN OpenFortiTray\n",
-		pid, installerPath), nil
+		pid, clean), nil
 }
 
-// validateInstallerPath fails closed unless p is an absolute path, under the
-// system temp root (where DownloadAndVerify writes), an existing regular file,
-// and free of quote/control characters that could break out of the quoted
-// PowerShell argument. This program produced the path, but it is re-validated
-// here because it crosses into a command line.
-func validateInstallerPath(p string) error {
-	if !filepath.IsAbs(p) {
-		return fmt.Errorf("update: installer path not absolute: %q", p)
+// validateInstallerPath fails closed unless p, once cleaned, is an absolute path
+// that is a genuine descendant of the system temp root (where DownloadAndVerify
+// writes), an existing regular file, and free of quote/backtick/control
+// characters that could break out of the quoted PowerShell argument. It returns
+// the CLEANED path so the caller interpolates a canonical form (no "." or ".."
+// components). This program produced the path, but it is re-validated here
+// because it crosses into a command line.
+func validateInstallerPath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("update: empty installer path")
 	}
-	if strings.ContainsAny(p, "'\"") {
-		return fmt.Errorf("update: installer path contains a quote: %q", p)
+	if strings.ContainsAny(p, "'\"`") {
+		return "", fmt.Errorf("update: installer path contains a quote or backtick: %q", p)
 	}
 	for _, r := range p {
 		if r < 0x20 {
-			return fmt.Errorf("update: installer path contains a control character")
+			return "", fmt.Errorf("update: installer path contains a control character")
 		}
 	}
-	tmp := os.TempDir()
-	if !strings.HasPrefix(p, tmp) {
-		return fmt.Errorf("update: installer path %q is not under the temp root %q", p, tmp)
+	clean := filepath.Clean(p)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("update: installer path not absolute: %q", p)
 	}
-	fi, err := os.Stat(p)
+	// Containment checked AFTER Clean (so ".." cannot escape) and via Rel (so a
+	// sibling like "/tmpX" cannot pass a bare string prefix of "/tmp").
+	root := filepath.Clean(os.TempDir())
+	rel, err := filepath.Rel(root, clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("update: installer path %q is not under the temp root %q", p, root)
+	}
+	fi, err := os.Stat(clean)
 	if err != nil {
-		return fmt.Errorf("update: installer path not readable: %w", err)
+		return "", fmt.Errorf("update: installer path not readable: %w", err)
 	}
 	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("update: installer path is not a regular file: %q", p)
+		return "", fmt.Errorf("update: installer path is not a regular file: %q", p)
 	}
-	return nil
+	return clean, nil
 }
 
 // updateLogPath returns the file the detached updater's stdout/stderr are

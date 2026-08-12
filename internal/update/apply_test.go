@@ -35,19 +35,46 @@ func TestValidateInstallerPath(t *testing.T) {
 	if err := os.WriteFile(good, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateInstallerPath(good); err != nil {
+	clean, err := validateInstallerPath(good)
+	if err != nil {
 		t.Errorf("valid temp installer path rejected: %v", err)
 	}
+	if clean != good {
+		t.Errorf("clean path = %q, want %q", clean, good)
+	}
 	cases := map[string]string{
-		"relative":          "Setup.exe",
-		"single quote":      filepath.Join(dir, "a'b.exe"),
-		"double quote":      filepath.Join(dir, "a\"b.exe"),
-		"outside temp":      "/etc/passwd",
-		"missing under tmp": filepath.Join(dir, "does-not-exist.exe"),
+		"relative":            "Setup.exe",
+		"single quote":        filepath.Join(dir, "a'b.exe"),
+		"double quote":        filepath.Join(dir, "a\"b.exe"),
+		"backtick":            filepath.Join(dir, "a`b.exe"),
+		"outside temp":        "/etc/passwd",
+		"missing under tmp":   filepath.Join(dir, "does-not-exist.exe"),
+		"dotdot traversal":    filepath.Join(dir, "..", "..", "..", "etc", "passwd"),
+		"raw dotdot escape":   dir + "//../../../etc/passwd",
+		"temp sibling prefix": filepath.Clean(os.TempDir()) + "X" + string(os.PathSeparator) + "evil.exe",
 	}
 	for name, p := range cases {
-		if err := validateInstallerPath(p); err == nil {
+		if _, err := validateInstallerPath(p); err == nil {
 			t.Errorf("%s: expected rejection, got nil for %q", name, p)
+		}
+	}
+}
+
+func TestSafeAssetFilename(t *testing.T) {
+	ok := []string{"OpenFortiTray-0.1.8-Setup.exe", "SHA256SUMS", "a_b-c.1.dmg"}
+	for _, n := range ok {
+		if got, err := safeAssetFilename(n); err != nil || got != n {
+			t.Errorf("safeAssetFilename(%q) = %q, %v; want %q, nil", n, got, err, n)
+		}
+	}
+	bad := []string{
+		"", ".", "..", ".hidden",
+		"a b.exe", "a'b.exe", "a\"b.exe", "a`b.exe", "a;b.exe", "a$b.exe",
+		"a\nb.exe",
+	}
+	for _, n := range bad {
+		if _, err := safeAssetFilename(n); err == nil {
+			t.Errorf("safeAssetFilename(%q) accepted, want rejection", n)
 		}
 	}
 }
