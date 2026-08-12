@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -49,6 +50,19 @@ type app struct {
 	fyneApp  fyne.App
 	tray     *tray.Controller
 	settings *settings.Controller
+	// win is the (initially hidden) settings window, reused as the parent for the
+	// first-run bootstrap dialogs. Set once in main after the window is built.
+	win fyne.Window
+	// connectBootstrap, when non-nil, runs the macOS first-run helper-install gate
+	// before dialing: a passwordless-helper readiness probe, and — if the helper is
+	// not yet installed — an admin-password prompt that installs it, then a dial. It
+	// is nil off darwin and in tests, where Connect dials directly as before.
+	// Installed by installBootstrapHooks (a no-op off macOS).
+	connectBootstrap func()
+	// onPermanentError, when non-nil, offers the same first-run install when the
+	// supervisor reports a broken-install (ErrPermanent) event at runtime — e.g. the
+	// sudoers rule was removed after being installed. nil off darwin and in tests.
+	onPermanentError func()
 	// onConnectIssue routes a blocking config issue to the settings window when
 	// Connect is refused (see Connect). In production it is set to the settings
 	// controller's ShowIssue once the window is built; it stays nil until then,
@@ -121,8 +135,23 @@ func (a *app) Connect() {
 		}
 		return
 	}
-	// Snapshot the active profile the tunnel will dial, so a Connect that follows
-	// a settings Save picks up the edited profile rather than the startup one.
+	// First-run bootstrap gate (macOS): if the privileged helper is not yet
+	// installed, offer to install it via one admin-password prompt before dialing.
+	// connectBootstrap owns the readiness probe, the prompt, the off-thread install
+	// and the follow-on dial. Off darwin and in tests it is nil and we dial
+	// directly, keeping the existing behaviour.
+	if a.connectBootstrap != nil {
+		a.connectBootstrap()
+		return
+	}
+	a.startTunnel()
+}
+
+// startTunnel snapshots the active profile the tunnel will dial — so a Connect
+// that follows a settings Save picks up the edited profile rather than the
+// startup one — and starts the supervisor. It runs on the UI goroutine (every
+// caller reaches it there); the supervisor's goroutines read only the snapshot.
+func (a *app) startTunnel() {
 	prof := *a.cfg.Active()
 	a.setSnapshot(tunnelParams{
 		prof:            prof,
@@ -192,6 +221,14 @@ func (a *app) pump() {
 			// window's live strip. Safe whether the window is shown or hidden.
 			if a.settings != nil {
 				a.settings.Apply(e)
+			}
+			// A terminal, broken-install failure (tunnel.ErrPermanent, whose
+			// Error() text carries "install is broken") means the privileged path
+			// is not set up — on macOS, offer the same one-prompt install rather
+			// than leaving the user staring at a red Error. onPermanentError is nil
+			// off darwin and in tests, so this is a no-op there.
+			if a.onPermanentError != nil && e.State == tunnel.Error && strings.Contains(e.Detail, "install is broken") {
+				a.onPermanentError()
 			}
 		})
 	}
@@ -524,10 +561,15 @@ func main() {
 	// intercepted to Hide (see settings.build). The tray's Settings… item shows
 	// this same reused window.
 	win := a.fyneApp.NewWindow("OpenFortiTray — Settings")
+	a.win = win
 	a.settings = settings.New(a, win)
 	// Route a refused Connect (invalid active profile) to the settings window,
 	// which opens on the offending field with a banner naming the fix.
 	a.onConnectIssue = a.settings.ShowIssue
+	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
+	// where the manual scripts/install.sh path is unchanged). Must be after a.win
+	// and a.settings are set — the bootstrap dialogs parent on a.win.
+	a.installBootstrapHooks()
 
 	// The one event pump. Started before Run so events emitted by the
 	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and
