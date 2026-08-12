@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E23A2E"/><stop offset="1" stop-color="#7A1B16"/></linearGradient></defs>
+  <rect x="8" y="8" width="112" height="112" rx="27" fill="url(#g)"/>
+  <!-- solid white gate (arch), keyhole+stem knocked out via evenodd -->
+  <path fill="#ffffff" fill-rule="evenodd" d="
+    M28 104 V58 A36 36 0 0 1 100 58 V104 Z
+    M64 46 A11 11 0 0 0 64 68 A11 11 0 0 0 64 46 Z
+    M57 66 L50 92 H78 L71 66 Z
+  "/>
+  <!-- restore inner opening bottom so gate reads as a doorway (red arch interior) -->
+  <path fill="url(#g)" d="M40 104 V60 A24 24 0 0 1 88 60 V104 Z"/>
+  <!-- keyhole on the red interior, white -->
+  <circle cx="64" cy="60" r="8" fill="#ffffff"/>
+  <path fill="#ffffff" d="M59 66 L54 88 H74 L69 66 Z"/>
+</svg>
