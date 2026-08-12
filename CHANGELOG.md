@@ -8,6 +8,16 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.13] — 2026-08-12
+
+### Added
+- Startup and crash diagnostics: the app logs a build/platform stamp on launch, a
+  "run loop returned" line on clean exit, and captures a main-goroutine panic (with
+  stack) to the log. On Windows the `-H=windowsgui` build has no console, so the
+  process stderr is redirected to the log file — a Go runtime panic or a cgo/OpenGL
+  crash now lands in `openfortitray.log` instead of vanishing. Helps diagnose
+  silent GUI exits (e.g. on GPU-less VMs).
+
 ## [0.1.12] — 2026-08-12
 
 ### Added

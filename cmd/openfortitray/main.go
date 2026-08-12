@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -619,8 +620,26 @@ func main() {
 	logPath := filepath.Join(cfgDir, "openfortitray.log")
 	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 		log.SetOutput(f)
+		// A -H=windowsgui build has no console, so a Go runtime panic or a cgo/GL
+		// crash (which write to stderr / fd 2) would vanish. Point the process's
+		// stderr at the log file so those land there too. redirectStderr is a no-op
+		// off Windows, where stderr already works.
+		os.Stderr = f
+		redirectStderr(f)
 		defer f.Close()
 	}
+	// Startup breadcrumb + build stamp. Pair it with the "run loop returned" line
+	// below: if the log ends after this but before that, the process died in
+	// startup/run rather than exiting cleanly — the key signal for diagnosing a
+	// silent GUI crash. A main-goroutine panic is captured here with its stack;
+	// a C-level (glfw/Mesa) crash lands via the stderr redirect above.
+	log.Printf("openfortitray %s starting (%s/%s)", version, runtime.GOOS, runtime.GOARCH)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in main: %v\n%s", r, debug.Stack())
+			os.Exit(2)
+		}
+	}()
 
 	// Single-instance guard, acquired BEFORE any SAML/connect. Without it a second
 	// launch runs its own SAML login and connect, and the two instances fight over
@@ -739,6 +758,7 @@ func main() {
 		log.Fatal(err)
 	}
 	a.tray = ctrl
+	log.Print("tray: system tray menu installed")
 
 	// Best-effort menu-bar tooltip. fyne has no tooltip API, so this reaches the
 	// systray singleton fyne drives. It must run after the tray is live: fyne
@@ -746,6 +766,7 @@ func main() {
 	// which is the first moment the native status item exists. tray.SetTooltip is
 	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
 	a.fyneApp.Lifecycle().SetOnStarted(func() {
+		log.Print("fyne lifecycle: OnStarted (tray live)")
 		tray.SetTooltip("OpenFortiTray")
 		// fyne/glfw promotes the process to a Regular (Dock-visible) app when it
 		// initializes NSApp during Run, overriding Info.plist LSUIElement=1. Undo
@@ -805,7 +826,9 @@ func main() {
 	// down (see app.shutdown). A tray-only fyne app (no window ever shown) stays
 	// alive here and exits cleanly on Quit — verified against fyne v2.8's glfw
 	// run loop.
+	log.Print("entering fyne run loop")
 	a.fyneApp.Run()
+	log.Print("fyne run loop returned; app exiting")
 }
 
 // loggedRun wraps runFn so every backend exit lands in the log file.
