@@ -1,0 +1,134 @@
+name: CI
+
+# Runs on every branch push and on pull requests. Since the tray moved to
+# fyne v2 it renders through OpenGL/GLFW, so cmd/openfortitray is now a cgo
+# build on EVERY OS. That kills the old "type-check windows on ubuntu" trick
+# (cgo windows cannot cross-compile from Linux), so the matrix now spans all
+# three real runners: linux needs GL + X11 dev headers (installed below),
+# macOS uses the system frameworks + Xcode CLT already on the runner, and
+# windows uses the runner's bundled MinGW gcc. Each runner does the full
+# gofmt / vet / test -race / build pass against its own native toolchain.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Least privilege: CI only ever reads the tree.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# bash everywhere, including the windows runner (Git Bash), so the gofmt /
+# shell-syntax steps below are written once and behave identically.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # cgo is now mandatory on all three OSes (fyne -> GLFW -> OpenGL). Setting
+    # it at the job level covers vet, test -race and build in one place.
+    env:
+      CGO_ENABLED: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      # Third-party actions are pinned to full commit SHAs, not floating tags: a
+      # tag can be repointed at new code, so `@v4` is a standing write into every
+      # job that uses it. The trailing comment records the human-readable version.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: stable
+          # setup-go@v5 caches the module and build caches by default, keyed on
+          # go.sum; no separate actions/cache step needed.
+          cache: true
+
+      # windows-latest ships MinGW-w64 but does NOT put it on PATH
+      # (actions/runner-images #6103/#8399), so a CGO=1 vet/test/build would
+      # fail for want of a C compiler. Install a known-good gcc via a pinned
+      # setup-msys2 and prepend its bin to PATH ourselves. Linux uses the apt
+      # deps below; macOS uses system frameworks — neither needs this.
+      - name: Set up MinGW-w64 (MSYS2)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 gcc on PATH
+        if: runner.os == 'Windows'
+        # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but the
+        # steps below run in Git Bash (defaults.run.shell: bash). Prepend the
+        # MINGW64 bin dir to PATH so cgo's go toolchain finds gcc, then confirm.
+        run: |
+          printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+
+      - name: Verify C toolchain
+        if: runner.os == 'Windows'
+        run: gcc --version
+
+      # Windows only: generate the *.syso from the app manifest so `go vet` /
+      # `go build` below link it, proving the requireAdministrator manifest
+      # embeds without error on every push. Go auto-links the GOOS/GOARCH-scoped
+      # resource in the main package dir into the windows exe only; the .syso is
+      # a build artifact (gitignored), regenerated here from the checked-in
+      # manifest with the pinned, pure-Go rsrc tool. -arch amd64 matches the
+      # windows runner's GOARCH.
+      - name: Embed Windows manifest (generate .syso)
+        if: runner.os == 'Windows'
+        run: |
+          go run github.com/akavel/rsrc@v0.10.2 \
+            -manifest cmd/openfortitray/openfortitray.manifest \
+            -arch amd64 \
+            -o cmd/openfortitray/resource_windows_amd64.syso
+
+      # fyne renders through OpenGL/GLFW, so building or even type-checking the
+      # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
+      # dev headers. `go vet`/`go test -race`/`go build` below all compile
+      # cmd/openfortitray, so these must be present first. This is fyne's
+      # documented Linux build-dependency set. macOS uses system frameworks and
+      # windows uses the runner's bundled MinGW gcc, so neither needs this step.
+      - name: Install GL/X11 build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+
+      - name: Check gofmt
+        # `gofmt -l` first so a failure names the offending files in the log,
+        # then the assertion that the list is empty.
+        run: |
+          gofmt -l cmd internal
+          test -z "$(gofmt -l cmd internal)"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: go build
+        run: go build ./...
+
+      # Shell syntax gate for the installer and the privileged helper. Linux
+      # only: these are parse checks, not execution, so one platform suffices.
+      # install.sh is bash (arrays, [[ ]]); openfortitray-tunnel is strict POSIX
+      # sh because it runs from a sudoers rule under an unknown login shell.
+      - name: Shell syntax check
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/*.sh
+          sh -n scripts/openfortitray-tunnel
