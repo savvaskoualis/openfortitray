@@ -231,6 +231,14 @@ jobs:
           echo "Found openconnect.exe at: ${exe}"
           test -n "${exe}"
           cp -v "${exe}" staging/openconnect/
+          # openconnect builds its OWN shared library libopenconnect-5.dll in .libs/
+          # (the CLI links it), which lives in the build tree, not mingw64/bin, so
+          # the mingw64\bin closure walk never sees it. Copy every .libs/*.dll here
+          # or the exe fails to start (libopenconnect-5.dll => not found).
+          libdir="$(dirname "${exe}")"
+          for d in "${libdir}"/*.dll; do
+            [ -f "${d}" ] && cp -v "${d}" staging/openconnect/
+          done
           if [ -f "${src}/vpnc-script-win.js" ]; then
             cp -v "${src}/vpnc-script-win.js" staging/openconnect/
           else
