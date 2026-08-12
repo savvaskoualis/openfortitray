@@ -158,8 +158,11 @@ window. That is the whole app install.
 > you would rather not build from source at all, running `scripts/install.sh` (next
 > section) does the whole thing end to end and you can skip the `.dmg`.
 
-Because the release artifact is unsigned and un-notarized, macOS quarantines it — see
-[macOS Gatekeeper](#macos-gatekeeper) below to clear the attribute after the drag.
+The `.app` is **ad-hoc code-signed** (so it launches on Apple Silicon — an unsigned
+Mach-O is killed by the OS as "damaged" even after quarantine is cleared) but it is
+**not notarized**. A `.dmg` you download in a browser is still quarantined, so macOS
+shows an "unidentified developer" prompt on first launch — see
+[macOS Gatekeeper](#macos-gatekeeper) below to get past it.
 
 ### macOS and Linux — `scripts/install.sh` (helper + sudoers, all-in-one)
 
@@ -219,17 +222,23 @@ it stops before touching anything and prints both ways to reconcile them — pas
 
 #### macOS Gatekeeper
 
-Release artifacts (the binaries and the `.dmg`) are unsigned and un-notarized.
-Anything you download with a browser carries the quarantine attribute, and macOS will
-refuse to run it. After dragging `OpenFortiTray.app` to `/Applications`, clear it:
+The `.app` inside the `.dmg` is **ad-hoc code-signed** — that valid (if not
+Developer-ID) signature is what lets it run at all on Apple Silicon; an unsigned
+build is refused as "damaged". It is **not notarized**, though, and the bare
+binaries are neither signed nor notarized. Anything you download with a browser
+carries the quarantine attribute, so macOS still shows an "unidentified developer"
+prompt on first launch. After dragging `OpenFortiTray.app` to `/Applications`, clear
+the quarantine:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/OpenFortiTray.app
 ```
 
 Or right-click the app in Finder and choose **Open** once, which records your consent.
-(Running `scripts/install.sh` from a checkout builds the app locally, so the quarantine
-attribute never applies to that path.)
+A forthcoming `brew install --cask` avoids the prompt entirely: Homebrew strips the
+quarantine attribute on install, so the ad-hoc signature is enough for a no-prompt
+launch. (Running `scripts/install.sh` from a checkout builds the app locally, so the
+quarantine attribute never applies to that path either.)
 
 ### Windows
 
@@ -621,8 +630,9 @@ The release carries the four binaries (`openfortitray-darwin-arm64`,
 `openfortitray-darwin-amd64`, `openfortitray-linux-amd64`,
 `openfortitray-windows-amd64.exe`), the macOS `OpenFortiTray-<version>.dmg`, the Windows
 `OpenFortiTray-<version>-Setup.exe` wizard (built on `windows-latest` with Inno Setup),
-and `SHA256SUMS` (which covers the Setup.exe too). Binaries carry no version stamp yet,
-and are neither signed nor notarized.
+and `SHA256SUMS` (which covers the Setup.exe too). Binaries carry no version stamp yet.
+The macOS `.app` inside the `.dmg` is ad-hoc code-signed by `make app` (so it runs on
+Apple Silicon) but is not notarized; the bare binaries are neither signed nor notarized.
 
 ## Contributing
 

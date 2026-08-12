@@ -92,6 +92,25 @@ endif
 		echo "make app: iconutil/rsvg-convert not found — skipping .icns (not a blocker)"; \
 	fi
 	@echo "make app: assembled $(APP_BUNDLE)"
+# Ad-hoc codesign LAST — the bundle is now fully assembled (binary, Info.plist,
+# .icns all in place), and any change to the bundle after signing invalidates the
+# signature. An UNSIGNED Mach-O (the CI build lands with Identifier=a.out and no
+# signature) is killed by the OS on Apple Silicon even after quarantine is
+# stripped — "damaged / can't be opened". `-s -` is an ad-hoc identity: no
+# Developer-ID cert, no paid Apple account, but a valid signature the kernel
+# accepts, so the app runs. It is NOT notarized, so a browser-downloaded .dmg
+# still shows the "unidentified developer" prompt; a `brew install --cask` install
+# strips quarantine automatically and gets a no-prompt launch. --deep signs the
+# nested code; no entitlements are needed for this app. Guarded so a codesign-less
+# environment (non-macOS) does not break `make app`; on macOS codesign always ships
+# with the CLT. `make dmg` depends on `app` and stages the bundle only after this
+# target completes, so the shipped .dmg carries the SIGNED bundle.
+	@if command -v codesign >/dev/null 2>&1; then \
+		codesign --force --deep -s - "$(APP_BUNDLE)" && \
+		echo "make app: ad-hoc signed $(APP_BUNDLE)"; \
+	else \
+		echo "make app: codesign not available, skipping (unsigned)"; \
+	fi
 
 # dmg wraps the .app in a double-click, drag-to-Applications disk image — the
 # primary macOS download. Depends on `app`, so the bundle is fresh. macOS only
