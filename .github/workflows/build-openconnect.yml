@@ -179,12 +179,18 @@ jobs:
           # path before configure/make — the DLL alone (added to the bundle later)
           # is not enough. Fetch the pinned, sha256-verified wintun zip and put its
           # include dir on CPPFLAGS.
-          wtzip="${RUNNER_TEMP}/wintun-hdr.zip"
-          curl -fSL --retry 3 -o "$wtzip" "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
-          echo "${WINTUN_SHA}  ${wtzip}" | sha256sum -c -
-          unzip -o "$wtzip" 'wintun/include/*' -d "${RUNNER_TEMP}/wtinc"
-          export CPPFLAGS="-I${RUNNER_TEMP}/wtinc/wintun/include ${CPPFLAGS:-}"
-          echo "CPPFLAGS=${CPPFLAGS}"
+          # $(pwd) here is a POSIX MSYS path (the source root, where
+          # openconnect-internal.h lives). Keep everything relative to it — a
+          # Windows-style RUNNER_TEMP (D:\a\_temp) breaks both unzip -d and gcc -I
+          # under MSYS. openconnect-internal.h does a QUOTED `#include "wintun.h"`,
+          # which resolves from the including file's own directory, so copying the
+          # wintun header into the source root is the most robust fix (no -I / path
+          # translation to get wrong).
+          curl -fSL --retry 3 -o wintun-hdr.zip "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
+          echo "${WINTUN_SHA}  wintun-hdr.zip" | sha256sum -c -
+          unzip -o wintun-hdr.zip 'wintun/include/*' -d _wtinc
+          cp -v _wtinc/wintun/include/*.h .
+          ls -l wintun.h
           ./configure \
             --prefix=/mingw64 \
             --with-gnutls \
