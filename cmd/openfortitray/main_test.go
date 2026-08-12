@@ -161,6 +161,20 @@ func TestSignalTriggersGracefulShutdownOnce(t *testing.T) {
 	}
 }
 
+// shutdownWait must cover the backend's worst-case teardown so a clean quit never
+// SIGKILLs openconnect before it has sent its FortiGate logout — a session left
+// open is what rejects the next run's first cookie. The worst case is coupled to
+// internal/tunnel's constants (helperStopAttempts*helperStopTimeout +
+// helperWaitDelay = 2*10s + 12s = 32s); if those change, this and the doc comment
+// must move with them.
+func TestShutdownWaitCoversTeardownBudget(t *testing.T) {
+	const teardownWorstCase = 32 * time.Second
+	if shutdownWait < teardownWorstCase {
+		t.Errorf("shutdownWait %v must be >= the teardown worst case %v, or a clean quit kills openconnect mid-logout",
+			shutdownWait, teardownWorstCase)
+	}
+}
+
 // Startup must reap a stale/orphaned tunnel BEFORE connecting on launch: minting
 // a new cookie while a previous crash's root openconnect still holds the
 // one-per-user FortiGate session is exactly what triggers the "Cookie was

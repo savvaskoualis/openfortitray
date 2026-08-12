@@ -2,7 +2,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -293,6 +296,44 @@ func (a *app) SetAutostart(on bool) error {
 	return nil
 }
 
+// fyneRootConfigDir mirrors fyne's own internal/app.rootConfigDir (v2.8): fyne
+// stores preferences.json under <root>/<appID>/. It is reimplemented here rather
+// than imported because fyne's is in an internal package. Kept in step with the
+// fyne version pinned in go.mod.
+func fyneRootConfigDir() string {
+	home, _ := os.UserHomeDir()
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Preferences", "fyne")
+	case "windows":
+		return filepath.Join(home, "AppData", "Roaming", "fyne")
+	default:
+		base, _ := os.UserConfigDir()
+		return filepath.Join(base, "fyne")
+	}
+}
+
+// sanitizeFynePreferences removes fyne's preferences.json for appID when it is
+// empty or not valid JSON, so fyne's loader sees a missing (clean, empty) store
+// instead of logging "Fyne Preferences load error: EOF". A file that parses as
+// JSON is left untouched. Best-effort: every error is logged and swallowed —
+// this is cosmetic, never a reason to fail startup.
+func sanitizeFynePreferences(appID string) {
+	path := filepath.Join(fyneRootConfigDir(), appID, "preferences.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // missing (the common case) or unreadable: fyne handles missing itself
+	}
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && json.Valid(trimmed) {
+		return // real preferences: leave them alone
+	}
+	if err := os.Remove(path); err != nil {
+		log.Printf("openfortitray: could not clear corrupt fyne preferences %s: %v", path, err)
+		return
+	}
+	log.Printf("openfortitray: cleared corrupt/empty fyne preferences %s (%d bytes)", path, len(data))
+}
+
 // setLoginItem installs or removes the per-user login item for this executable.
 func setLoginItem(on bool) error {
 	if !on {
@@ -312,11 +353,13 @@ const authTimeout = 5 * time.Minute
 // shutdownWait caps how long we wait for the backend to tear the tunnel down on
 // quit. os/exec runs the runner's Cancel to completion before starting its
 // WaitDelay timer, so the worst case is the sum of the two: two privileged-helper
-// stop attempts (2*8s) followed by the 12s backstop, i.e. 28s. Quitting a few
-// seconds slower is a better trade than quitting fast and leaving the machine on
-// the VPN with a root openconnect nobody can signal. The normal path returns in
-// well under a second.
-const shutdownWait = 30 * time.Second
+// stop attempts (2*10s) followed by the 12s backstop, i.e. 32s. It MUST cover
+// that sum so a clean quit never SIGKILLs openconnect before it has sent its
+// logout to the FortiGate — a session left holding open is exactly what rejects
+// the next run's first cookie. Quitting a few seconds slower is a better trade
+// than quitting fast and leaving the machine on the VPN with a root openconnect
+// nobody can signal. The normal path returns in well under a second.
+const shutdownWait = 35 * time.Second
 
 // startupReapWait bounds the best-effort reap of an orphaned tunnel at launch
 // (selfHealThenConnect → tunnel.ReapStale). The helper's "stop" waits up to a few
@@ -342,6 +385,25 @@ func main() {
 		log.SetOutput(f)
 		defer f.Close()
 	}
+
+	// Single-instance guard, acquired BEFORE any SAML/connect. Without it a second
+	// launch runs its own SAML login and connect, and the two instances fight over
+	// the one per-user FortiGate session — the dual-instance contention behind the
+	// "listen tcp 127.0.0.1:8020: bind: address already in use" and the ensuing
+	// cookie-rejected storm from the real logs. flock releases automatically when
+	// the process dies, so a crash leaves no stale lock for the next launch to
+	// clear. A second instance exits cleanly (status 0): the first is already up.
+	lockPath := filepath.Join(cfgDir, "openfortitray.lock")
+	lock, err := acquireInstanceLock(lockPath)
+	if err != nil {
+		if errors.Is(err, ErrAlreadyRunning) {
+			log.Printf("openfortitray: %v; exiting (only one instance may run)", err)
+			os.Exit(0)
+		}
+		log.Fatalf("openfortitray: cannot acquire single-instance lock %s: %v", lockPath, err)
+	}
+	defer lock.release()
+
 	if prof := cfg.Active(); prof.Gateway == "" {
 		log.Printf("openfortitray: starting, no gateway configured — Connect opens Settings to add one")
 	} else {
@@ -430,6 +492,11 @@ func main() {
 		Name:       "OpenFortiTray",
 		Migrations: map[string]bool{"fyneDo": true},
 	})
+	// A previous unclean write can leave fyne's preferences.json empty or corrupt,
+	// which makes fyne log a scary "Fyne Preferences load error: EOF" at startup.
+	// Clear it first (the app keeps its real settings in internal/config, not in
+	// fyne preferences, so this loses nothing) so fyne sees a clean, empty store.
+	sanitizeFynePreferences("io.github.savvaskoualis.openfortitray")
 	a.fyneApp = fyneapp.NewWithID("io.github.savvaskoualis.openfortitray")
 	ctrl, err := tray.Setup(a.fyneApp, a)
 	if err != nil {

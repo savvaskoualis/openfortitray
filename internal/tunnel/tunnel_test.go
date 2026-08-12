@@ -207,6 +207,10 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 	}
 	s := New(auth, run, events)
 	s.backoffBase = 20 * time.Millisecond
+	// This test pins the clear-cookie + re-auth fallback, so disable the quiet
+	// startup grace (which would instead retry the SAME cookie a few times before
+	// re-authing — covered by TestQuietEarlyRetry*).
+	s.maxEarlyRetries = 0
 	s.Connect()
 	c.waitFor(t, Connected, 3*time.Second)
 	if n := authCalls.Load(); n < 2 {
@@ -318,12 +322,160 @@ func TestFreshCookieRejectedBacksOff(t *testing.T) {
 	}
 	s := New(auth, run, events)
 	s.backoffBase = time.Hour
+	// Pin the backoff fallback: disable the quiet startup grace so a rejected
+	// fresh cookie goes straight to the backoff wait, as this test asserts. The
+	// grace itself (retry same cookie first) is covered by TestQuietEarlyRetry*.
+	s.maxEarlyRetries = 0
 	s.Connect()
 	c.waitFor(t, Reconnecting, 2*time.Second)
 	time.Sleep(50 * time.Millisecond)
 	if n := authCalls.Load(); n != 1 {
 		t.Errorf("auth calls = %d, want 1 (must wait out backoff before re-auth)", n)
 	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+}
+
+// Right after start a freshly minted cookie can be refused for a few seconds
+// while the gateway releases a stale session from a previous run. The supervisor
+// must retry the SAME cookie (no re-SAML) with a short delay and stay on
+// Connecting… — never flashing Reconnecting/Error — and recover quietly once the
+// gateway lets the cookie in.
+func TestQuietEarlyRetryReusesCookieAndStaysConnecting(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	var authCalls atomic.Int32
+	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
+	var runs atomic.Int32
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		if cookie != "C" {
+			t.Errorf("early retry must reuse the same cookie, got %q", cookie)
+		}
+		if runs.Add(1) == 1 {
+			return ErrAuthRejected // gateway still holds the previous run's session
+		}
+		connected("10.0.0.5") // the very same cookie works once it is released
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s := New(auth, run, events)
+	s.earlyRetryDelay = 10 * time.Millisecond
+	s.backoffBase = time.Hour // the quiet retry, NOT the backoff, must be what recovers
+	s.Connect()
+	c.waitFor(t, Connected, 2*time.Second)
+
+	if n := authCalls.Load(); n != 1 {
+		t.Errorf("auth calls = %d, want 1 (the quiet retry reuses the cookie, it must not re-SAML)", n)
+	}
+	for _, e := range c.snapshot() {
+		if e.State == Reconnecting || e.State == Error {
+			t.Errorf("quiet early retry emitted %v; the tray must stay on Connecting…", e.State)
+		}
+	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+}
+
+// Once the quiet grace is exhausted the loop must fall back to the loud path:
+// clear the cookie, re-authenticate and back off. The first cookie is retried
+// exactly maxEarlyRetries times on top of the initial attempt before a fresh
+// cookie is minted.
+func TestQuietEarlyRetryExhaustsThenReauthsAndBacksOff(t *testing.T) {
+	events := make(chan Event, 128)
+	c := collect(events)
+	defer c.close()
+
+	var mu sync.Mutex
+	var cookiesSeen []string
+	var authN atomic.Int32
+	auth := func(ctx context.Context) (string, error) {
+		return fmt.Sprintf("C%d", authN.Add(1)), nil
+	}
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		mu.Lock()
+		cookiesSeen = append(cookiesSeen, cookie)
+		mu.Unlock()
+		return ErrAuthRejected // never connects: a genuinely dead cookie
+	}
+	s := New(auth, run, events)
+	s.earlyRetryDelay = 5 * time.Millisecond
+	s.maxEarlyRetries = 2
+	s.backoffBase = 10 * time.Millisecond
+	s.Connect()
+
+	// A Reconnecting event is only emitted on the loud fallback, so its arrival
+	// proves the grace was exhausted first.
+	c.waitFor(t, Reconnecting, 2*time.Second)
+	// And a second, fresh cookie must be minted: the fallback re-authenticates.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		reAuthed := slices.Contains(cookiesSeen, "C2")
+		mu.Unlock()
+		if reAuthed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("grace exhausted but the loop never re-authenticated")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	s.Disconnect()
+	c.waitFor(t, Disconnected, 2*time.Second)
+
+	mu.Lock()
+	seen := append([]string(nil), cookiesSeen...)
+	mu.Unlock()
+	firstBlock := 0
+	for _, ck := range seen {
+		if ck != "C1" {
+			break
+		}
+		firstBlock++
+	}
+	if want := 1 + s.maxEarlyRetries; firstBlock != want {
+		t.Errorf("first cookie tried %d times, want %d (initial + %d quiet retries) before re-auth; saw %v",
+			firstBlock, want, s.maxEarlyRetries, seen)
+	}
+}
+
+// A cookie that has carried a healthy session (everConnected) does NOT get the
+// quiet startup grace: a mid-session server-side kill must still take the
+// immediate-reauth path, not sit on the same dead cookie. Guards against the
+// early-retry gate leaking into the proven-cookie path.
+func TestQuietEarlyRetryDoesNotApplyAfterConnected(t *testing.T) {
+	events := make(chan Event, 64)
+	c := collect(events)
+	defer c.close()
+
+	var authCalls atomic.Int32
+	auth := func(ctx context.Context) (string, error) { authCalls.Add(1); return "C", nil }
+	var runs atomic.Int32
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		connected("10.0.0.5")
+		if runs.Add(1) == 1 {
+			time.Sleep(30 * time.Millisecond) // healthy long enough to be "proven"
+			return ErrAuthRejected            // then a server-side session kill
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s := New(auth, run, events)
+	s.minHealthy = 10 * time.Millisecond
+	s.earlyRetryDelay = time.Hour // must NOT be paid: this path is immediate re-auth
+	s.backoffBase = time.Hour
+	s.Connect()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for authCalls.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("proven cookie rejected mid-session did not re-auth immediately; auth calls = %d", authCalls.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.waitFor(t, Connected, 2*time.Second)
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
 }

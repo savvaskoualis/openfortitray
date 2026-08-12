@@ -101,8 +101,12 @@ OPENCONNECT='@OPENCONNECT@'
 
 PIDFILE=/var/run/openfortitray-openconnect.pid
 # Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
-# internal/tunnel allows a little more than this before giving up on us.
-STOP_TIMEOUT=6
+# openconnect uses this window to send its logout request to the FortiGate, so
+# the server-side session is released and does NOT linger to reject the next
+# run's first cookie (one-session-per-user). Killing it sooner is what leaves a
+# stale session behind, so keep this generous. internal/tunnel's
+# helperStopTimeout allows a little more than this before giving up on us.
+STOP_TIMEOUT=8
 
 # RESOLVER_DIR is macOS's per-domain scoped-resolver directory. A file
 # /etc/resolver/<domain> containing "nameserver <ip>" makes <domain> resolve

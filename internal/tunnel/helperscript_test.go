@@ -5,9 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // helperScript returns the path to the repo's privileged helper. It is exercised
@@ -43,6 +46,78 @@ func runHelper(t *testing.T, args ...string) (string, int) {
 		code = ee.ExitCode()
 	}
 	return string(out), code
+}
+
+// readHelperSource returns the repo helper's text.
+func readHelperSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(helperScript(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// helperStopTimeoutSeconds parses STOP_TIMEOUT from the helper — the window,
+// after SIGINT, in which openconnect sends its FortiGate logout and exits.
+func helperStopTimeoutSeconds(t *testing.T) int {
+	t.Helper()
+	m := regexp.MustCompile(`(?m)^STOP_TIMEOUT=(\d+)`).FindStringSubmatch(readHelperSource(t))
+	if m == nil {
+		t.Fatal("could not find STOP_TIMEOUT in the helper")
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Teardown exists to give openconnect time to log out of the FortiGate on SIGINT
+// so no session lingers server-side to reject the next run's first cookie. Every
+// bound in the ladder must sit OUTSIDE the one it wraps, or a stop is killed
+// mid-logout. This pins the constants against a regression that would shrink the
+// window.
+func TestTeardownLogoutTimingInvariants(t *testing.T) {
+	stop := time.Duration(helperStopTimeoutSeconds(t)) * time.Second
+
+	// The Go-side bound on one privileged stop call must outlast the helper's own
+	// SIGINT-and-wait window, or the call is cancelled before openconnect finishes
+	// its logout.
+	if helperStopTimeout <= stop {
+		t.Errorf("helperStopTimeout %v must exceed the helper's STOP_TIMEOUT %v so a stop is not killed mid-logout",
+			helperStopTimeout, stop)
+	}
+
+	// The supervisor's wait for a previous loop must cover the whole worst-case
+	// teardown (every stop attempt, then the WaitDelay backstop), or a genuinely
+	// clean-but-slow logout is abandoned and reported as wedged.
+	worst := time.Duration(helperStopAttempts)*helperStopTimeout + helperWaitDelay
+	if s := New(nil, nil, nil); s.prevWait < worst {
+		t.Errorf("prevWait %v must cover the worst-case teardown %v (%d*%v + %v)",
+			s.prevWait, worst, helperStopAttempts, helperStopTimeout, helperWaitDelay)
+	}
+
+	// The logout window itself must be long enough to matter — a 1s window would
+	// SIGKILL openconnect before its HTTPS logout completes.
+	if stop < 5*time.Second {
+		t.Errorf("STOP_TIMEOUT %v is too short for openconnect to complete its gateway logout", stop)
+	}
+}
+
+// The helper must SIGINT openconnect (which triggers the clean logout) and only
+// SIGKILL as a last resort AFTER the grace period — a KILL first would drop the
+// tunnel without a logout, exactly the lingering-session bug.
+func TestHelperStopSendsSIGINTBeforeKill(t *testing.T) {
+	src := readHelperSource(t)
+	int_ := strings.Index(src, "kill -INT")
+	kill := strings.Index(src, "kill -KILL")
+	if int_ < 0 {
+		t.Fatal("helper must SIGINT openconnect so it logs out of the gateway on teardown")
+	}
+	if kill >= 0 && kill < int_ {
+		t.Error("helper sends SIGKILL before SIGINT: openconnect would never send its logout")
+	}
 }
 
 // The gateway comes from config.json, but the sudoers rule does not constrain

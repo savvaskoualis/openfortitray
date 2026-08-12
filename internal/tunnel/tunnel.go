@@ -86,6 +86,14 @@ type Supervisor struct {
 	minHealthy  time.Duration // time connected before a cookie counts as proven
 	prevWait    time.Duration // cap on waiting for the previous loop to tear down
 
+	// earlyRetryDelay / maxEarlyRetries shape the quiet startup retry: a freshly
+	// minted cookie refused before the tunnel has ever come up this session is
+	// retried AS-IS (no re-SAML, tray stays on Connecting…) up to maxEarlyRetries
+	// times, earlyRetryDelay apart, before the loud clear-cookie + re-auth +
+	// backoff path. See loop(). Exposed for tests.
+	earlyRetryDelay time.Duration
+	maxEarlyRetries int
+
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
@@ -103,9 +111,15 @@ func New(authFn func(ctx context.Context) (string, error),
 		backoffMax:  2 * time.Minute,
 		minHealthy:  30 * time.Second,
 		// Must exceed the runner's worst-case teardown (two helper stop attempts
-		// then the WaitDelay backstop = 28s), with margin, and no more: past that
-		// point the previous backend is wedged, not slow.
+		// then the WaitDelay backstop = 2*10s+12s = 32s), with margin, and no more:
+		// past that point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
+		// A stale server-side FortiGate session from a previous run can refuse the
+		// first fresh cookie for a few seconds until the gateway releases it
+		// (one-session-per-user). Retry the same cookie a couple of times, a short
+		// delay apart, before doing anything the user would see as an error.
+		earlyRetryDelay: 4 * time.Second,
+		maxEarlyRetries: 2,
 	}
 }
 
@@ -229,6 +243,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	proven := false        // this cookie carried a healthy connection at some point
 	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
+	earlyRetries := 0 // quiet same-cookie retries used before the first bring-up
 	backoff := s.backoffBase
 	for {
 		if ctx.Err() != nil {
@@ -290,6 +305,27 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		}
 
 		if errors.Is(err, ErrAuthRejected) {
+			// Quiet early retry, gated on the tunnel never having come up this
+			// Connect (everConnected). Right after start a freshly minted cookie is
+			// valid but the gateway can still refuse it for a few seconds while it
+			// releases a stale server-side session left by a previous run
+			// (one-session-per-user). Re-run with the SAME cookie a couple of times,
+			// a short delay apart, WITHOUT clearing it and WITHOUT re-running SAML —
+			// the loop top re-emits Connecting, so the tray stays calm instead of
+			// flashing "Reconnecting — cookie rejected". Bounded by maxEarlyRetries,
+			// so a genuinely dead cookie costs only maxEarlyRetries*earlyRetryDelay
+			// before the loud fallback below. Once the tunnel has come up even once,
+			// everConnected is true and a later rejection takes the proven /
+			// immediate-reauth / backoff paths unchanged.
+			if !everConnected && earlyRetries < s.maxEarlyRetries {
+				earlyRetries++
+				select {
+				case <-time.After(s.earlyRetryDelay):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
 			cookie = ""
 			if proven && immediateReauths < maxImmediateReauths {
 				// A cookie that once carried a healthy session has gone stale
@@ -430,8 +466,10 @@ const helperPIDFile = "/var/run/openfortitray-openconnect.pid"
 
 const (
 	// helperStopTimeout bounds one privileged teardown call. The helper waits up
-	// to 6s for openconnect to exit cleanly, so allow a little more.
-	helperStopTimeout = 8 * time.Second
+	// to STOP_TIMEOUT (8s) for openconnect to exit cleanly after SIGINT — long
+	// enough for openconnect to send its logout request to the FortiGate so no
+	// session lingers server-side — so allow a little more here than that window.
+	helperStopTimeout = 10 * time.Second
 	// helperWaitDelay is the backstop *after* teardown has been attempted, and it
 	// needs no headroom for the retry: os/exec's watchCtx calls Cancel to
 	// completion and only then creates the WaitDelay timer, so the two are
