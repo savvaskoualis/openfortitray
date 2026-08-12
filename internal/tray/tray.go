@@ -30,6 +30,9 @@ type App interface {
 	// Quit item drives this rather than fyne's built-in quit so the VPN is always
 	// torn down before the process leaves.
 	Quit()
+	// UpdateClicked is the update menu item's action: apply a pending update, or
+	// trigger a fresh check when none is pending. Runs on the UI goroutine.
+	UpdateClicked()
 }
 
 // Controller owns the tray menu and icon and applies tunnel events to them.
@@ -46,6 +49,7 @@ type Controller struct {
 	connectItem    *fyne.MenuItem
 	disconnectItem *fyne.MenuItem
 	autoItem       *fyne.MenuItem
+	updateItem     *fyne.MenuItem
 
 	resGray, resGreen, resYellow, resRed fyne.Resource
 }
@@ -121,6 +125,12 @@ func newController(app App) *Controller {
 
 	logsItem := fyne.NewMenuItem("View logs", func() { _ = xopen.File(app.LogPath()) })
 
+	// The update row. It starts as a manual "Check for Updates…"; when the
+	// background checker finds a newer release, SetUpdateAvailable relabels it to
+	// "Update to <version> & Restart". Its Action (UpdateClicked) decides which of
+	// the two it is, so the label and behaviour stay in sync via one code path.
+	c.updateItem = fyne.NewMenuItem("Check for Updates…", app.UpdateClicked)
+
 	// Quit carries its own Action, so fyne's addMissingQuitForMenu keeps it
 	// (it only injects a default d.Quit when an IsQuit item has a nil Action).
 	// On the desktop driver the tray invokes item.Action() directly, so our
@@ -139,6 +149,7 @@ func newController(app App) *Controller {
 		settingsItem,
 		c.autoItem,
 		logsItem,
+		c.updateItem,
 		fyne.NewMenuItemSeparator(),
 		quitItem,
 	)
@@ -169,6 +180,14 @@ func (c *Controller) Apply(e tunnel.Event) {
 	// canConnect and its opposite are always exact opposites (see view).
 	c.connectItem.Disabled = !v.canConnect
 	c.disconnectItem.Disabled = v.canConnect
+	c.menu.Refresh()
+}
+
+// SetUpdateAvailable relabels the update row to offer a one-click update to
+// `version` and restart. It must run on the UI goroutine (the caller marshals it
+// through fyne.Do); like Apply it mutates the item and refreshes the menu.
+func (c *Controller) SetUpdateAvailable(version string) {
+	c.updateItem.Label = "Update to " + version + " & Restart"
 	c.menu.Refresh()
 }
 

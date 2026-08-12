@@ -17,3 +17,9 @@ func File(path string) error {
 		return exec.Command("xdg-open", path).Start()
 	}
 }
+
+// URL opens rawURL in the OS default browser. The same launchers File uses
+// (open / start / xdg-open) all accept a URL as readily as a path.
+func URL(rawURL string) error {
+	return File(rawURL)
+}

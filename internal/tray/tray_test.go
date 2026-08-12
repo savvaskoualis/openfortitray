@@ -22,6 +22,7 @@ type fakeApp struct {
 	autostartSet  []bool
 	autostartOn   bool
 	setAutostartE error
+	updateClicks  int
 }
 
 func (f *fakeApp) Connect()               { f.connects++ }
@@ -31,6 +32,7 @@ func (f *fakeApp) ShowSettings()          { f.settings++ }
 func (f *fakeApp) AutostartEnabled() bool { return f.autostartOn }
 func (f *fakeApp) LogPath() string        { return "" }
 func (f *fakeApp) Version() string        { return "v9.9.9-test" }
+func (f *fakeApp) UpdateClicked()         { f.updateClicks++ }
 func (f *fakeApp) SetAutostart(on bool) error {
 	f.autostartSet = append(f.autostartSet, on)
 	if f.setAutostartE != nil {
@@ -38,6 +40,32 @@ func (f *fakeApp) SetAutostart(on bool) error {
 	}
 	f.autostartOn = on
 	return nil
+}
+
+// The update row starts as a manual check and its Action must reach
+// UpdateClicked; SetUpdateAvailable must relabel it to the one-click offer.
+func TestUpdateItemWiresAndRelabels(t *testing.T) {
+	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
+
+	f := &fakeApp{}
+	c := newController(f)
+
+	it := itemByLabel(c.menu, "Check for Updates…")
+	if it == nil {
+		t.Fatal("update item not found by its initial label")
+	}
+	it.Action()
+	if f.updateClicks != 1 {
+		t.Errorf("update action fired %d UpdateClicked calls, want 1", f.updateClicks)
+	}
+
+	c.SetUpdateAvailable("v1.2.3")
+	if c.updateItem.Label != "Update to v1.2.3 & Restart" {
+		t.Errorf("after SetUpdateAvailable label = %q, want the one-click offer", c.updateItem.Label)
+	}
+	if itemByLabel(c.menu, "Check for Updates…") != nil {
+		t.Error("old update label still present after relabel")
+	}
 }
 
 func itemByLabel(m *fyne.Menu, label string) *fyne.MenuItem {

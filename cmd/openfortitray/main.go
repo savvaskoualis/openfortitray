@@ -28,6 +28,8 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/update"
+	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
 
 // supervisor is the slice of *tunnel.Supervisor the app drives. Naming it as an
@@ -88,6 +90,12 @@ type app struct {
 	// newly edited settings (Connect re-snapshots the now-updated active profile).
 	mu sync.Mutex
 	tp tunnelParams
+
+	// updateMu guards updateRel: the newest release the background checker found
+	// to be newer than this build, or nil until one is found. UpdateClicked reads
+	// it to decide between applying a pending update and kicking off a fresh check.
+	updateMu  sync.Mutex
+	updateRel *update.Release
 }
 
 // tunnelParams is the subset of config the tunnel dials with, snapshotted so the
@@ -201,6 +209,132 @@ func (a *app) Commit(c *config.Config) error {
 	}
 	*a.cfg = *c
 	return nil
+}
+
+// updateRepo is the GitHub repo the updater checks and downloads from.
+const updateRepo = "savvaskoualis/openfortitray"
+
+// releasesPageURL is opened as the manual fallback whenever an automatic update
+// is not possible or fails (non-brew mac, Linux, a download/verify error).
+const releasesPageURL = "https://github.com/savvaskoualis/openfortitray/releases/latest"
+
+// updateChecker builds the release checker with a bounded HTTP client.
+func updateChecker() update.Checker {
+	return update.Checker{
+		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		Repo:       updateRepo,
+	}
+}
+
+// startUpdateChecker polls GitHub for a newer release: once ~30s after launch,
+// then every 6h. All failures are logged and ignored — a background check must
+// never disrupt the app. It exits when ctx is cancelled.
+func (a *app) startUpdateChecker(ctx context.Context) {
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		a.checkForUpdate(ctx)
+		timer.Reset(6 * time.Hour)
+	}
+}
+
+// checkForUpdate runs one release check; if a newer version exists it records the
+// release and relabels the tray's update item on the UI goroutine.
+func (a *app) checkForUpdate(ctx context.Context) {
+	rel, err := updateChecker().Available(ctx, version)
+	if err != nil {
+		log.Printf("update: check failed: %v", err)
+		return
+	}
+	if rel == nil {
+		return
+	}
+	a.updateMu.Lock()
+	a.updateRel = rel
+	a.updateMu.Unlock()
+	if a.quitting.Load() {
+		return
+	}
+	fyne.Do(func() {
+		if a.tray != nil && !a.quitting.Load() {
+			a.tray.SetUpdateAvailable(rel.Tag)
+		}
+	})
+}
+
+// UpdateClicked is the tray update item's action (UI goroutine). With a pending
+// update it applies it; otherwise it kicks off an immediate background check.
+func (a *app) UpdateClicked() {
+	a.updateMu.Lock()
+	rel := a.updateRel
+	a.updateMu.Unlock()
+	if rel == nil {
+		go a.checkForUpdate(context.Background())
+		return
+	}
+	go a.applyUpdate(rel)
+}
+
+// applyUpdate performs the channel-appropriate update OFF the UI goroutine
+// (DownloadAndVerify blocks on the network), then quits so the detached updater
+// can replace the app and relaunch. Any failure falls back to opening the
+// releases page so the user can update by hand — the app keeps running.
+func (a *app) applyUpdate(rel *update.Release) {
+	method := update.InstallMethod()
+	switch method {
+	case update.MethodHomebrew:
+		if err := update.Apply(method, "", os.Getpid()); err != nil {
+			log.Printf("update: homebrew apply failed: %v; opening releases page", err)
+			_ = xopen.URL(releasesPageURL)
+			return
+		}
+	case update.MethodWindowsInstaller:
+		setup, sums := windowsUpdateAssets(rel)
+		if setup == nil || sums == nil {
+			log.Printf("update: release %s has no Setup.exe/SHA256SUMS; opening releases page", rel.Tag)
+			_ = xopen.URL(releasesPageURL)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		path, err := updateChecker().DownloadAndVerify(ctx, *setup, *sums)
+		if err != nil {
+			log.Printf("update: download/verify failed: %v; opening releases page", err)
+			_ = xopen.URL(releasesPageURL)
+			return
+		}
+		if err := update.Apply(method, path, os.Getpid()); err != nil {
+			log.Printf("update: windows apply failed: %v; opening releases page", err)
+			_ = xopen.URL(releasesPageURL)
+			return
+		}
+	default: // MethodManual and anything unrecognised
+		_ = xopen.URL(releasesPageURL)
+		return
+	}
+	// The detached updater is now waiting for this process to exit — quit
+	// gracefully so the tunnel is torn down before the upgrade replaces the app.
+	fyne.Do(a.Quit)
+}
+
+// windowsUpdateAssets picks the Setup.exe and SHA256SUMS assets from a release,
+// returning nil for either if it is absent.
+func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
+	for i := range rel.Assets {
+		as := &rel.Assets[i]
+		switch {
+		case strings.HasPrefix(as.Name, "OpenFortiTray-") && strings.HasSuffix(as.Name, "-Setup.exe"):
+			setup = as
+		case as.Name == "SHA256SUMS":
+			sums = as
+		}
+	}
+	return setup, sums
 }
 
 // pump is the one goroutine that reads tunnel events and drives the UI. fyne
@@ -601,6 +735,12 @@ func main() {
 	// fyne's main-loop queue and runs as soon as Run starts.
 	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
 	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart, func() { fyne.Do(a.Connect) })
+
+	// Background update checker: polls GitHub for a newer release and, if found,
+	// surfaces a one-click "Update … & Restart" item on the tray. Fully best-effort
+	// and off the UI thread; a bare/untagged build reports version "dev", which the
+	// checker treats as never-newer, so local runs never prompt.
+	go a.startUpdateChecker(context.Background())
 
 	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's Quit
 	// item and the signal handler both drive only after the tunnel has been torn
