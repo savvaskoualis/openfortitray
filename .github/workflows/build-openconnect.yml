@@ -1,0 +1,396 @@
+# Build-once workflow: compile openconnect for Windows (amd64) from source under
+# MSYS2/MINGW64 with GnuTLS, bundle its full transitive DLL closure + wintun.dll,
+# self-check the closure, and upload the result as an artifact.
+#
+# WHY THIS EXISTS: MSYS2 no longer ships a `mingw-w64-x86_64-openconnect` package
+# (`pacman -S` -> "target not found") and there is no modern prebuilt Windows
+# openconnect binary, so release.yml can no longer `pacman -S openconnect`. This
+# workflow builds it ONCE, on demand, and produces a pinned, self-contained zip.
+# The maintainer runs it via workflow_dispatch, records the printed sha256s,
+# stores the zip as a deps release asset, and rewires release.yml to
+# download+verify+extract it. This file NEVER publishes and NEVER touches
+# release.yml — it only emits an artifact.
+#
+# The recipe (deps + configure flags) mirrors OpenConnect's own MSYS2 build
+# script (openconnect-gui contrib/build_mingw-openconnect-w64@msys2.sh) and the
+# upstream GitLab CI mingw64 job. See taskP-report.md for citations.
+#
+# It CANNOT be validated locally; expect CI iteration. `set -x` + echo
+# breadcrumbs are in every build step so a failed run is diagnosable.
+
+name: Build openconnect (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openconnect_version:
+        description: 'openconnect release version (dir name at infradead download/)'
+        default: '9.12'
+        required: true
+      wintun_version:
+        description: 'Wintun release version (www.wintun.net/builds)'
+        default: '0.14.1'
+        required: true
+      openconnect_sha256:
+        description: >-
+          Expected sha256 of the openconnect tarball. Verified when non-empty
+          (job fails on mismatch). Default matches openconnect-9.12.tar.gz.
+          Leave blank to skip verification and only record the hash.
+        default: 'a2bedce3aa4dfe75e36e407e48e8e8bc91d46def5335ac9564fbf91bd4b2413e'
+        required: false
+      wintun_sha256:
+        description: 'Expected sha256 of the wintun zip. Default matches wintun-0.14.1.zip.'
+        default: '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-openconnect:
+    name: Build openconnect + DLL closure (amd64)
+    runs-on: windows-latest
+    # Everything below needs the MINGW64 environment (pacman, gcc, pkgconf,
+    # ntldd, configure, make), so make it the default shell for `run:` steps.
+    defaults:
+      run:
+        shell: 'msys2 {0}'
+    steps:
+      # Same pinned action + msystem as release.yml's Windows job. No repo
+      # checkout is needed: we build from the upstream release tarball.
+      - name: Set up MSYS2 (MINGW64)
+        id: msys2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        with:
+          msystem: MINGW64
+          # Refresh the package DB so the packages below resolve on the rolling
+          # MSYS2 distro.
+          update: true
+
+      # STEP 1 - toolchain + openconnect build/runtime deps.
+      #
+      # Toolchain: base-devel (make, sed, grep, ...), git, autoconf, automake,
+      # libtool, mingw-w64-x86_64-{gcc,pkgconf}. autotools are only strictly
+      # needed for a git checkout (release tarballs ship a generated configure),
+      # but they are cheap insurance if we ever build from git.
+      #
+      # openconnect deps mirror upstream's MSYS2 build script exactly:
+      #   gnutls (TLS, >=3.2.10 required), libxml2, zlib  -> the hard requirements
+      #   nettle, gmp, libtasn1, p11-kit, libidn2, libunistring -> gnutls's own
+      #     deps; listing them explicitly makes the closure walk deterministic
+      #   lz4        -> optional compression openconnect probes for
+      #   libproxy   -> optional proxy autoconfig openconnect probes for
+      # ntldd is the recursive PE dependency walker used to collect the DLL
+      # closure (same tool release.yml uses). zip/unzip for packaging + wintun.
+      #
+      # `pacman -Q` afterwards LOGS exact versions for the report / license notes.
+      - name: Install toolchain + openconnect build deps
+        run: |
+          set -euxo pipefail
+          pacman -S --needed --noconfirm \
+            base-devel git autoconf automake libtool \
+            mingw-w64-x86_64-gcc \
+            mingw-w64-x86_64-pkgconf \
+            mingw-w64-x86_64-gnutls \
+            mingw-w64-x86_64-libxml2 \
+            mingw-w64-x86_64-zlib \
+            mingw-w64-x86_64-nettle \
+            mingw-w64-x86_64-gmp \
+            mingw-w64-x86_64-libtasn1 \
+            mingw-w64-x86_64-p11-kit \
+            mingw-w64-x86_64-libidn2 \
+            mingw-w64-x86_64-libunistring \
+            mingw-w64-x86_64-lz4 \
+            mingw-w64-x86_64-libproxy \
+            mingw-w64-x86_64-ntldd \
+            zip unzip
+          echo "== toolchain =="
+          gcc --version
+          pkgconf --version || pkg-config --version
+          echo "== gnutls pkg-config =="
+          pkg-config --modversion gnutls
+          echo "== installed package versions =="
+          pacman -Q \
+            mingw-w64-x86_64-gcc \
+            mingw-w64-x86_64-gnutls \
+            mingw-w64-x86_64-libxml2 \
+            mingw-w64-x86_64-zlib \
+            mingw-w64-x86_64-nettle \
+            mingw-w64-x86_64-gmp \
+            mingw-w64-x86_64-libtasn1 \
+            mingw-w64-x86_64-p11-kit \
+            mingw-w64-x86_64-libidn2 \
+            mingw-w64-x86_64-libunistring \
+            mingw-w64-x86_64-lz4 \
+            mingw-w64-x86_64-libproxy \
+            mingw-w64-x86_64-ntldd
+
+      # STEP 2 - fetch + integrity-check the openconnect release tarball.
+      - name: Download + verify openconnect tarball
+        env:
+          OC_VER: ${{ inputs.openconnect_version }}
+          OC_SHA: ${{ inputs.openconnect_sha256 }}
+        run: |
+          set -euxo pipefail
+          tarball="openconnect-${OC_VER}.tar.gz"
+          url="https://www.infradead.org/openconnect/download/${tarball}"
+          echo "Downloading ${url}"
+          curl -fSL --retry 3 -o "${tarball}" "${url}"
+          ls -l "${tarball}"
+          echo "== sha256 of fetched tarball (PIN THIS) =="
+          actual="$(sha256sum "${tarball}" | awk '{print $1}')"
+          echo "OPENCONNECT_TARBALL_SHA256=${actual}"
+          echo "OPENCONNECT_TARBALL_SHA256=${actual}" >> "$GITHUB_ENV"
+          if [ -n "${OC_SHA}" ]; then
+            echo "Verifying against expected sha256: ${OC_SHA}"
+            echo "${OC_SHA}  ${tarball}" | sha256sum -c -
+          else
+            echo "No expected sha256 supplied; recorded hash only (NOT verified)."
+          fi
+          tar xzf "${tarball}"
+          test -d "openconnect-${OC_VER}"
+
+      # STEP 3 - configure (GnuTLS) + build.
+      #
+      # Configure flags, mirroring upstream's MSYS2 build script:
+      #   --with-gnutls              use GnuTLS (openconnect's default TLS lib)
+      #   --without-openssl          be explicit: do not also probe OpenSSL
+      #   --without-libpskc          skip optional PSKC (not needed, avoids a dep)
+      #   --with-vpnc-script=vpnc-script-win.js
+      #                              the documented Windows default: openconnect
+      #                              resolves this .js (run via cscript.exe)
+      #                              RELATIVE TO THE EXE DIR, so no /etc path and
+      #                              no configure "vpnc-script not found" warning.
+      #   --disable-dependency-tracking  faster one-shot build
+      #   --without-gnutls-version-check same as upstream CI (avoid brittle check)
+      # Wintun needs NO configure flag: openconnect 9.x loads wintun.dll at
+      # runtime from the exe's own directory (wintun.c), so we just ship the DLL.
+      # Native MINGW64 build => host==build, no --host cross-compile triple.
+      - name: Configure + make
+        env:
+          OC_VER: ${{ inputs.openconnect_version }}
+          WINTUN_VER: ${{ inputs.wintun_version }}
+          WINTUN_SHA: ${{ inputs.wintun_sha256 }}
+        run: |
+          set -euxo pipefail
+          cd "openconnect-${OC_VER}"
+          # openconnect 9.x's Windows build #includes "wintun.h" at COMPILE time
+          # (openconnect-internal.h), so the wintun header must be on the include
+          # path before configure/make — the DLL alone (added to the bundle later)
+          # is not enough. Fetch the pinned, sha256-verified wintun zip and put its
+          # include dir on CPPFLAGS.
+          # $(pwd) here is a POSIX MSYS path (the source root, where
+          # openconnect-internal.h lives). Keep everything relative to it — a
+          # Windows-style RUNNER_TEMP (D:\a\_temp) breaks both unzip -d and gcc -I
+          # under MSYS. openconnect-internal.h does a QUOTED `#include "wintun.h"`,
+          # which resolves from the including file's own directory, so copying the
+          # wintun header into the source root is the most robust fix (no -I / path
+          # translation to get wrong).
+          curl -fSL --retry 3 -o wintun-hdr.zip "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
+          echo "${WINTUN_SHA}  wintun-hdr.zip" | sha256sum -c -
+          unzip -o wintun-hdr.zip 'wintun/include/*' -d _wtinc
+          cp -v _wtinc/wintun/include/*.h .
+          ls -l wintun.h
+          # GCC 14 promotes -Wincompatible-pointer-types to a hard error by
+          # default; openconnect 9.12 trips it on a benign Winsock getsockopt type
+          # mismatch (mtucalc.c) that builds fine on older gcc. Downgrade it back to
+          # a warning so the build completes (functionally correct on Windows).
+          export CFLAGS="-Wno-error=incompatible-pointer-types ${CFLAGS:-}"
+          ./configure \
+            --prefix=/mingw64 \
+            --with-gnutls \
+            --without-openssl \
+            --without-libpskc \
+            --with-vpnc-script=vpnc-script-win.js \
+            --disable-dependency-tracking \
+            --without-gnutls-version-check
+          echo "== config.log tail (for diagnosing a failed configure) =="
+          tail -n 40 config.log || true
+          make -j"$(nproc)"
+          echo "== build tree openconnect binaries =="
+          find . -name 'openconnect.exe' -o -name 'openconnect' | sort
+
+      # STEP 4 - stage the exe (libtool puts the real PE at .libs/openconnect.exe;
+      # a wrapper script sits at the build root). Also ship the Windows vpnc
+      # script from the source tree so real connections work (it is not needed
+      # for the --version self-check but is required at connect time).
+      - name: Stage openconnect.exe + vpnc-script-win.js
+        env:
+          OC_VER: ${{ inputs.openconnect_version }}
+        run: |
+          set -euxo pipefail
+          src="openconnect-${OC_VER}"
+          mkdir -p staging/openconnect
+          # Prefer .libs/openconnect.exe — the REAL standalone PE. The build root
+          # also has an openconnect.exe, but that is the libtool WRAPPER, which
+          # re-execs .libs/openconnect.exe from an uninstalled path and so fails
+          # (exit 127) once bundled on its own. Fall back to any match only if the
+          # .libs one is somehow absent.
+          exe="$(find "${src}" -type f -path '*/.libs/openconnect.exe' | head -n1)"
+          [ -n "${exe}" ] || exe="$(find "${src}" -type f -name 'openconnect.exe' | head -n1)"
+          echo "Found openconnect.exe at: ${exe}"
+          test -n "${exe}"
+          cp -v "${exe}" staging/openconnect/
+          # openconnect builds its OWN shared library libopenconnect-5.dll in .libs/
+          # (the CLI links it), which lives in the build tree, not mingw64/bin, so
+          # the mingw64\bin closure walk never sees it. Copy every .libs/*.dll here
+          # or the exe fails to start (libopenconnect-5.dll => not found).
+          libdir="$(dirname "${exe}")"
+          for d in "${libdir}"/*.dll; do
+            [ -f "${d}" ] && cp -v "${d}" staging/openconnect/
+          done
+          # vpnc-script-win.js is NOT in openconnect's tarball — it lives in the
+          # openconnect vpnc-scripts repo, and openconnect looks for it next to the
+          # exe at CONNECT time (run via cscript) to set up routes + DNS. Without it
+          # the tunnel comes up but nothing is routed. Fetch the pinned,
+          # sha256-verified copy.
+          curl -fSL --retry 3 -o staging/openconnect/vpnc-script-win.js \
+            "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script-win.js"
+          echo "e196fdf0cc8b325180154535f843034dc0ae9eb43ead9980adfcfc57c58069b2  staging/openconnect/vpnc-script-win.js" | sha256sum -c -
+          ls -l staging/openconnect/vpnc-script-win.js
+
+      # STEP 5 - collect the FULL transitive DLL closure. `ntldd -R` prints e.g.
+      #   libgnutls-30.dll => /mingw64/bin/libgnutls-30.dll (0x...)
+      # Copy every resolved path under /mingw64/bin. System DLLs (kernel32, ...)
+      # resolve outside /mingw64/bin and are intentionally skipped. Identical
+      # technique to release.yml's proven closure walk.
+      - name: Collect transitive DLL closure (ntldd -R)
+        run: |
+          set -euxo pipefail
+          # ntldd -R exits non-zero when it lists Windows api-set virtual DLLs
+          # (ext-ms-win-*) as "not found" — those are not real files (the OS
+          # provides them) and resolve outside /mingw64/bin, so the grep below
+          # correctly ignores them. Capture the output regardless of exit code;
+          # the stripped-PATH --version self-check is the real completeness gate.
+          ntldd -R staging/openconnect/openconnect.exe > ntldd.txt || true
+          echo "== ntldd -R output =="
+          cat ntldd.txt
+          # ntldd prints resolved paths in WINDOWS form, e.g.
+          #   libxml2-16.dll => D:\a\_temp\msys64\mingw64\bin\libxml2-16.dll (0x..)
+          # Take every resolved DLL under a mingw64\bin dir (skips the "not found"
+          # api-sets and C:\Windows\System32 system DLLs), strip the "=> " prefix and
+          # the trailing "(0x..)", normalise backslashes, cygpath to POSIX, and copy.
+          grep -iE '=>[[:space:]].*mingw64.bin.*\.dll' ntldd.txt \
+            | sed -E 's/.*=>[[:space:]]*//; s/[[:space:]]*\(0x[0-9a-fA-F]+\)[[:space:]]*$//' \
+            | tr '\\' '/' \
+            | sort -u \
+            | while read -r dll; do
+                p="$(cygpath -u "$dll" 2>/dev/null || echo "$dll")"
+                cp -v "$p" staging/openconnect/
+              done
+          rm -f ntldd.txt
+          echo "== staged DLLs =="
+          ls -1 staging/openconnect/*.dll
+
+      # STEP 6 - add wintun.dll (amd64), pinned + sha256-verified. openconnect's
+      # Windows tunnel driver is NOT in the DLL closure (loaded at runtime from
+      # the exe dir), so it is collected explicitly.
+      - name: Add wintun.dll (pinned + verified)
+        env:
+          WINTUN_VER: ${{ inputs.wintun_version }}
+          WINTUN_SHA: ${{ inputs.wintun_sha256 }}
+        run: |
+          set -euxo pipefail
+          url="https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
+          echo "Downloading ${url}"
+          curl -fSL --retry 3 -o wintun.zip "${url}"
+          echo "== sha256 of wintun zip (PIN THIS) =="
+          wsha="$(sha256sum wintun.zip | awk '{print $1}')"
+          echo "WINTUN_ZIP_SHA256=${wsha}"
+          echo "WINTUN_ZIP_SHA256=${wsha}" >> "$GITHUB_ENV"
+          if [ -n "${WINTUN_SHA}" ]; then
+            echo "${WINTUN_SHA}  wintun.zip" | sha256sum -c -
+          else
+            echo "No expected wintun sha256 supplied; recorded hash only (NOT verified)."
+          fi
+          unzip -o wintun.zip -d wintun-extract
+          cp -v wintun-extract/wintun/bin/amd64/wintun.dll staging/openconnect/
+          rm -rf wintun.zip wintun-extract
+          test -s staging/openconnect/wintun.dll
+
+      # STEP 7 - THE closure guard. Run the staged exe with /mingw64/bin and the
+      # msys dirs STRIPPED from PATH, so DLLs can only resolve from the exe's own
+      # directory (Windows searches the application dir first). A missing DLL
+      # makes the exe fail to start and fails the job here, rather than shipping
+      # an openconnect that dies on a user's machine.
+      - name: Self-check DLL closure (stripped PATH)
+        run: |
+          set -euxo pipefail
+          test -s staging/openconnect/openconnect.exe
+          test -s staging/openconnect/wintun.dll
+          dll_count="$(ls staging/openconnect/*.dll | wc -l)"
+          echo "collected ${dll_count} DLLs"
+          [ "${dll_count}" -gt 0 ]
+          cd staging/openconnect
+          # Diagnostic: with the bundle assembled, ask ntldd which REAL dependency
+          # (not a Windows api-set / system DLL) still fails to resolve. Anything
+          # here is a DLL we must add to the closure grep. Printed unconditionally
+          # so a failing --version below is immediately actionable.
+          echo "== ntldd from bundle dir — REAL missing deps (api-sets/system excluded) =="
+          ntldd -R openconnect.exe 2>/dev/null \
+            | grep -i 'not found' \
+            | grep -viE 'ext-ms-win|api-ms-win' \
+            || echo "(ntldd reports no real missing deps)"
+          echo "== closure self-check (PATH = System32 + Windows only) =="
+          set +e
+          ver="$(PATH='/c/Windows/System32:/c/Windows' ./openconnect.exe --version 2>&1)"; rc=$?
+          set -e
+          echo "exit=${rc}"
+          echo "output: ${ver}"
+          { [ "${rc}" -eq 0 ] && echo "${ver}" | grep -qiE 'openconnect'; } \
+            || { echo "BROKEN DLL CLOSURE: bundled openconnect.exe failed to start"; exit 1; }
+
+      # STEP 8 - zip, print both sha256s + the DLL list + versions, and emit a
+      # job summary the maintainer pins when wiring release.yml.
+      - name: Package + summarize
+        id: package
+        env:
+          OC_VER: ${{ inputs.openconnect_version }}
+          WINTUN_VER: ${{ inputs.wintun_version }}
+        run: |
+          set -euxo pipefail
+          zipname="openconnect-win-amd64-${OC_VER}.zip"
+          ( cd staging && zip -r -9 "../${zipname}" openconnect )
+          zipsha="$(sha256sum "${zipname}" | awk '{print $1}')"
+          dlls="$(ls -1 staging/openconnect/*.dll | xargs -n1 basename | sort)"
+
+          echo "zipname=${zipname}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## openconnect Windows build"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| openconnect version | ${OC_VER} |"
+            echo "| wintun version | ${WINTUN_VER} |"
+            echo "| tarball sha256 | \`${OPENCONNECT_TARBALL_SHA256:-?}\` |"
+            echo "| wintun zip sha256 | \`${WINTUN_ZIP_SHA256:-?}\` |"
+            echo "| artifact | \`${zipname}\` |"
+            echo "| **artifact sha256 (PIN THIS)** | \`${zipsha}\` |"
+            echo ""
+            echo "### Bundled DLLs"
+            echo '```'
+            echo "${dlls}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "================ PIN THESE ================"
+          echo "openconnect version : ${OC_VER}"
+          echo "wintun version      : ${WINTUN_VER}"
+          echo "tarball sha256      : ${OPENCONNECT_TARBALL_SHA256:-?}"
+          echo "wintun zip sha256   : ${WINTUN_ZIP_SHA256:-?}"
+          echo "artifact            : ${zipname}"
+          echo "artifact sha256     : ${zipsha}"
+          echo "bundled DLLs        :"
+          echo "${dlls}"
+          echo "=========================================="
+          ls -l staging/openconnect
+
+      # Upload the self-contained zip. Same pinned action as release.yml.
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openconnect-win-amd64-${{ inputs.openconnect_version }}
+          path: ${{ steps.package.outputs.zipname }}
+          if-no-files-found: error
+          retention-days: 90
