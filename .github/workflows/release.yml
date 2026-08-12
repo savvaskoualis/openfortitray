@@ -138,7 +138,7 @@ jobs:
       - name: Install GL/X11 build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
 
       - name: Build linux binary
         # -s -w trims fyne's size. Ships the bare binary: there is no
