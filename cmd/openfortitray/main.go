@@ -767,6 +767,10 @@ func main() {
 	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
 	a.fyneApp.Lifecycle().SetOnStarted(func() {
 		log.Print("fyne lifecycle: OnStarted (tray live)")
+		// Re-assert the tray icon + menu now that the native systray exists. On
+		// Windows the initial set in tray.Setup (before the run loop) logs "tray not
+		// ready yet" and no icon appears; setting it again here makes it stick.
+		a.tray.ReassertTray()
 		tray.SetTooltip("OpenFortiTray")
 		// fyne/glfw promotes the process to a Regular (Dock-visible) app when it
 		// initializes NSApp during Run, overriding Info.plist LSUIElement=1. Undo

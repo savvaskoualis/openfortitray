@@ -227,6 +227,21 @@ func (c *Controller) SetUpdateAvailable(version string) {
 // pure and unit-testable) to the pre-wrapped fyne resource. Once an update is
 // available it returns the badged variant, so the red dot rides on top of
 // whatever connection-state colour is current.
+// ReassertTray re-installs the icon and menu after the native tray is live. On
+// Windows fyne's systray is not ready when Setup runs (before the run loop), so
+// the initial SetSystemTrayIcon there logs "tray not ready yet" and no icon
+// appears — the app runs but looks like nothing happened. Calling this from the
+// app's OnStarted hook (fired once the tray is up) sets them again, now that it
+// takes. Harmless on macOS/Linux, where the first set already worked. Must run on
+// the UI goroutine (OnStarted does).
+func (c *Controller) ReassertTray() {
+	if c.desk == nil {
+		return
+	}
+	c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
+	c.desk.SetSystemTrayMenu(c.menu)
+}
+
 func (c *Controller) resourceFor(icon []byte) fyne.Resource {
 	switch {
 	case bytes.Equal(icon, iconGreen):
