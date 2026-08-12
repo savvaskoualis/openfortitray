@@ -239,11 +239,15 @@ jobs:
           for d in "${libdir}"/*.dll; do
             [ -f "${d}" ] && cp -v "${d}" staging/openconnect/
           done
-          if [ -f "${src}/vpnc-script-win.js" ]; then
-            cp -v "${src}/vpnc-script-win.js" staging/openconnect/
-          else
-            echo "WARNING: vpnc-script-win.js not found in source tree (connect-time config script). Bundle it separately if real connections fail."
-          fi
+          # vpnc-script-win.js is NOT in openconnect's tarball — it lives in the
+          # openconnect vpnc-scripts repo, and openconnect looks for it next to the
+          # exe at CONNECT time (run via cscript) to set up routes + DNS. Without it
+          # the tunnel comes up but nothing is routed. Fetch the pinned,
+          # sha256-verified copy.
+          curl -fSL --retry 3 -o staging/openconnect/vpnc-script-win.js \
+            "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script-win.js"
+          echo "e196fdf0cc8b325180154535f843034dc0ae9eb43ead9980adfcfc57c58069b2  staging/openconnect/vpnc-script-win.js" | sha256sum -c -
+          ls -l staging/openconnect/vpnc-script-win.js
 
       # STEP 5 - collect the FULL transitive DLL closure. `ntldd -R` prints e.g.
       #   libgnutls-30.dll => /mingw64/bin/libgnutls-30.dll (0x...)
