@@ -308,21 +308,29 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 // badge + menu item remain for the user to act on. It is a thin wrapper: the
 // once-per-version decision lives in shouldPromptUpdate. Nil-checks a.win.
 func (a *app) promptUpdate(rel *update.Release) {
-	if a.win == nil {
+	if a.fyneApp == nil {
 		return
 	}
-	a.win.Show()
-	a.win.RequestFocus()
+	// A dedicated window hosts the update dialog, so it no longer surfaces the
+	// Settings window. Hide (never Close) on any dismissal: closing would destroy
+	// the window, and destroying the last window makes fyne quit the app.
+	w := a.fyneApp.NewWindow("OpenFortiTray Update")
+	w.SetFixedSize(true)
+	w.Resize(fyne.NewSize(440, 170))
+	w.CenterOnScreen()
+	w.SetCloseIntercept(func() { w.Hide() })
 	d := dialog.NewConfirm("Update available",
 		fmt.Sprintf("OpenFortiTray %s is available.\nUpdate and restart now?", rel.Tag),
 		func(ok bool) {
-			if !ok {
-				return
+			w.Hide()
+			if ok {
+				go a.applyUpdate(rel)
 			}
-			go a.applyUpdate(rel)
-		}, a.win)
+		}, w)
 	d.SetConfirmText("Update & Restart")
 	d.SetDismissText("Later")
+	w.Show()
+	w.RequestFocus()
 	d.Show()
 }
 

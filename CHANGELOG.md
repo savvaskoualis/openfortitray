@@ -8,6 +8,12 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.16] — 2026-08-12
+
+### Changed
+- The update prompt is now its own dedicated window instead of appearing on top
+  of (and surfacing) the Settings window.
+
 ## [0.1.15] — 2026-08-12
 
 ### Changed
