@@ -169,9 +169,22 @@ jobs:
       - name: Configure + make
         env:
           OC_VER: ${{ inputs.openconnect_version }}
+          WINTUN_VER: ${{ inputs.wintun_version }}
+          WINTUN_SHA: ${{ inputs.wintun_sha256 }}
         run: |
           set -euxo pipefail
           cd "openconnect-${OC_VER}"
+          # openconnect 9.x's Windows build #includes "wintun.h" at COMPILE time
+          # (openconnect-internal.h), so the wintun header must be on the include
+          # path before configure/make — the DLL alone (added to the bundle later)
+          # is not enough. Fetch the pinned, sha256-verified wintun zip and put its
+          # include dir on CPPFLAGS.
+          wtzip="${RUNNER_TEMP}/wintun-hdr.zip"
+          curl -fSL --retry 3 -o "$wtzip" "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
+          echo "${WINTUN_SHA}  ${wtzip}" | sha256sum -c -
+          unzip -o "$wtzip" 'wintun/include/*' -d "${RUNNER_TEMP}/wtinc"
+          export CPPFLAGS="-I${RUNNER_TEMP}/wtinc/wintun/include ${CPPFLAGS:-}"
+          echo "CPPFLAGS=${CPPFLAGS}"
           ./configure \
             --prefix=/mingw64 \
             --with-gnutls \
