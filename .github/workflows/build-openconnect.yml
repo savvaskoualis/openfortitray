@@ -191,6 +191,11 @@ jobs:
           unzip -o wintun-hdr.zip 'wintun/include/*' -d _wtinc
           cp -v _wtinc/wintun/include/*.h .
           ls -l wintun.h
+          # GCC 14 promotes -Wincompatible-pointer-types to a hard error by
+          # default; openconnect 9.12 trips it on a benign Winsock getsockopt type
+          # mismatch (mtucalc.c) that builds fine on older gcc. Downgrade it back to
+          # a warning so the build completes (functionally correct on Windows).
+          export CFLAGS="-Wno-error=incompatible-pointer-types ${CFLAGS:-}"
           ./configure \
             --prefix=/mingw64 \
             --with-gnutls \
