@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.18] — 2026-08-12
+
+### Added
+- **Windows now bundles `openconnect` + `wintun`** inside `Setup.exe` (collected
+  from MSYS2 with its full DLL closure, CI-verified via `openconnect --version`),
+  so the tunnel backend needs no separate install — winget was unavailable on
+  locked-down Cloud PCs. The app resolves the bundled binary automatically. See
+  `THIRD_PARTY_LICENSES` (openconnect LGPL-2.1 + deps + wintun).
+
 ## [0.1.17] — 2026-08-12
 
 ### Fixed
