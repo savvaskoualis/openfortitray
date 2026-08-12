@@ -771,6 +771,7 @@ func main() {
 		// Windows the initial set in tray.Setup (before the run loop) logs "tray not
 		// ready yet" and no icon appears; setting it again here makes it stick.
 		a.tray.ReassertTray()
+		log.Print("tray: re-asserted icon+menu after OnStarted")
 		tray.SetTooltip("OpenFortiTray")
 		// fyne/glfw promotes the process to a Regular (Dock-visible) app when it
 		// initializes NSApp during Run, overriding Info.plist LSUIElement=1. Undo
@@ -778,6 +779,13 @@ func main() {
 		// so setting the Accessory activation policy now hides the Dock icon
 		// without racing fyne. No-op on non-darwin.
 		setAccessoryActivationPolicy()
+	})
+	// OnStopped fires when fyne itself tears the run loop down. If this appears in
+	// the log (rather than the "run loop returned" line, or nothing), the app is
+	// being quit by fyne — e.g. a tray-only app the driver did not keep alive —
+	// not crashing. The distinction drives the fix.
+	a.fyneApp.Lifecycle().SetOnStopped(func() {
+		log.Print("fyne lifecycle: OnStopped (fyne is quitting the run loop)")
 	})
 
 	// Build the settings window once, hidden. It is never ShowAndRun'd, so it
@@ -789,7 +797,11 @@ func main() {
 	a.settings = settings.New(a, win)
 	// Route a refused Connect (invalid active profile) to the settings window,
 	// which opens on the offending field with a banner naming the fix.
-	a.onConnectIssue = a.settings.ShowIssue
+	a.onConnectIssue = func(i *settings.Issue) {
+		log.Print("onConnectIssue: showing settings window")
+		a.settings.ShowIssue(i)
+		log.Print("onConnectIssue: settings window shown")
+	}
 	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
 	// where the manual scripts/install.sh path is unchanged). Must be after a.win
 	// and a.settings are set — the bootstrap dialogs parent on a.win.

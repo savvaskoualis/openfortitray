@@ -8,6 +8,13 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.15] — 2026-08-12
+
+### Changed
+- More Windows startup diagnostics (fyne `OnStopped` hook, settings-window-show
+  and tray-reassert breadcrumbs) to pinpoint a silent post-startup exit on
+  GPU-less/Cloud-PC Windows.
+
 ## [0.1.14] — 2026-08-12
 
 ### Fixed
