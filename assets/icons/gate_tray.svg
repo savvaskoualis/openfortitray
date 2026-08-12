@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Gate arch + keyhole. Color token CC is substituted per status tint at
+       render time (see Makefile / render). Keyhole tightened for 18px menu
+       legibility: circle r3.1, flared stem. -->
+  <path d="M6 28 V15 A10 10 0 0 1 26 15 V28"
+        fill="none" stroke="CC" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="16" cy="14.5" r="3.1" fill="CC"/>
+  <path d="M16 16.5 L13.6 23.2 H18.4 Z" fill="CC"/>
+</svg>
