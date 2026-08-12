@@ -105,10 +105,15 @@ Filename: "{sys}\schtasks.exe"; \
   Flags: runhidden waituntilterminated
 
 ; 3. Optionally launch the app after install (skipped on silent installs).
+;    shellexec is REQUIRED: the exe ships a requireAdministrator manifest, and a
+;    postinstall Run entry launches as the original (non-elevated) user via
+;    CreateProcess, which cannot start an elevation-requiring exe (fails with
+;    "code 740, requires elevation"). ShellExecuteEx honours the manifest and
+;    raises the UAC prompt, matching how the Start-menu shortcut launches it.
 Filename: "{app}\openfortitray.exe"; \
   Description: "Launch OpenFortiTray"; \
   WorkingDir: "{app}"; \
-  Flags: postinstall nowait skipifsilent
+  Flags: postinstall nowait skipifsilent shellexec
 
 [UninstallRun]
 ; Remove the logon task first, before the exe is deleted. RunOnceId guards
