@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>OpenFortiTray</string>
+	<key>CFBundleDisplayName</key>
+	<string>OpenFortiTray</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.savvaskoualis.openfortitray</string>
+	<key>CFBundleExecutable</key>
+	<string>openfortitray</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<!-- Menu-bar only: no Dock icon, no app-switcher entry. A fyne status-item
+	     app renders reliably on macOS only when LSUIElement makes it an agent. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
