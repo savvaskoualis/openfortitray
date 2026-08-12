@@ -8,6 +8,19 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.14] — 2026-08-12
+
+### Fixed
+- **Windows single-instance is now a named mutex, not a pidfile.** The pidfile's
+  liveness check (`os.FindProcess`) succeeds for a dead-or-reused pid on Windows,
+  so a crash left a stale lock that made every later launch exit with "another
+  instance is already running" — the app could never start again. A session-local
+  named mutex is released automatically by the kernel on process death.
+- **Windows tray icon now appears.** The icon was set in `Setup` before fyne's
+  run loop, when the Windows systray isn't ready yet ("tray not ready yet"), so no
+  icon showed and the app looked like it never launched. It is now re-asserted
+  from the `OnStarted` lifecycle hook, once the native tray is live.
+
 ## [0.1.13] — 2026-08-12
 
 ### Added
