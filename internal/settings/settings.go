@@ -70,6 +70,7 @@ type Controller struct {
 	// Advanced tab.
 	dualStack       *widget.Check
 	dtls            *widget.Check
+	rememberSession *widget.Check
 	certMode        *widget.RadioGroup
 	certPin         *widget.Entry
 	certPinItem     *widget.FormItem
@@ -469,6 +470,7 @@ func (c *Controller) loadProfile(i int) {
 	// Advanced tab.
 	c.dualStack.SetChecked(p.DualStack)
 	c.dtls.SetChecked(p.DTLS)
+	c.rememberSession.SetChecked(p.RememberSession)
 	c.certMode.SetSelected(certModeLabel(p.ServerCert.Mode))
 	c.certPin.SetText(p.ServerCert.Pin)
 	c.applyCertMode(p.ServerCert.Mode)
@@ -537,6 +539,12 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 		}
 		c.work.Profiles[c.sel].DTLS = on
 	})
+	c.rememberSession = widget.NewCheck("Reuse session to avoid re-login", func(on bool) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].RememberSession = on
+	})
 
 	c.certPin = widget.NewEntry()
 	c.certPin.SetPlaceHolder("e.g. sha256:AB:CD:...")
@@ -604,9 +612,14 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 	helperNote.Importance = widget.WarningImportance
 	helperNote.Wrapping = fyne.TextWrapWord
 
+	rememberNote := widget.NewLabel("Skips the browser login while the session is valid; off never stores it.")
+	rememberNote.Wrapping = fyne.TextWrapWord
+
 	form := widget.NewForm(
 		widget.NewFormItem("", c.dualStack),
 		widget.NewFormItem("", c.dtls),
+		widget.NewFormItem("", c.rememberSession),
+		widget.NewFormItem("", rememberNote),
 		widget.NewFormItem("Server certificate", c.certMode),
 		c.certPinItem,
 		widget.NewFormItem("Split-DNS domains", c.splitDNS),

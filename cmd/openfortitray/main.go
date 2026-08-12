@@ -27,6 +27,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
@@ -92,6 +93,24 @@ type app struct {
 	// newly edited settings (Connect re-snapshots the now-updated active profile).
 	mu sync.Mutex
 	tp tunnelParams
+
+	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
+	// offer per Connect. startTunnel resets it to false before every
+	// sup.Connect(); authenticate does a Swap(true) so the first authFn call this
+	// Connect may reuse the stored cookie, while any later call (the supervisor
+	// re-minting after the gateway rejected that cookie) is forced onto SAML. It
+	// is crossed between the UI goroutine (reset) and the supervisor's (auth), so
+	// it is atomic.
+	storedCookieTried atomic.Bool
+	// cookieGet/cookieSet/cookieDelete are the credstore seam. They default to the
+	// package funcs in main(); tests substitute an in-memory fake so the cache-first
+	// flow is exercised without touching the real keychain. samlAuth is the SAML
+	// browser flow, likewise injectable so authenticate is unit-testable without a
+	// live gateway.
+	cookieGet    func(key string) (string, error)
+	cookieSet    func(key, value string) error
+	cookieDelete func(key string) error
+	samlAuth     func(ctx context.Context, prof config.Profile) (string, error)
 
 	// updateMu guards updateRel and lastPromptedTag: the newest release the
 	// background checker found to be newer than this build, or nil until one is
@@ -174,7 +193,79 @@ func (a *app) startTunnel() {
 		openconnectPath: resolveOpenconnectPath(a.cfg.OpenconnectPath),
 		helperPath:      a.cfg.HelperPath,
 	})
+	// Fresh Connect: allow authenticate to offer the stored cookie once (no
+	// browser). Reset BEFORE sup.Connect() so the reset happens-before the
+	// supervisor's first authFn call reads it. A later re-mint within this same
+	// Connect (gateway rejected the stored cookie) finds the flag set and runs SAML.
+	a.storedCookieTried.Store(false)
 	a.sup.Connect()
+}
+
+// cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
+// profiles/gateways keep independent cookies.
+func cookieKey(gateway string) string { return "openfortitray:" + gateway }
+
+// authenticate is the supervisor's AuthFunc. It is cache-first: on a fresh
+// Connect (storedCookieTried just reset by startTunnel) it offers the profile's
+// stored cookie ONCE, with no browser, so a still-valid session reconnects
+// silently and survives app restarts. The supervisor re-mints on ErrAuthRejected
+// (a dead stored cookie costs one silent openconnect attempt), which calls this
+// again with the flag already set — forcing the SAML browser flow, whose fresh
+// cookie is then stored.
+//
+// It runs on the supervisor's goroutine. The cookie value is never logged (only
+// the fact of reuse) and never written to config.json.
+func (a *app) authenticate(ctx context.Context) (string, error) {
+	prof := a.snapshot().prof
+	gw := prof.Gateway
+	key := cookieKey(gw)
+
+	// Offer the stored cookie only on the first auth of this Connect, only when
+	// the profile opts in, and only for a real gateway. Swap(true) both consumes
+	// the one-shot and marks it used for any later re-mint this Connect.
+	if prof.RememberSession && gw != "" && !a.storedCookieTried.Swap(true) {
+		if cookie, err := a.cookieGet(key); err != nil {
+			log.Printf("auth: could not read stored session cookie: %v", err)
+		} else if cookie != "" {
+			log.Print("auth: reusing stored session cookie (no browser)")
+			return cookie, nil
+		}
+	}
+
+	cookie, err := a.samlAuth(ctx, prof)
+	if err != nil {
+		return "", err
+	}
+	// Persist the freshly minted cookie for the next reconnect/restart. Best-effort:
+	// a store failure must not fail an otherwise-good login.
+	if prof.RememberSession && gw != "" {
+		if err := a.cookieSet(key, cookie); err != nil {
+			log.Printf("auth: could not store session cookie: %v", err)
+		}
+	}
+	return cookie, nil
+}
+
+// defaultSAMLAuth is the production SAML browser flow, unchanged from the inline
+// authFn it replaced: it opens the browser, waits for the redirect, and returns
+// the minted SVPNCOOKIE. Injectable via app.samlAuth so authenticate is testable
+// without a live gateway.
+func defaultSAMLAuth(ctx context.Context, prof config.Profile) (string, error) {
+	authr := &auth.Authenticator{
+		GatewayURL: prof.GatewayURL(),
+		ListenPort: prof.SAMLPort,
+		Client:     &http.Client{Timeout: 30 * time.Second},
+	}
+	ctx, cancel := context.WithTimeout(ctx, authTimeout)
+	defer cancel()
+	log.Printf("auth: starting SAML login on 127.0.0.1:%d", prof.SAMLPort)
+	cookie, err := authr.Authenticate(ctx)
+	if err != nil {
+		log.Printf("auth: failed: %v", err)
+		return "", err
+	}
+	log.Printf("auth: cookie obtained")
+	return cookie, nil
 }
 
 // defaultOpenconnectName is the bare, PATH-resolved value internal/config ships
@@ -262,8 +353,48 @@ func (a *app) Commit(c *config.Config) error {
 		log.Printf("config save: %v", err)
 		return err
 	}
+	// A stored cookie outlives Disconnect/Quit (that is the whole point), but a
+	// few edits make an existing one useless or unwanted, so delete it here —
+	// while a.cfg still holds the OLD profiles to compare against.
+	a.reconcileStoredCookies(a.cfg, c)
 	*a.cfg = *c
 	return nil
+}
+
+// reconcileStoredCookies deletes stored session cookies that the edit from old to
+// new makes stale or unwanted. For each new profile matched by name to an old
+// one, the old gateway's cookie is deleted when: remember-session was turned off,
+// the gateway changed, or the auth method changed — a cookie for a changed target
+// (or one the user opted out of) is worthless and must not linger at rest. It
+// runs on the UI goroutine (from Commit); deletion is best-effort and only
+// logged. Matching by name means a rename is treated as a new profile and its old
+// cookie is left to age out under its own gateway key, which is harmless.
+func (a *app) reconcileStoredCookies(old, new *config.Config) {
+	if a.cookieDelete == nil {
+		return
+	}
+	oldByName := make(map[string]config.Profile, len(old.Profiles))
+	for _, p := range old.Profiles {
+		oldByName[p.Name] = p
+	}
+	for _, np := range new.Profiles {
+		op, ok := oldByName[np.Name]
+		if !ok {
+			continue
+		}
+		turnedOff := !np.RememberSession && op.RememberSession
+		gatewayChanged := op.Gateway != np.Gateway
+		authChanged := op.Auth.Method != np.Auth.Method
+		if !np.RememberSession || turnedOff || gatewayChanged || authChanged {
+			// Delete the cookie under the OLD gateway (the one it was stored for).
+			// Idempotent: deleting an absent key is a no-op.
+			if op.Gateway != "" {
+				if err := a.cookieDelete(cookieKey(op.Gateway)); err != nil {
+					log.Printf("auth: could not delete stored session cookie: %v", err)
+				}
+			}
+		}
+	}
 }
 
 // updateRepo is the GitHub repo the updater checks and downloads from.
@@ -738,30 +869,19 @@ func main() {
 		cfgDir:  cfgDir,
 		events:  events,
 		logPath: logPath,
+		// The credstore seam: real platform-native store in production, an
+		// in-memory fake in tests.
+		cookieGet:    credstore.Get,
+		cookieSet:    credstore.Set,
+		cookieDelete: credstore.Delete,
+		samlAuth:     defaultSAMLAuth,
 	}
 
 	// The auth/run funcs read a.snapshot() rather than a value captured at
 	// startup, so a Connect that follows a settings Save (Save & Reconnect) dials
 	// the freshly edited active profile. Connect refreshes the snapshot on the UI
 	// goroutine before starting the supervisor; these run on its goroutines.
-	authFn := tunnel.AuthFunc(func(ctx context.Context) (string, error) {
-		prof := a.snapshot().prof
-		authr := &auth.Authenticator{
-			GatewayURL: prof.GatewayURL(),
-			ListenPort: prof.SAMLPort,
-			Client:     &http.Client{Timeout: 30 * time.Second},
-		}
-		ctx, cancel := context.WithTimeout(ctx, authTimeout)
-		defer cancel()
-		log.Printf("auth: starting SAML login on 127.0.0.1:%d", prof.SAMLPort)
-		cookie, err := authr.Authenticate(ctx)
-		if err != nil {
-			log.Printf("auth: failed: %v", err)
-			return "", err
-		}
-		log.Printf("auth: cookie obtained")
-		return cookie, nil
-	})
+	authFn := tunnel.AuthFunc(a.authenticate)
 
 	// macOS/Linux go through the root-owned helper installed by
 	// scripts/install.sh (see internal/tunnel.Options); on Windows the app is

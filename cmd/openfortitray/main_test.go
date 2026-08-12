@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
@@ -240,6 +242,147 @@ func TestSelfHealWithoutAutostartReapsButDoesNotConnect(t *testing.T) {
 
 	if !slices.Equal(order, []string{"reap"}) {
 		t.Errorf("order = %v, want [reap] only: reap always runs, connect must not", order)
+	}
+}
+
+// newCookieTestApp builds an app wired to an in-memory credstore fake and a
+// stubbed SAML flow that hands out FRESH-1, FRESH-2, … on each call, so the
+// cache-first auth flow is exercised without a real keychain or a live gateway.
+func newCookieTestApp(prof config.Profile) (*app, *credstore.Memory, *int) {
+	mem := credstore.NewMemory()
+	n := 0
+	a := &app{
+		cookieGet:    mem.Get,
+		cookieSet:    mem.Set,
+		cookieDelete: mem.Delete,
+		samlAuth: func(ctx context.Context, p config.Profile) (string, error) {
+			n++
+			return fmt.Sprintf("FRESH-%d", n), nil
+		},
+	}
+	a.setSnapshot(tunnelParams{prof: prof})
+	a.storedCookieTried.Store(false) // startTunnel does this before every Connect
+	return a, mem, &n
+}
+
+// A fresh Connect with a valid stored cookie must reconnect with NO browser: the
+// first authenticate returns the stored cookie and never runs SAML.
+func TestAuthenticateReusesStoredCookie(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, mem, saml := newCookieTestApp(prof)
+	mem.Set(cookieKey("vpn.example.com"), "STORED-COOKIE")
+
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "STORED-COOKIE" {
+		t.Errorf("cookie = %q, want STORED-COOKIE", got)
+	}
+	if *saml != 0 {
+		t.Errorf("SAML ran %d times; a valid stored cookie must open no browser", *saml)
+	}
+}
+
+// The supervisor re-mints on a rejected stored cookie: the second authenticate of
+// the same Connect (flag already set) must run SAML and store the fresh cookie.
+func TestAuthenticateRemintsAfterRejection(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, mem, saml := newCookieTestApp(prof)
+	mem.Set(cookieKey("vpn.example.com"), "DEAD-COOKIE")
+
+	if got, _ := a.authenticate(context.Background()); got != "DEAD-COOKIE" {
+		t.Fatalf("first auth = %q, want the stored DEAD-COOKIE", got)
+	}
+	// Gateway rejected it → supervisor calls authFn again, same Connect.
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "FRESH-1" || *saml != 1 {
+		t.Errorf("re-mint = %q (saml=%d), want a fresh SAML cookie", got, *saml)
+	}
+	if stored, _ := mem.Get(cookieKey("vpn.example.com")); stored != "FRESH-1" {
+		t.Errorf("stored cookie = %q, want the fresh FRESH-1 persisted", stored)
+	}
+}
+
+// No stored cookie: SAML runs and the minted cookie is persisted for next time.
+func TestAuthenticateStoresFreshCookie(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, mem, saml := newCookieTestApp(prof)
+
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "FRESH-1" || *saml != 1 {
+		t.Errorf("auth = %q (saml=%d), want a fresh SAML cookie", got, *saml)
+	}
+	if stored, _ := mem.Get(cookieKey("vpn.example.com")); stored != "FRESH-1" {
+		t.Errorf("stored cookie = %q, want FRESH-1", stored)
+	}
+}
+
+// remember_session off: never reuse a stored cookie, always SAML, never store.
+func TestAuthenticateSkipsStoreWhenRememberOff(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: false}
+	a, mem, saml := newCookieTestApp(prof)
+	mem.Set(cookieKey("vpn.example.com"), "STORED-COOKIE")
+
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "FRESH-1" || *saml != 1 {
+		t.Errorf("auth = %q (saml=%d), want SAML ignoring the stored cookie", got, *saml)
+	}
+	// The pre-existing stored cookie must be left untouched (never overwritten).
+	if stored, _ := mem.Get(cookieKey("vpn.example.com")); stored != "STORED-COOKIE" {
+		t.Errorf("stored cookie = %q; remember-off must not write", stored)
+	}
+}
+
+// reconcileStoredCookies deletes the stored cookie exactly when an edit makes it
+// stale or unwanted: remember turned off, gateway changed, or auth method changed
+// — and leaves it in place otherwise.
+func TestReconcileStoredCookies(t *testing.T) {
+	base := config.Profile{Name: "P", Gateway: "g1.example.com", RememberSession: true,
+		Auth: config.AuthConfig{Method: config.AuthSAML}}
+	cfg := func(p config.Profile) *config.Config {
+		return &config.Config{ActiveProfile: "P", Profiles: []config.Profile{p}}
+	}
+	mut := func(f func(*config.Profile)) config.Profile {
+		p := base
+		f(&p)
+		return p
+	}
+
+	tests := []struct {
+		name       string
+		new        config.Profile
+		wantDelete bool
+	}{
+		{"unchanged keeps cookie", base, false},
+		{"remember turned off deletes", mut(func(p *config.Profile) { p.RememberSession = false }), true},
+		{"gateway change deletes", mut(func(p *config.Profile) { p.Gateway = "g2.example.com" }), true},
+		{"auth method change deletes", mut(func(p *config.Profile) { p.Auth.Method = config.AuthCert }), true},
+		{"unrelated edit keeps cookie", mut(func(p *config.Profile) { p.DTLS = !p.DTLS }), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := credstore.NewMemory()
+			mem.Set(cookieKey("g1.example.com"), "COOKIE")
+			a := &app{cookieDelete: mem.Delete}
+
+			a.reconcileStoredCookies(cfg(base), cfg(tc.new))
+
+			stored, _ := mem.Get(cookieKey("g1.example.com"))
+			deleted := stored == ""
+			if deleted != tc.wantDelete {
+				t.Errorf("deleted = %v, want %v (stored=%q)", deleted, tc.wantDelete, stored)
+			}
+		})
 	}
 }
 

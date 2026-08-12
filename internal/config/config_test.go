@@ -24,8 +24,12 @@ func TestMigrate(t *testing.T) {
 			raw:          `{"gateway":"vpn.example.com","port":11443,"saml_port":9020,"openconnect_path":"/opt/oc","helper_path":"/opt/helper","autostart":false}`,
 			wantUpgraded: true,
 			check: func(t *testing.T, c *Config) {
-				if c.SchemaVersion != 2 {
-					t.Errorf("schemaVersion = %d, want 2", c.SchemaVersion)
+				if c.SchemaVersion != 3 {
+					t.Errorf("schemaVersion = %d, want 3 (legacy upgrades to current)", c.SchemaVersion)
+				}
+				// A legacy file predates remember_session; it must default to true.
+				if !c.Profiles[0].RememberSession {
+					t.Errorf("remember_session must default true on legacy upgrade")
 				}
 				if c.ActiveProfile != "Default" {
 					t.Errorf("activeProfile = %q, want Default", c.ActiveProfile)
@@ -78,11 +82,16 @@ func TestMigrate(t *testing.T) {
 			raw:          `{"schemaVersion":2,"activeProfile":"Work","profiles":[{"name":"Work","gateway":"work.example.com","port":10443,"saml_port":8020,"auth":{"method":"saml"},"dtls":true,"server_cert":{"mode":"warn"}}],"openconnect_path":"openconnect","helper_path":"/usr/local/libexec/openfortitray-tunnel","autostart":true}`,
 			wantUpgraded: false,
 			check: func(t *testing.T, c *Config) {
+				// A read of a v2 file keeps its on-disk version in memory (Save later
+				// rewrites it as v3), but the missing remember_session backfills true.
 				if c.SchemaVersion != 2 || c.ActiveProfile != "Work" {
 					t.Errorf("v2 fields not preserved: %+v", c)
 				}
 				if len(c.Profiles) != 1 || c.Profiles[0].Name != "Work" || c.Profiles[0].Gateway != "work.example.com" {
 					t.Errorf("v2 profiles not preserved: %+v", c.Profiles)
+				}
+				if !c.Profiles[0].RememberSession {
+					t.Errorf("v2 file must backfill remember_session=true")
 				}
 			},
 		},
@@ -112,6 +121,24 @@ func TestMigrate(t *testing.T) {
 			check: func(t *testing.T, c *Config) {
 				if c.OpenconnectPath != "openconnect" || c.HelperPath != "/usr/local/libexec/openfortitray-tunnel" || !c.Autostart {
 					t.Errorf("v2 overlay did not keep top-level defaults: %+v", c)
+				}
+			},
+		},
+		{
+			name:         "v3 honors explicit remember_session false",
+			raw:          `{"schemaVersion":3,"activeProfile":"A","profiles":[{"name":"A","gateway":"a","remember_session":false},{"name":"B","gateway":"b","remember_session":true}]}`,
+			wantUpgraded: false,
+			check: func(t *testing.T, c *Config) {
+				if c.SchemaVersion != 3 {
+					t.Errorf("schemaVersion = %d, want 3", c.SchemaVersion)
+				}
+				// A v3 file is trusted as written: no backfill, so an explicit false
+				// stays false and an explicit true stays true.
+				if c.Profiles[0].RememberSession {
+					t.Errorf("explicit remember_session:false must be honored")
+				}
+				if !c.Profiles[1].RememberSession {
+					t.Errorf("explicit remember_session:true must be honored")
 				}
 			},
 		},
@@ -152,8 +179,11 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.SchemaVersion != 2 || c.ActiveProfile != "Default" {
+	if c.SchemaVersion != 3 || c.ActiveProfile != "Default" {
 		t.Fatalf("bad defaults: %+v", c)
+	}
+	if !c.Active().RememberSession {
+		t.Fatal("remember_session should default to true")
 	}
 	if len(c.Profiles) != 1 {
 		t.Fatalf("want one default profile, got %d", len(c.Profiles))
@@ -210,8 +240,8 @@ func TestLoadMigratesAndPersists(t *testing.T) {
 	if upgraded {
 		t.Fatal("re-migrating the persisted file should be a no-op")
 	}
-	if c2.SchemaVersion != 2 || c2.Active().Gateway != "x.example.com" {
-		t.Fatalf("persisted file is not v2: %+v", c2)
+	if c2.SchemaVersion != 3 || c2.Active().Gateway != "x.example.com" {
+		t.Fatalf("persisted file is not v3: %+v", c2)
 	}
 }
 
@@ -232,8 +262,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if c2.Active().Gateway != "other.example.com" || c2.Active().Realm != "corp" || c2.Autostart {
 		t.Fatalf("round trip lost data: %+v", c2)
 	}
-	if c2.SchemaVersion != 2 {
-		t.Fatalf("round trip must stay at v2, got %d", c2.SchemaVersion)
+	if c2.SchemaVersion != 3 {
+		t.Fatalf("round trip must stay at v3, got %d", c2.SchemaVersion)
 	}
 }
 

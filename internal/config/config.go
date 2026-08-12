@@ -1,9 +1,9 @@
 // Package config holds static VPN settings and user preferences.
 //
-// The on-disk format is versioned. schemaVersion 2 is the multi-profile shape
-// below; a file with no schemaVersion (the original flat, single-connection
-// layout) is a "legacy" file and is migrated in place on first load. See
-// migrate for the exact rules.
+// The on-disk format is versioned. schemaVersion 2/3 is the multi-profile shape
+// below (v3 added Profile.RememberSession); a file with no schemaVersion (the
+// original flat, single-connection layout) is a "legacy" file and is migrated in
+// place on first load. See migrate for the exact rules.
 package config
 
 import (
@@ -14,13 +14,14 @@ import (
 )
 
 // schemaVersion is the current on-disk config version. It is written by Save
-// and drives migrate.
-const schemaVersion = 2
+// and drives migrate. v3 added Profile.RememberSession; a v2 file predates that
+// field, so migrate backfills its default (true) rather than the JSON zero.
+const schemaVersion = 3
 
 // Config is the whole config.json. Per-connection settings live in Profiles;
 // only machine-wide keys stay top-level.
 type Config struct {
-	// SchemaVersion is 0/absent for a legacy flat file and 2 for this shape.
+	// SchemaVersion is 0/absent for a legacy flat file and 2/3 for this shape.
 	SchemaVersion int       `json:"schemaVersion"`
 	ActiveProfile string    `json:"activeProfile"`
 	Profiles      []Profile `json:"profiles"`
@@ -97,6 +98,14 @@ type Profile struct {
 	ServerCert ServerCert `json:"server_cert"`
 	SplitDNS   []string   `json:"split_dns,omitempty"`
 	Quiet      bool       `json:"quiet,omitempty"`
+
+	// RememberSession lets the app reuse a stored SVPNCOOKIE (kept in
+	// platform-native secret storage, never in this file) across reconnects and
+	// restarts, falling back to the SAML browser flow only when the gateway
+	// rejects it. Default true; turning it off never stores or reuses a cookie
+	// and deletes any already stored for this profile's gateway. schemaVersion 3
+	// backfills true for pre-v3 files (see migrate).
+	RememberSession bool `json:"remember_session"`
 }
 
 // GatewayURL is the https base URL for this profile's gateway.
@@ -108,13 +117,14 @@ func (p *Profile) GatewayURL() string {
 // the empty-gateway guard still trips) and every other field at its default.
 func defaultProfile() Profile {
 	return Profile{
-		Name:       "Default",
-		Gateway:    "",
-		Port:       10443,
-		SAMLPort:   8020,
-		Auth:       AuthConfig{Method: AuthSAML},
-		DTLS:       true,
-		ServerCert: ServerCert{Mode: CertWarn},
+		Name:            "Default",
+		Gateway:         "",
+		Port:            10443,
+		SAMLPort:        8020,
+		Auth:            AuthConfig{Method: AuthSAML},
+		DTLS:            true,
+		ServerCert:      ServerCert{Mode: CertWarn},
+		RememberSession: true,
 	}
 }
 
@@ -212,8 +222,16 @@ func migrate(raw []byte) (*Config, bool, error) {
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, false, fmt.Errorf("parse config.json: %w", err)
 		}
+		// remember_session (v3) defaults true, but JSON cannot tell an omitted key
+		// from an explicit false. A file at schemaVersion < 3 predates the field, so
+		// every profile in it wants the default; backfill true. A v3+ file is trusted
+		// as written (Save always emits the key, so round-trips are exact).
+		backfillRemember := probe.SchemaVersion < 3
 		for i := range c.Profiles {
 			normalizeProfile(&c.Profiles[i])
+			if backfillRemember {
+				c.Profiles[i].RememberSession = true
+			}
 		}
 		return c, false, nil
 	}
