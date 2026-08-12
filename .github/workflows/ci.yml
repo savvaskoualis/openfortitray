@@ -80,6 +80,21 @@ jobs:
         if: runner.os == 'Windows'
         run: gcc --version
 
+      # Windows only: generate the *.syso from the app manifest so `go vet` /
+      # `go build` below link it, proving the requireAdministrator manifest
+      # embeds without error on every push. Go auto-links the GOOS/GOARCH-scoped
+      # resource in the main package dir into the windows exe only; the .syso is
+      # a build artifact (gitignored), regenerated here from the checked-in
+      # manifest with the pinned, pure-Go rsrc tool. -arch amd64 matches the
+      # windows runner's GOARCH.
+      - name: Embed Windows manifest (generate .syso)
+        if: runner.os == 'Windows'
+        run: |
+          go run github.com/akavel/rsrc@v0.10.2 \
+            -manifest cmd/openfortitray/openfortitray.manifest \
+            -arch amd64 \
+            -o cmd/openfortitray/resource_windows_amd64.syso
+
       # fyne renders through OpenGL/GLFW, so building or even type-checking the
       # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
       # dev headers. `go vet`/`go test -race`/`go build` below all compile

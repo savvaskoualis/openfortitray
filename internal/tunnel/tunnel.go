@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -454,7 +455,27 @@ func isPermanent(output string) bool {
 // tray keeps only the first line of a detail and clips it at 60 runes, so an
 // instruction placed after the process output would be the part that gets cut.
 // The diagnostics go on the following lines, where the log file still has them.
-const installHint = "re-run scripts/install.sh"
+//
+// The wording is OS-aware. On unix the permanent failures are the privileged
+// path being unset — a missing/mismatched sudoers rule ("a password is
+// required"), or the helper still carrying its @OPENCONNECT@ placeholder ("not
+// installed: run scripts/install.sh") — all repaired by re-running
+// scripts/install.sh, which does not exist on Windows. On Windows there is no
+// helper: the app runs openconnect directly, so the only permanent failure is
+// openconnect itself not being found (the exec.ErrNotFound branch below), and
+// scripts/install.sh guidance would be a dead end. There the fix is to reinstall
+// via the installer and let the app run elevated.
+var installHint = installHintFor(runtime.GOOS)
+
+// installHintFor returns the one-line remediation hint for goos. Split out from
+// the package var so a test can exercise both platforms regardless of the host.
+// Keep every return value at or under the tray's 60-rune first-line clip.
+func installHintFor(goos string) string {
+	if goos == "windows" {
+		return "reinstall OpenFortiTray and run it as Administrator"
+	}
+	return "re-run scripts/install.sh"
+}
 
 // DefaultHelperPath is where scripts/install.sh puts the privileged helper.
 const DefaultHelperPath = "/usr/local/libexec/openfortitray-tunnel"

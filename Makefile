@@ -16,11 +16,33 @@ ICON_SRC   := assets/icons/gate_dock.svg
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 DMG     := $(DIST)/$(APP)-$(VERSION).dmg
 
-.PHONY: all build test release clean install app dmg
+# Windows application manifest -> .syso resource. On Windows there is no
+# privileged helper: the app runs openconnect directly, which needs Administrator
+# to create the wintun adapter. openfortitray.manifest requests
+# requireAdministrator so EVERY launch is elevated (see the file for the full
+# rationale). The Go toolchain auto-links a GOOS/GOARCH-scoped *.syso found in the
+# main package dir into the WINDOWS exe only — darwin/linux builds ignore it. We
+# never commit the binary .syso (it is gitignored); it is regenerated from the
+# checked-in manifest by `winres`. rsrc is pure Go (no cgo), so it cross-generates
+# the COFF resource on any host; pinned to a full version like the CI actions.
+RSRC       := github.com/akavel/rsrc@v0.10.2
+MANIFEST   := $(PKG:./%=%)/openfortitray.manifest
+SYSO_AMD64 := $(PKG:./%=%)/resource_windows_amd64.syso
+SYSO_ARM64 := $(PKG:./%=%)/resource_windows_arm64.syso
+
+.PHONY: all build test release clean install app dmg winres
 
 all: build
 
+# winres compiles the app manifest into the windows amd64 + arm64 *.syso
+# resources. Safe (and a no-op for the output) on any host; the release/build
+# recipes below invoke it only when the host is actually building windows.
+winres:
+	go run $(RSRC) -manifest $(MANIFEST) -arch amd64 -o $(SYSO_AMD64)
+	go run $(RSRC) -manifest $(MANIFEST) -arch arm64 -o $(SYSO_ARM64)
+
 build:
+	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
 	go build -o $(BIN) $(PKG)
 
 test:
@@ -61,8 +83,9 @@ else ifeq ($(shell uname -s),Linux)
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
 else
+	$(MAKE) winres
 	CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
-	@echo "make release: built windows amd64. darwin/linux come from CI (native runners)."
+	@echo "make release: built windows amd64 (manifest embedded, runs elevated). darwin/linux come from CI (native runners)."
 endif
 	@ls -l $(DIST)
 
@@ -167,3 +190,4 @@ install:
 
 clean:
 	rm -rf $(DIST) $(BIN)
+	rm -f $(SYSO_AMD64) $(SYSO_ARM64)

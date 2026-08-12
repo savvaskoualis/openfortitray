@@ -211,6 +211,22 @@ jobs:
       - name: Verify C toolchain
         run: gcc --version
 
+      # Embed the Windows application manifest so the exe ALWAYS runs elevated
+      # (requireAdministrator) from any launch path — Start-menu shortcut,
+      # manual launch, or the /RL HIGHEST login task — because openconnect needs
+      # Administrator to create the wintun adapter and there is no privileged
+      # helper on Windows. Go auto-links a GOOS/GOARCH-scoped *.syso in the main
+      # package dir into the windows exe; we generate it here from the checked-in
+      # manifest rather than commit a binary blob (the .syso is gitignored). rsrc
+      # is pure Go (no cgo, no MinGW needed) and pinned to a full version like
+      # every action above. -arch amd64 matches the single arch built below.
+      - name: Embed Windows manifest (generate .syso)
+        run: |
+          go run github.com/akavel/rsrc@v0.10.2 \
+            -manifest cmd/openfortitray/openfortitray.manifest \
+            -arch amd64 \
+            -o cmd/openfortitray/resource_windows_amd64.syso
+
       - name: Build windows binary
         # -s -w trims size; -H=windowsgui suppresses the console window.
         run: |

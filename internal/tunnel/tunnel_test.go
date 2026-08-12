@@ -1034,6 +1034,34 @@ func TestPermanentMarkersAreLowercase(t *testing.T) {
 	}
 }
 
+// TestInstallHintIsOSAware pins the remediation hint to each platform's real
+// repair path: scripts/install.sh does not exist on Windows (no privileged
+// helper there), so the Windows hint must not send the user to it, and must fit
+// the tray's 60-rune first-line clip. unix keeps the install.sh guidance.
+func TestInstallHintIsOSAware(t *testing.T) {
+	const clip = 60
+
+	win := installHintFor("windows")
+	if strings.Contains(win, "install.sh") {
+		t.Errorf("windows hint must not reference scripts/install.sh (it does not exist on Windows): %q", win)
+	}
+	if !strings.Contains(win, "Administrator") {
+		t.Errorf("windows hint should point at running as Administrator: %q", win)
+	}
+
+	for _, goos := range []string{"darwin", "linux"} {
+		if got := installHintFor(goos); got != "re-run scripts/install.sh" {
+			t.Errorf("installHintFor(%q) = %q, want the install.sh guidance", goos, got)
+		}
+	}
+
+	for _, goos := range []string{"windows", "darwin", "linux"} {
+		if n := len([]rune(installHintFor(goos))); n > clip {
+			t.Errorf("installHintFor(%q) is %d runes, exceeds the tray's %d-rune clip", goos, n, clip)
+		}
+	}
+}
+
 func TestStartArgv(t *testing.T) {
 	tests := []struct {
 		name     string
