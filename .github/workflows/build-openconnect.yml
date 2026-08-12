@@ -36,7 +36,7 @@ on:
           Expected sha256 of the openconnect tarball. Verified when non-empty
           (job fails on mismatch). Default matches openconnect-9.12.tar.gz.
           Leave blank to skip verification and only record the hash.
-        default: '69b92c9e4af27ccd3bc41bd21663790102d7096f213f1ab59471a0bfc19534c9'
+        default: 'a2bedce3aa4dfe75e36e407e48e8e8bc91d46def5335ac9564fbf91bd4b2413e'
         required: false
       wintun_sha256:
         description: 'Expected sha256 of the wintun zip. Default matches wintun-0.14.1.zip.'
