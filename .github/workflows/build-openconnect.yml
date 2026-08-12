@@ -303,12 +303,24 @@ jobs:
           dll_count="$(ls staging/openconnect/*.dll | wc -l)"
           echo "collected ${dll_count} DLLs"
           [ "${dll_count}" -gt 0 ]
+          cd staging/openconnect
+          # Diagnostic: with the bundle assembled, ask ntldd which REAL dependency
+          # (not a Windows api-set / system DLL) still fails to resolve. Anything
+          # here is a DLL we must add to the closure grep. Printed unconditionally
+          # so a failing --version below is immediately actionable.
+          echo "== ntldd from bundle dir — REAL missing deps (api-sets/system excluded) =="
+          ntldd -R openconnect.exe 2>/dev/null \
+            | grep -i 'not found' \
+            | grep -viE 'ext-ms-win|api-ms-win' \
+            || echo "(ntldd reports no real missing deps)"
           echo "== closure self-check (PATH = System32 + Windows only) =="
-          ver="$(PATH='/c/Windows/System32:/c/Windows' ./staging/openconnect/openconnect.exe --version 2>&1)" \
-            || { echo "BROKEN DLL CLOSURE: bundled openconnect.exe failed to start"; echo "${ver}"; exit 1; }
-          echo "${ver}"
-          echo "${ver}" | grep -qiE 'openconnect' \
-            || { echo "openconnect --version did not print a version"; exit 1; }
+          set +e
+          ver="$(PATH='/c/Windows/System32:/c/Windows' ./openconnect.exe --version 2>&1)"; rc=$?
+          set -e
+          echo "exit=${rc}"
+          echo "output: ${ver}"
+          { [ "${rc}" -eq 0 ] && echo "${ver}" | grep -qiE 'openconnect'; } \
+            || { echo "BROKEN DLL CLOSURE: bundled openconnect.exe failed to start"; exit 1; }
 
       # STEP 8 - zip, print both sha256s + the DLL list + versions, and emit a
       # job summary the maintainer pins when wiring release.yml.
