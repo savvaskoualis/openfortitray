@@ -221,7 +221,13 @@ jobs:
           set -euxo pipefail
           src="openconnect-${OC_VER}"
           mkdir -p staging/openconnect
-          exe="$(find "${src}" -type f -name 'openconnect.exe' | head -n1)"
+          # Prefer .libs/openconnect.exe — the REAL standalone PE. The build root
+          # also has an openconnect.exe, but that is the libtool WRAPPER, which
+          # re-execs .libs/openconnect.exe from an uninstalled path and so fails
+          # (exit 127) once bundled on its own. Fall back to any match only if the
+          # .libs one is somehow absent.
+          exe="$(find "${src}" -type f -path '*/.libs/openconnect.exe' | head -n1)"
+          [ -n "${exe}" ] || exe="$(find "${src}" -type f -name 'openconnect.exe' | head -n1)"
           echo "Found openconnect.exe at: ${exe}"
           test -n "${exe}"
           cp -v "${exe}" staging/openconnect/
