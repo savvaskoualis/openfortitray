@@ -475,10 +475,12 @@ var installHint = installHintFor(runtime.GOOS)
 
 // installHintFor returns the one-line remediation hint for goos. Split out from
 // the package var so a test can exercise both platforms regardless of the host.
-// Keep every return value at or under the tray's 60-rune first-line clip.
+// The detail's first line is "tunnel: install is broken: " (27 runes, from
+// ErrPermanent) followed by this hint, and the tray clips that whole line at 60
+// runes — so a hint must stay at or under ~33 runes to survive the clip.
 func installHintFor(goos string) string {
 	if goos == "windows" {
-		return "reinstall OpenFortiTray and run it as Administrator"
+		return "reinstall as Administrator"
 	}
 	return "re-run scripts/install.sh"
 }

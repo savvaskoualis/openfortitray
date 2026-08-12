@@ -707,9 +707,10 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 			// instruction has to survive that, or the user is told there is an
 			// error and nothing about how to clear it.
 			first := strings.SplitN(e.Detail, "\n", 2)[0]
-			if !strings.Contains(first, "re-run scripts/install.sh") {
-				t.Errorf("first line of the detail is %q; the fix must appear there, "+
-					"not after the process output the menu clips away", first)
+			if !strings.Contains(first, installHintFor(runtime.GOOS)) {
+				t.Errorf("first line of the detail is %q; the OS-aware fix hint %q must "+
+					"appear there, not after the process output the menu clips away",
+					first, installHintFor(runtime.GOOS))
 			}
 			if n := len([]rune(first)); n > 60 {
 				t.Errorf("first line of the detail is %d runes (%q); the menu clips at 60", n, first)
@@ -924,8 +925,8 @@ func TestRunOpenconnectStartFailure(t *testing.T) {
 	if !errors.Is(err, ErrPermanent) {
 		t.Errorf("err = %v, want ErrPermanent: retrying cannot conjure up a missing binary", err)
 	}
-	if !strings.Contains(err.Error(), "scripts/install.sh") {
-		t.Errorf("err = %v, want it to say what fixes the install", err)
+	if !strings.Contains(err.Error(), installHintFor(runtime.GOOS)) {
+		t.Errorf("err = %v, want it to carry the OS-aware install-fix hint %q", err, installHintFor(runtime.GOOS))
 	}
 }
 
