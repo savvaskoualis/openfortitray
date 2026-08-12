@@ -157,6 +157,19 @@ window. That is the whole app install.
 > `config.json` — so the drag-install and the script converge on the same state. If
 > you would rather not build from source at all, running `scripts/install.sh` (next
 > section) does the whole thing end to end and you can skip the `.dmg`.
+>
+> **No checkout? Use `scripts/install-helper.sh`.** If you installed the app from the
+> `.dmg` or `brew install --cask` and have no repository clone, install just the
+> helper + `sudoers` rule with a single command — it downloads the helper from the
+> pinned release tag, verifies its `sha256`, and writes the scoped rule for you:
+>
+> ```sh
+> curl -fsSL https://raw.githubusercontent.com/savvaskoualis/openfortitray/v0.1.3/scripts/install-helper.sh | sudo bash
+> ```
+>
+> Unlike `scripts/install.sh` it never touches the app or `config.json` — set the
+> gateway in the app afterwards. On macOS `openconnect` comes with the cask; if you
+> used the `.dmg`, `brew install openconnect` first.
 
 The `.app` is **ad-hoc code-signed** (so it launches on Apple Silicon — an unsigned
 Mach-O is killed by the OS as "damaged" even after quarantine is cleared) but it is
