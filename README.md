@@ -164,7 +164,7 @@ window. That is the whole app install.
 > pinned release tag, verifies its `sha256`, and writes the scoped rule for you:
 >
 > ```sh
-> curl -fsSL https://raw.githubusercontent.com/savvaskoualis/openfortitray/v0.1.6/scripts/install-helper.sh | sudo bash
+> curl -fsSL https://raw.githubusercontent.com/savvaskoualis/openfortitray/v0.1.7/scripts/install-helper.sh | sudo bash
 > ```
 >
 > Unlike `scripts/install.sh` it never touches the app or `config.json` — set the
