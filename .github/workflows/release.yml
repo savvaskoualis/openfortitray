@@ -13,6 +13,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual dry-run: build all artifacts (incl. the .dmg and the Windows
+  # installer) without publishing, so the packaging path can be verified on a
+  # branch before a real tag. The publish job is gated to tag refs below.
+  workflow_dispatch:
 
 # Least privilege at the top; only the publishing job widens to contents: write.
 permissions:
@@ -215,12 +219,14 @@ jobs:
             go build -ldflags="-s -w -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
           ls -l dist
 
-      # Inno Setup builds the friendly OpenFortiTray-Setup.exe wizard. Chocolatey
-      # is preinstalled on windows-latest; the innosetup version is pinned so the
-      # compiler is reproducible (choco itself is not SHA-pinnable like the
-      # Actions above, so the version pin is the reproducibility lever here).
-      - name: Install Inno Setup
-        run: choco install innosetup --version=6.2.2 -y --no-progress
+      # Inno Setup is preinstalled on windows-latest (6.7.x); the build step below
+      # calls ISCC.exe by its fixed install path. We deliberately do NOT
+      # `choco install` a pinned version — choco refuses to "downgrade" over the
+      # newer preinstalled build and fails the job.
+      - name: Verify Inno Setup present
+        run: |
+          test -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            || { echo "ISCC.exe not found at the expected path"; exit 1; }
 
       # ISCC compiles scripts/openfortitray.iss. Source/OutputDir in the .iss are
       # resolved relative to the script (scripts/), so ..\dist picks up the exe
@@ -264,6 +270,9 @@ jobs:
   release:
     name: Publish release
     needs: [build-darwin, build-linux, build-windows]
+    # Publish only for a real tag push; workflow_dispatch dry-runs build and
+    # verify the artifacts but never create a release.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # The only job that writes: it creates the release and uploads the assets.
     permissions:
