@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.17] — 2026-08-12
+
+### Fixed
+- **Windows: opening any window (Settings, the update prompt) crashed the app on
+  GPU-less hosts (Cloud PC / RDP).** Mesa's default llvmpipe software driver
+  JIT-crashes on the first GL draw there; force the pure-C `softpipe` driver
+  (`GALLIUM_DRIVER=softpipe`) at startup on Windows. The tray already worked; now
+  windows render too.
+
 ## [0.1.16] — 2026-08-12
 
 ### Changed

@@ -614,6 +614,18 @@ const shutdownWait = 35 * time.Second
 const startupReapWait = 15 * time.Second
 
 func main() {
+	// Windows ships a bundled Mesa software OpenGL (the app-dir opengl32.dll
+	// shadows the system one), whose default gallium driver is llvmpipe. llvmpipe
+	// JITs with LLVM and uses CPU vector instructions, and on some GPU-less hosts
+	// (locked-down Cloud PCs / RDP) that hard-crashes on the first window draw —
+	// the tray survives (no GL surface) but opening any window kills the process
+	// with no WER/crash record. Force the pure-C softpipe driver, which renders
+	// this light UI fine and does not crash there. Must be set before any GL call
+	// (i.e. before fyne creates its driver). No-op off Windows.
+	if runtime.GOOS == "windows" {
+		_ = os.Setenv("GALLIUM_DRIVER", "softpipe")
+	}
+
 	cfgDir, err := config.DefaultDir()
 	if err != nil {
 		log.Fatal(err)
