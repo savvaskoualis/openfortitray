@@ -87,10 +87,10 @@ type Supervisor struct {
 	minHealthy  time.Duration // time connected before a cookie counts as proven
 	prevWait    time.Duration // cap on waiting for the previous loop to tear down
 
-	// earlyRetryDelay / maxEarlyRetries shape the quiet startup retry: a freshly
-	// minted cookie refused before the tunnel has ever come up this session is
-	// retried AS-IS (no re-SAML, tray stays on Connecting…) up to maxEarlyRetries
-	// times, earlyRetryDelay apart, before the loud clear-cookie + re-auth +
+	// earlyRetryDelay / maxEarlyRetries shape the quiet startup retry: a cookie
+	// refused before the tunnel has ever come up this session is re-minted (a
+	// fresh, non-interactive SAML login, tray stays on Connecting…) up to
+	// maxEarlyRetries times, earlyRetryDelay apart, before the loud re-auth +
 	// backoff path. See loop(). Exposed for tests.
 	earlyRetryDelay time.Duration
 	maxEarlyRetries int
@@ -115,10 +115,11 @@ func New(authFn func(ctx context.Context) (string, error),
 		// then the WaitDelay backstop = 2*10s+12s = 32s), with margin, and no more:
 		// past that point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
-		// A stale server-side FortiGate session from a previous run can refuse the
-		// first fresh cookie for a few seconds until the gateway releases it
-		// (one-session-per-user). Retry the same cookie a couple of times, a short
-		// delay apart, before doing anything the user would see as an error.
+		// A stale server-side FortiGate session from a previous run can make the
+		// gateway reject the first cookie outright (one-session-per-user). Re-mint
+		// a fresh cookie a couple of times, a short delay apart — the re-auth is
+		// seamless because the IdP session is still cached — before doing anything
+		// the user would see as an error.
 		earlyRetryDelay: 4 * time.Second,
 		maxEarlyRetries: 2,
 	}
@@ -307,19 +308,24 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 
 		if errors.Is(err, ErrAuthRejected) {
 			// Quiet early retry, gated on the tunnel never having come up this
-			// Connect (everConnected). Right after start a freshly minted cookie is
-			// valid but the gateway can still refuse it for a few seconds while it
-			// releases a stale server-side session left by a previous run
-			// (one-session-per-user). Re-run with the SAME cookie a couple of times,
-			// a short delay apart, WITHOUT clearing it and WITHOUT re-running SAML —
-			// the loop top re-emits Connecting, so the tray stays calm instead of
-			// flashing "Reconnecting — cookie rejected". Bounded by maxEarlyRetries,
-			// so a genuinely dead cookie costs only maxEarlyRetries*earlyRetryDelay
-			// before the loud fallback below. Once the tunnel has come up even once,
-			// everConnected is true and a later rejection takes the proven /
-			// immediate-reauth / backoff paths unchanged.
+			// Connect (everConnected). A cookie refused at startup is refused
+			// outright — the gateway rejects the stale SAML assertion, it does not
+			// merely defer a valid one — so only a fresh assertion recovers, not a
+			// re-send. Clear the cookie so the loop top re-runs SAML and mints a
+			// FRESH one on each retry. This is cheap and non-interactive right after
+			// the interactive login: the IdP browser session is still cached, so the
+			// re-auth completes in ~1s with no clicks. The loop top re-emits
+			// Authenticating/Connecting (never Reconnecting), so the tray stays calm
+			// instead of flashing "Reconnecting — cookie rejected". Bounded by
+			// maxEarlyRetries, so a gateway that refuses every fresh cookie costs at
+			// most maxEarlyRetries quiet re-auths before the loud fallback below.
+			// Once the tunnel has come up even once, everConnected is true and a
+			// later rejection takes the proven / immediate-reauth / backoff paths
+			// unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
+				cookie = "" // re-mint: the gateway rejects the stale cookie outright,
+				// it does not merely defer it, so only a fresh SAML assertion recovers
 				select {
 				case <-time.After(s.earlyRetryDelay):
 				case <-ctx.Done():
