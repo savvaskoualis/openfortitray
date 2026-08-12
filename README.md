@@ -233,9 +233,33 @@ attribute never applies to that path.)
 
 ### Windows
 
-Download `openfortitray-windows-amd64.exe` from a release (or run `make release` and
-take it from `dist\`), put it next to `scripts\install.ps1`, then from an **elevated**
-PowerShell:
+The primary download is **`OpenFortiTray-<version>-Setup.exe`** from a release — a
+double-click wizard. It requests admin (it writes `%ProgramFiles%\openfortitray` and
+creates an elevated task), then:
+
+- installs the tray app to `%ProgramFiles%\openfortitray\openfortitray.exe`,
+- adds a **Start-menu** entry (`OpenFortiTray`),
+- creates the logon scheduled task named `OpenFortiTray` with **Run with highest
+  privileges** — that task is also the elevation mechanism (openconnect needs admin for
+  the wintun adapter), so unchecking *Auto-connect at login* in the tray deletes it, and
+  a later manual launch has to be elevated by you,
+- installs **openconnect via winget** (`OpenConnect.OpenConnect`) when winget is present
+  and openconnect is not already on `PATH`. openconnect is **not bundled** (licensing +
+  size). If winget is unavailable the wizard still installs the app and tells you to add
+  openconnect yourself — the tray runs, only the tunnel needs it. Install openconnect
+  from <https://gitlab.com/openconnect/openconnect> (or another package manager), then,
+  if it is not on `PATH`, set `"openconnect_path"` to its full path in
+  `%APPDATA%\openfortitray\config.json`.
+
+The wizard does not set a gateway; open **Settings…** from the tray on first launch to
+enter your `host:port`. The uninstaller (Apps & features → OpenFortiTray) removes the
+exe, the Start-menu entry and the scheduled task, and leaves your config in
+`%APPDATA%\openfortitray`.
+
+#### Scripted alternative: `install.ps1`
+
+For scripted/CLI installs, download the bare `openfortitray-windows-amd64.exe`, put it
+next to `scripts\install.ps1`, then from an **elevated** PowerShell:
 
 ```powershell
 $env:OPENFORTITRAY_GATEWAY = "vpn.example.com:10443"
@@ -244,11 +268,8 @@ $env:OPENFORTITRAY_GATEWAY = "vpn.example.com:10443"
 
 If `OPENFORTITRAY_GATEWAY` is unset the script prompts for it. It installs to
 `%ProgramFiles%\openfortitray`, writes `%APPDATA%\openfortitray\config.json`, installs
-openconnect via winget if it is missing, and creates a logon scheduled task named
-`OpenFortiTray` with **Run with highest privileges**. That task is also the elevation
-mechanism — openconnect needs admin for the wintun adapter — so unchecking
-*Auto-connect at login* in the tray deletes it, and a later manual launch has to be
-elevated by you.
+openconnect via winget if it is missing, adds the Start-menu shortcut, and creates the
+same `OpenFortiTray` logon task with highest privileges.
 
 ## Before you connect
 
@@ -598,8 +619,10 @@ git push origin v0.1.0
 
 The release carries the four binaries (`openfortitray-darwin-arm64`,
 `openfortitray-darwin-amd64`, `openfortitray-linux-amd64`,
-`openfortitray-windows-amd64.exe`), the macOS `OpenFortiTray-<version>.dmg`, and
-`SHA256SUMS`. Binaries carry no version stamp yet, and are neither signed nor notarized.
+`openfortitray-windows-amd64.exe`), the macOS `OpenFortiTray-<version>.dmg`, the Windows
+`OpenFortiTray-<version>-Setup.exe` wizard (built on `windows-latest` with Inno Setup),
+and `SHA256SUMS` (which covers the Setup.exe too). Binaries carry no version stamp yet,
+and are neither signed nor notarized.
 
 ## Contributing
 
