@@ -18,6 +18,11 @@
 ; The freshly built exe is expected at ..\dist\openfortitray-windows-amd64.exe
 ; relative to this script (override with /DMyAppExe=... if it lives elsewhere).
 ;
+; This installer also redistributes Mesa 3D (https://mesa3d.org/) — the
+; llvmpipe software OpenGL driver (opengl32.dll + libgallium_wgl.dll) — so the
+; tray renders on GPU-less Windows (VMs/RDP). Mesa is under an MIT-style
+; license; see THIRD_PARTY_LICENSES in the repository root for attribution.
+;
 ; UNVERIFIED: authored on a non-Windows host and never run through ISCC or on a
 ; real Windows machine. Review by inspection only.
 
@@ -33,6 +38,14 @@
 ; parent; override with /DMyAppExe if needed.
 #ifndef MyAppExe
   #define MyAppExe "..\dist\openfortitray-windows-amd64.exe"
+#endif
+
+; Directory holding the bundled Mesa llvmpipe GL DLLs (opengl32.dll +
+; libgallium_wgl.dll). CI's "Bundle Mesa software OpenGL" step extracts them
+; into dist/ before ISCC runs, so they sit beside the exe. Override with
+; /DMyMesaDir if they live elsewhere.
+#ifndef MyMesaDir
+  #define MyMesaDir "..\dist"
 #endif
 
 ; Where the finished OpenFortiTray-<version>-Setup.exe lands. Defaults to the
@@ -78,6 +91,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; The CI-built tray exe, renamed to openfortitray.exe at the install target
 ; (matches install.ps1's %ProgramFiles%\openfortitray\openfortitray.exe).
 Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: ignoreversion
+; Bundled Mesa llvmpipe software OpenGL, installed into {app} beside the exe.
+; Windows loads an app-directory opengl32.dll before the system one, so the tray
+; renders in software on GPU-less machines (VMs/RDP) that have no GL driver.
+; opengl32.dll is a thin WGL front-end that loads its driver from
+; libgallium_wgl.dll, so BOTH must ship. Removed automatically on uninstall
+; (Inno tracks [Files] it installs). Mesa is MIT-style — see THIRD_PARTY_LICENSES.
+Source: "{#MyMesaDir}\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyMesaDir}\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; Start-menu shortcut -> {autoprograms}\OpenFortiTray.lnk, same as install.ps1.

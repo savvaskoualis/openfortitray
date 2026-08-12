@@ -55,6 +55,25 @@ if (-not (Get-Command openconnect -ErrorAction SilentlyContinue)) {
 # 3. Tray binary.
 Copy-Item $exeSource $exeTarget -Force
 
+# 3b. Bundled Mesa llvmpipe software OpenGL. Windows loads an app-directory
+#     opengl32.dll before the system one, so copying Mesa's opengl32.dll (plus
+#     its llvmpipe backend libgallium_wgl.dll) next to the exe makes the tray
+#     render in software on GPU-less boxes (VMs/RDP) that have no GL driver.
+#     The release ships both DLLs beside openfortitray-windows-amd64.exe; if you
+#     downloaded only the bare exe, download opengl32.dll and libgallium_wgl.dll
+#     from the same release and drop them next to this script. Both are needed:
+#     opengl32.dll is a thin front-end that loads libgallium_wgl.dll. Skipped
+#     (with a note) if absent — the app still runs where a real GL driver exists.
+foreach ($dll in @("opengl32.dll", "libgallium_wgl.dll")) {
+    $dllSource = Join-Path $PSScriptRoot $dll
+    if (Test-Path $dllSource) {
+        Copy-Item $dllSource (Join-Path $installDir $dll) -Force
+        Write-Host "copied $dll (bundled software OpenGL)"
+    } else {
+        Write-Host "note: $dll not found next to this script; on a GPU-less machine (VM/RDP) download it from the release and place it here, then re-run"
+    }
+}
+
 # 4. Start Menu shortcut so the app shows up in Start search (the logon task
 #    launches it at login; without this it is nowhere in the Start menu). Written
 #    to the per-user Programs folder and overwritten each run so it stays current.

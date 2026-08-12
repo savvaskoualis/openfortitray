@@ -6,9 +6,11 @@ tags. Dates are the release date.
 
 ## [Unreleased]
 
-- Bundle a software OpenGL renderer (Mesa llvmpipe) with the Windows build so the
-  app runs on VMs, RDP sessions, and GPU-less Windows where there is no OpenGL
-  driver (previously: `WGL: driver does not support OpenGL` at launch).
+- Bundle a software OpenGL renderer (Mesa llvmpipe, pinned + sha256-verified in
+  CI) with the Windows build so the app runs on VMs, RDP sessions, and GPU-less
+  Windows where there is no OpenGL driver (previously: `WGL: driver does not
+  support OpenGL` at launch). Ships `opengl32.dll` + its `libgallium_wgl.dll`
+  backend beside the exe; installed by `Setup.exe` and `install.ps1`.
 - Tray icon shows a red badge when an update is available, in addition to the
   "Update to … & Restart" menu item.
 - App icons: real `.icns` on the macOS bundle and an embedded `.ico` on the

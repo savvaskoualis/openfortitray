@@ -9,6 +9,13 @@ APP        := OpenFortiTray
 APP_BUNDLE := $(DIST)/$(APP).app
 APP_PLIST  := scripts/Info.plist
 ICON_SRC   := assets/icons/gate_dock.svg
+# Raster source for the .icns fallback: a stock macOS/CI runner has no
+# rsvg-convert, but ships sips + iconutil, so the bundle icon is built from this
+# 256px PNG when rsvg is absent (see the `app` target).
+ICON_PNG   := assets/icons/openfortitray-256.png
+# Windows exe icon resource. Committed .ico (real asset, not a build artifact —
+# see .gitattributes `*.ico binary`); embedded into the exe via rsrc -ico below.
+WIN_ICO    := assets/icons/openfortitray.ico
 
 # VERSION stamps the .dmg filename. Locally it derives from git (a tag when on
 # one, else the short SHA); CI overrides it with the release tag
@@ -34,12 +41,15 @@ SYSO_ARM64 := $(PKG:./%=%)/resource_windows_arm64.syso
 
 all: build
 
-# winres compiles the app manifest into the windows amd64 + arm64 *.syso
-# resources. Safe (and a no-op for the output) on any host; the release/build
-# recipes below invoke it only when the host is actually building windows.
+# winres compiles the app manifest AND the .ico into the windows amd64 + arm64
+# *.syso resources, so the exe both runs elevated (manifest) and carries a real
+# application icon (-ico; previously the exe embedded only the manifest and
+# showed the generic file icon in Explorer/taskbar). Safe (and a no-op for the
+# output) on any host; the release/build recipes below invoke it only when the
+# host is actually building windows.
 winres:
-	go run $(RSRC) -manifest $(MANIFEST) -arch amd64 -o $(SYSO_AMD64)
-	go run $(RSRC) -manifest $(MANIFEST) -arch arm64 -o $(SYSO_ARM64)
+	go run $(RSRC) -manifest $(MANIFEST) -ico $(WIN_ICO) -arch amd64 -o $(SYSO_AMD64)
+	go run $(RSRC) -manifest $(MANIFEST) -ico $(WIN_ICO) -arch arm64 -o $(SYSO_ARM64)
 
 build:
 	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
@@ -115,9 +125,19 @@ endif
 		done; \
 		iconutil -c icns "$$iconset" -o "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"; \
 		rm -rf "$$work"; \
-		echo "make app: generated Contents/Resources/AppIcon.icns from $(ICON_SRC)"; \
+		echo "make app: generated Contents/Resources/AppIcon.icns from $(ICON_SRC) (rsvg)"; \
+	elif command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then \
+		set -e; \
+		work="$$(mktemp -d)"; iconset="$$work/AppIcon.iconset"; mkdir -p "$$iconset"; \
+		for sz in 16 32 128 256 512; do \
+			sips -z $$sz         $$sz         "$(ICON_PNG)" --out "$$iconset/icon_$${sz}x$${sz}.png" >/dev/null; \
+			sips -z $$((sz*2))   $$((sz*2))   "$(ICON_PNG)" --out "$$iconset/icon_$${sz}x$${sz}@2x.png" >/dev/null; \
+		done; \
+		iconutil -c icns "$$iconset" -o "$(APP_BUNDLE)/Contents/Resources/AppIcon.icns"; \
+		rm -rf "$$work"; \
+		echo "make app: generated Contents/Resources/AppIcon.icns from $(ICON_PNG) (sips)"; \
 	else \
-		echo "make app: iconutil/rsvg-convert not found — skipping .icns (not a blocker)"; \
+		echo "make app: iconutil/sips/rsvg-convert not found — skipping .icns (not a blocker)"; \
 	fi
 	@echo "make app: assembled $(APP_BUNDLE)"
 # Ad-hoc codesign LAST — the bundle is now fully assembled (binary, Info.plist,

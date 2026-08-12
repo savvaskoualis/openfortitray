@@ -74,6 +74,16 @@ The login task launches it elevated without a prompt. Open **Settings…** to se
 gateway. If `openconnect` is not on `PATH`, set `"openconnect_path"` to its full path in
 `%APPDATA%\openfortitray\config.json`.
 
+The Windows build bundles a software OpenGL renderer (Mesa's llvmpipe — `opengl32.dll` +
+`libgallium_wgl.dll`, installed beside the exe), so the tray works on VMs, RDP sessions,
+and other GPU-less Windows where there is no OpenGL driver (otherwise the app dies at
+launch with `WGL: driver does not support OpenGL`). Windows loads the app-directory
+`opengl32.dll` before the system one, so this affects only OpenFortiTray; the light UI
+renders fine in software. The `Setup.exe` installs both DLLs for you — if you download the
+bare `openfortitray-windows-amd64.exe` instead, also download `opengl32.dll` and
+`libgallium_wgl.dll` from the same release and keep all three in the same folder. Mesa is
+MIT-licensed; see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
+
 > **Before you connect (all platforms):** quit FortiClient — or any other client for this
 > gateway — and disable its login item. FortiGate allows only one SSL-VPN session per
 > user; two clients fight over the routes and it looks like a flaky network.
