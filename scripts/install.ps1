@@ -1,6 +1,6 @@
-# Installs OpenFortiTray on Windows: openconnect, the tray binary, and an elevated
-# logon task (which is also the app's elevation mechanism — openconnect needs
-# admin for the wintun adapter). Idempotent: /F recreates the task in place.
+# Installs OpenFortiTray on Windows: the bundled openconnect, the tray binary, and
+# an elevated logon task (which is also the app's elevation mechanism — openconnect
+# needs admin for the wintun adapter). Idempotent: /F recreates the task in place.
 #
 # Run from an elevated PowerShell, with openfortitray-windows-amd64.exe next to this
 # script (copy it from dist\ after `make release`, or download the release).
@@ -45,11 +45,25 @@ if (Test-Path $configFile) {
     Write-Host "wrote $configFile (gateway $gateway)"
 }
 
-# 2. openconnect (verify the package id with `winget search openconnect` if
-#    this fails; a manual install works too — then set "openconnect_path" in
-#    %APPDATA%\openfortitray\config.json to its full path).
-if (-not (Get-Command openconnect -ErrorAction SilentlyContinue)) {
-    winget install --accept-package-agreements --accept-source-agreements OpenConnect.OpenConnect
+# 2. Bundled openconnect. Windows has no reliable way to obtain openconnect
+#    (winget is a dead stub on locked-down Cloud PCs), so the release ships it —
+#    openconnect.exe, its full DLL closure, and wintun.dll — in an "openconnect"
+#    folder next to this script (CI collects it; the Setup.exe wizard is the
+#    turnkey path). Copy that folder next to the exe; the tray resolves
+#    <installDir>\openconnect\openconnect.exe at runtime when config still holds
+#    the bare "openconnect" default. If the folder is absent (you downloaded only
+#    the bare exe), install openconnect manually and set "openconnect_path" in
+#    %APPDATA%\openfortitray\config.json to its full path, or use the Setup.exe.
+$ocSource = Join-Path $PSScriptRoot "openconnect"
+$ocTarget = Join-Path $installDir "openconnect"
+if (Test-Path $ocSource) {
+    New-Item -ItemType Directory -Force -Path $ocTarget | Out-Null
+    Copy-Item (Join-Path $ocSource "*") $ocTarget -Recurse -Force
+    Write-Host "copied bundled openconnect from $ocSource"
+} elseif (-not (Get-Command openconnect -ErrorAction SilentlyContinue)) {
+    Write-Host "note: bundled 'openconnect' folder not found next to this script and openconnect is not on PATH."
+    Write-Host "      Use the Setup.exe installer (bundles openconnect), or install openconnect manually and set"
+    Write-Host "      'openconnect_path' in $configFile to its full path."
 }
 
 # 3. Tray binary.

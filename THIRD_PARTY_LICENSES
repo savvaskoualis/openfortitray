@@ -2,8 +2,8 @@ Third-party components redistributed with OpenFortiTray
 =======================================================
 
 OpenFortiTray itself is MIT-licensed (see LICENSE). The Windows build also
-redistributes the binary component below. Its license is reproduced here as
-required for redistribution.
+redistributes the binary components below. Their licenses are reproduced /
+referenced here as required for redistribution.
 
 
 Mesa 3D Graphics Library (llvmpipe software OpenGL)
@@ -44,3 +44,106 @@ Mesa is distributed under an MIT (Expat) style license:
 Individual Mesa components carry their own copyright notices held by the Mesa
 contributors; the full text and per-file notices are available in the Mesa
 source tree and distribution referenced above.
+
+
+OpenConnect VPN client and its dependency libraries
+----------------------------------------------------
+
+Shipped with the Windows build only, installed into `openconnect\` next to the
+executable ({app}\openconnect) as `openconnect.exe`, its full transitive DLL
+closure, and `wintun.dll`. Windows has no reliable way to obtain openconnect on
+a locked-down machine (winget is a non-functional stub on the target Cloud PCs),
+so it is redistributed here so the VPN tunnel works turnkey.
+
+  Component : OpenConnect VPN client (upstream https://www.infradead.org/openconnect/)
+  Source    : MSYS2 mingw-w64 package `mingw-w64-x86_64-openconnect`
+              (upstream openconnect 9.21, released 2026-06-16; the exact version
+              redistributed is whatever that MSYS2 package resolves to at build
+              time and is logged by the release workflow's
+              "Bundle openconnect + DLL closure + wintun" step —
+              `openconnect --version`).
+
+OpenConnect is licensed under the GNU Lesser General Public License, version 2.1
+(LGPL-2.1-or-later).
+
+The binaries were built by the MSYS2 project. openconnect.exe is accompanied by
+its full transitive DLL closure, collected in CI with `ntldd -R` (so a missing
+dependency fails the build, not the user). The bundled DLLs are MSYS2 mingw-w64
+builds of the upstream libraries below; the exact, definitive file list for a
+given release is the set of files present in the installed
+`{app}\openconnect` directory.
+
+  Library (DLL, name may vary by soname)   Upstream            License
+  ------------------------------------------------------------------------------
+  openconnect.exe / libopenconnect-5.dll   OpenConnect         LGPL-2.1-or-later
+  libgnutls-30.dll                         GnuTLS              LGPL-2.1-or-later
+  libnettle-8.dll                          Nettle              dual GPL-2.0-or-later / LGPL-3.0-or-later
+  libhogweed-6.dll                         Nettle (hogweed)    dual GPL-2.0-or-later / LGPL-3.0-or-later
+  libgmp-10.dll                            GNU MP (GMP)        dual LGPL-3.0-or-later / GPL-2.0-or-later
+  libtasn1-6.dll                           GNU Libtasn1        LGPL-2.1-or-later
+  libp11-kit-0.dll                         p11-kit             BSD-3-Clause (permissive)
+  libffi-8.dll                             libffi              MIT
+  libidn2-0.dll                            GNU libidn2         dual LGPL-3.0-or-later / GPL-2.0-or-later
+  libunistring-*.dll                       GNU libunistring    dual LGPL-3.0-or-later / GPL-2.0-or-later
+  libxml2-2.dll                            libxml2             MIT
+  zlib1.dll                                zlib                zlib license
+  libiconv-2.dll                           GNU libiconv        LGPL-2.1-or-later
+  libintl-8.dll                            GNU gettext runtime LGPL-2.1-or-later
+  libzstd.dll                              Zstandard           BSD-3-Clause
+  liblz4.dll                               LZ4                 BSD-2-Clause
+  libbrotlicommon.dll / dec / enc          Brotli              MIT
+  libgcc_s_seh-1.dll                       GCC runtime         GPL-3.0-or-later WITH GCC-exception-3.1
+  libwinpthread-1.dll                      mingw-w64 winpthreads  MIT / permissive (see MinGW-w64 licensing)
+
+  (zstd, lz4 and brotli appear only when the bundled GnuTLS / libxml2 builds link
+  them; the CI closure step ships exactly what openconnect.exe transitively loads.)
+
+WRITTEN OFFER FOR SOURCE (LGPL / GPL-with-exception components)
+---------------------------------------------------------------
+
+Several bundled libraries above are covered by the GNU LGPL (v2.1 or v3) or by
+the GCC Runtime Library Exception to GPLv3. In accordance with those licenses:
+
+  * The complete corresponding source code for each such component is available
+    from its upstream project and from the MSYS2 project, which built these
+    binaries: https://github.com/msys2/MINGW-packages (each package directory
+    records the exact upstream source URL and version used). Upstream sources:
+    OpenConnect https://www.infradead.org/openconnect/ ; GnuTLS, Nettle, GMP,
+    Libtasn1, libidn2, libunistring, libiconv, gettext https://www.gnu.org/ ;
+    p11-kit https://github.com/p11-glue/p11-kit ; libffi
+    https://github.com/libffi/libffi ; libxml2 https://gitlab.gnome.org/GNOME/libxml2 ;
+    zlib https://zlib.net/ ; zstd https://github.com/facebook/zstd ; lz4
+    https://github.com/lz4/lz4 ; Brotli https://github.com/google/brotli .
+
+  * As required by LGPL-2.1 §6 / LGPL-3 §4, these libraries are shipped as
+    separate, dynamically-loaded DLLs, so a recipient may modify a covered
+    library and relink it by replacing the corresponding DLL in the
+    `{app}\openconnect` directory with a compatible build of their own.
+
+  * For a physical copy of the corresponding source for any covered component,
+    or if the upstream links above are unavailable, open an issue at the
+    OpenFortiTray repository (https://github.com/savvaskoualis/openfortitray) and
+    the source for the exact redistributed version will be provided for no more
+    than the cost of distribution. This written offer is valid for any recipient
+    of this software and for at least three years from the date of receipt.
+
+
+Wintun (Layer 3 TUN driver for Windows)
+----------------------------------------
+
+Shipped with the Windows build only, as `wintun.dll` in the `openconnect\`
+directory beside openconnect.exe (openconnect loads it from its own directory to
+create the virtual VPN network adapter).
+
+  Component : Wintun
+  Version   : 0.14.1
+  Source    : Preferably the MSYS2 `mingw-w64-x86_64-wintun` package; otherwise
+              the official signed build https://www.wintun.net/builds/wintun-0.14.1.zip
+              (amd64 wintun.dll), pinned and sha256-verified in CI
+              (sha256 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51).
+
+Wintun's source code is licensed GPL-2.0; the precompiled, Microsoft-signed DLLs
+distributed in the official ZIP are released by WireGuard LLC under a more
+permissive "Prebuilt Binaries License" (redistribution of the unmodified signed
+binary is permitted), the text of which is included in that ZIP. Upstream:
+https://www.wintun.net/ and https://git.zx2c4.com/wintun/ .

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -239,5 +240,37 @@ func TestSelfHealWithoutAutostartReapsButDoesNotConnect(t *testing.T) {
 
 	if !slices.Equal(order, []string{"reap"}) {
 		t.Errorf("order = %v, want [reap] only: reap always runs, connect must not", order)
+	}
+}
+
+// The Windows build bundles openconnect at <exeDir>\openconnect\openconnect.exe.
+// resolveBundledOpenconnect (the OS-independent core of resolveOpenconnectPath)
+// must swap the bare "openconnect" default for that bundled binary only when it
+// exists, never override an explicit user path, and fall back to the configured
+// value when the bundle is absent. The exists func is injected so the three cases
+// are exercised on any host, not just Windows.
+func TestResolveBundledOpenconnect(t *testing.T) {
+	exeDir := filepath.FromSlash("/opt/openfortitray")
+	bundled := filepath.Join(exeDir, "openconnect", "openconnect.exe")
+	present := func(p string) bool { return p == bundled }
+	absent := func(string) bool { return false }
+	userPath := filepath.FromSlash("C:/tools/openconnect.exe")
+
+	tests := []struct {
+		name       string
+		configured string
+		exists     func(string) bool
+		want       string
+	}{
+		{"bare default + bundle present → bundled path", defaultOpenconnectName, present, bundled},
+		{"explicit user path → unchanged", userPath, present, userPath},
+		{"bare default + bundle absent → falls back to configured", defaultOpenconnectName, absent, defaultOpenconnectName},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveBundledOpenconnect(tc.configured, exeDir, tc.exists); got != tc.want {
+				t.Errorf("resolveBundledOpenconnect(%q, %q) = %q, want %q", tc.configured, exeDir, got, tc.want)
+			}
+		})
 	}
 }

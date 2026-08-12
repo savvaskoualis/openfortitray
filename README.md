@@ -67,12 +67,13 @@ StatusNotifierItem-capable tray and a working OpenGL stack.
 Download `OpenFortiTray-<version>-Setup.exe` from [Releases][rel] and run it. SmartScreen
 (unsigned) → **More info → Run anyway**; approve the UAC prompt. The wizard installs to
 `%ProgramFiles%\openfortitray`, adds a Start-menu entry and an elevated logon task, and
-installs `openconnect` via winget when present.
+bundles `openconnect` (with its DLLs and `wintun.dll`) in `%ProgramFiles%\openfortitray\openconnect`,
+so nothing else is needed — Windows has no reliable way to install openconnect otherwise.
 
 Every launch shows a UAC prompt — the app must be elevated to create the wintun adapter.
 The login task launches it elevated without a prompt. Open **Settings…** to set your
-gateway. If `openconnect` is not on `PATH`, set `"openconnect_path"` to its full path in
-`%APPDATA%\openfortitray\config.json`.
+gateway. The app uses the bundled `openconnect` automatically; to point it at a different
+build, set `"openconnect_path"` to its full path in `%APPDATA%\openfortitray\config.json`.
 
 The Windows build bundles a software OpenGL renderer (Mesa's llvmpipe — `opengl32.dll` +
 `libgallium_wgl.dll`, installed beside the exe), so the tray works on VMs, RDP sessions,

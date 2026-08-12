@@ -171,10 +171,57 @@ func (a *app) startTunnel() {
 	prof := *a.cfg.Active()
 	a.setSnapshot(tunnelParams{
 		prof:            prof,
-		openconnectPath: a.cfg.OpenconnectPath,
+		openconnectPath: resolveOpenconnectPath(a.cfg.OpenconnectPath),
 		helperPath:      a.cfg.HelperPath,
 	})
 	a.sup.Connect()
+}
+
+// defaultOpenconnectName is the bare, PATH-resolved value internal/config ships
+// as OpenconnectPath's default (config.defaults()). Only this exact value is
+// eligible for the Windows bundled-binary override below; any explicit user path
+// is left untouched.
+const defaultOpenconnectName = "openconnect"
+
+// resolveOpenconnectPath returns the openconnect binary the tunnel should run.
+//
+// Windows only: openconnect is bundled beside the tray exe (the installer and
+// install.ps1 place it at <exeDir>\openconnect\openconnect.exe) because there is
+// no reliable way to get openconnect onto a locked-down Cloud PC — winget is a
+// dead stub there and nothing is on PATH. When the configured path is still the
+// bare "openconnect" default (the user has not set an explicit path) and that
+// bundled binary exists, it is used so the install is turnkey. An explicit
+// user-set path, a missing bundle, an os.Executable() failure, or any non-Windows
+// OS all leave the configured value unchanged (macOS/Linux go through the
+// privileged helper, which resolves openconnect itself, so this must never fire
+// there). Derived from os.Executable() so it works wherever the app is installed;
+// no hardcoded Program Files path.
+func resolveOpenconnectPath(configured string) string {
+	if runtime.GOOS != "windows" {
+		return configured
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return configured
+	}
+	return resolveBundledOpenconnect(configured, filepath.Dir(exe), func(p string) bool {
+		info, statErr := os.Stat(p)
+		return statErr == nil && !info.IsDir()
+	})
+}
+
+// resolveBundledOpenconnect is the OS-independent core of resolveOpenconnectPath,
+// split out so it is unit-testable off Windows: exeDir is the directory of the
+// running executable and exists reports whether a regular file is present there.
+func resolveBundledOpenconnect(configured, exeDir string, exists func(string) bool) string {
+	if configured != defaultOpenconnectName {
+		return configured
+	}
+	bundled := filepath.Join(exeDir, "openconnect", "openconnect.exe")
+	if exists(bundled) {
+		return bundled
+	}
+	return configured
 }
 
 func (a *app) Disconnect()            { a.sup.Disconnect() }

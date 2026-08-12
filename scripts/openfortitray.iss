@@ -3,8 +3,10 @@
 ; Reproduces the outcomes of scripts/install.ps1 as a double-click wizard:
 ;   - copies the CI-built openfortitray-windows-amd64.exe to
 ;     %ProgramFiles%\openfortitray\openfortitray.exe,
-;   - installs openconnect via winget when winget is present and openconnect is
-;     not already on PATH (not bundled: licensing + size),
+;   - installs the bundled openconnect + its DLL closure + wintun.dll into
+;     {app}\openconnect (there is no reliable way to get openconnect onto a
+;     locked-down Cloud PC — winget is a dead stub there — so it is shipped, the
+;     same pattern used for Mesa; the app resolves this binary at runtime),
 ;   - creates the elevated ONLOGON scheduled task "OpenFortiTray"
 ;     (/RL HIGHEST) — the same task internal/autostart toggles from the tray and
 ;     the same command install.ps1 runs, so the task name stays byte-identical,
@@ -17,11 +19,15 @@
 ;   iscc /DMyAppVersion=1.2.3 scripts/openfortitray.iss
 ; The freshly built exe is expected at ..\dist\openfortitray-windows-amd64.exe
 ; relative to this script (override with /DMyAppExe=... if it lives elsewhere).
+; The bundled openconnect dir is expected at ..\dist\openconnect (override with
+; /DMyOcDir=...); CI's "Bundle openconnect + DLL closure + wintun" step fills it.
 ;
-; This installer also redistributes Mesa 3D (https://mesa3d.org/) — the
-; llvmpipe software OpenGL driver (opengl32.dll + libgallium_wgl.dll) — so the
-; tray renders on GPU-less Windows (VMs/RDP). Mesa is under an MIT-style
-; license; see THIRD_PARTY_LICENSES in the repository root for attribution.
+; This installer redistributes third-party binaries: Mesa 3D
+; (https://mesa3d.org/) — the llvmpipe software OpenGL driver (opengl32.dll +
+; libgallium_wgl.dll), MIT-style — so the tray renders on GPU-less Windows
+; (VMs/RDP); and openconnect (LGPL-2.1) with its dependency DLLs and Wintun. See
+; THIRD_PARTY_LICENSES in the repository root for full attribution and the LGPL
+; written-offer / relink notice.
 ;
 ; UNVERIFIED: authored on a non-Windows host and never run through ISCC or on a
 ; real Windows machine. Review by inspection only.
@@ -46,6 +52,13 @@
 ; /DMyMesaDir if they live elsewhere.
 #ifndef MyMesaDir
   #define MyMesaDir "..\dist"
+#endif
+
+; Directory holding the bundled openconnect binary, its full transitive DLL
+; closure, and wintun.dll. CI's "Bundle openconnect + DLL closure + wintun" step
+; collects them into dist/openconnect/ before ISCC runs. Override with /DMyOcDir.
+#ifndef MyOcDir
+  #define MyOcDir "..\dist\openconnect"
 #endif
 
 ; Where the finished OpenFortiTray-<version>-Setup.exe lands. Defaults to the
@@ -99,23 +112,21 @@ Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: i
 ; (Inno tracks [Files] it installs). Mesa is MIT-style — see THIRD_PARTY_LICENSES.
 Source: "{#MyMesaDir}\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyMesaDir}\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
+; installed into {app}\openconnect. The tray resolves this path at runtime
+; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config
+; still holds the bare "openconnect" default, so the tunnel works with no
+; openconnect on PATH. recursesubdirs is defensive (the dir is currently flat).
+; Tracked by Inno, so uninstall removes them. openconnect is LGPL-2.1 — see
+; THIRD_PARTY_LICENSES for the written-offer / relink notice.
+Source: "{#MyOcDir}\*"; DestDir: "{app}\openconnect"; Flags: recursesubdirs ignoreversion
 
 [Icons]
 ; Start-menu shortcut -> {autoprograms}\OpenFortiTray.lnk, same as install.ps1.
 Name: "{autoprograms}\OpenFortiTray"; Filename: "{app}\openfortitray.exe"; WorkingDir: "{app}"; Comment: "OpenFortiTray - FortiGate SSL-VPN tray client"
 
 [Run]
-; 1. openconnect via winget — only when winget is present AND openconnect is not
-;    already on PATH. Not bundled (licensing + size). If winget is absent the
-;    step is skipped (Check) and the README documents installing openconnect
-;    manually; the app still installs and runs, only the tunnel needs openconnect.
-Filename: "{cmd}"; \
-  Parameters: "/C winget install --accept-package-agreements --accept-source-agreements OpenConnect.OpenConnect"; \
-  StatusMsg: "Installing openconnect via winget..."; \
-  Flags: runhidden waituntilterminated; \
-  Check: ShouldInstallOpenConnect
-
-; 2. Elevated ONLOGON scheduled task. Byte-identical command to install.ps1:
+; Elevated ONLOGON scheduled task. Byte-identical command to install.ps1:
 ;    schtasks /Create /TN "OpenFortiTray" /SC ONLOGON /RL HIGHEST /TR "<quoted exe>" /F
 ;    The /TR value is wrapped in literal double quotes so Task Scheduler keeps
 ;    the path intact under Program Files at launch (see autostart_windows.go).
@@ -125,7 +136,7 @@ Filename: "{sys}\schtasks.exe"; \
   StatusMsg: "Registering the logon task..."; \
   Flags: runhidden waituntilterminated
 
-; 3. Optionally launch the app after install (skipped on silent installs).
+; Optionally launch the app after install (skipped on silent installs).
 ;    shellexec is REQUIRED: the exe ships a requireAdministrator manifest, and a
 ;    postinstall Run entry launches as the original (non-elevated) user via
 ;    CreateProcess, which cannot start an elevation-requiring exe (fails with
@@ -143,39 +154,3 @@ Filename: "{sys}\schtasks.exe"; \
   Parameters: "/Delete /TN ""OpenFortiTray"" /F"; \
   Flags: runhidden waituntilterminated; \
   RunOnceId: "DelOpenFortiTrayTask"
-
-[Code]
-{ Returns True when `where <exe>` finds the program on PATH. }
-function OnPath(Exe: String): Boolean;
-var
-  ResultCode: Integer;
-begin
-  Result := Exec(ExpandConstant('{cmd}'),
-                 '/C where ' + Exe + ' >nul 2>&1',
-                 '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-            and (ResultCode = 0);
-end;
-
-{ Install openconnect only if winget exists and openconnect is not already
-  present — mirrors install.ps1, which skips winget when openconnect resolves. }
-function ShouldInstallOpenConnect(): Boolean;
-begin
-  Result := OnPath('winget') and (not OnPath('openconnect'));
-end;
-
-{ After a non-silent install, if winget was unavailable, point the user at the
-  README so they know the tunnel needs openconnect installed separately. }
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-  begin
-    if (not WizardSilent) and (not OnPath('openconnect')) and (not OnPath('winget')) then
-      MsgBox('openconnect was not found and winget is unavailable to install it.'
-             + #13#10#13#10
-             + 'OpenFortiTray is installed, but the VPN tunnel needs openconnect. '
-             + 'Install it manually (see the README''s Windows section), then set '
-             + '"openconnect_path" in %APPDATA%\openfortitray\config.json if it is '
-             + 'not on PATH.',
-             mbInformation, MB_OK);
-  end;
-end;
