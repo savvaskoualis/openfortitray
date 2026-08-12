@@ -6,15 +6,26 @@ tags. Dates are the release date.
 
 ## [Unreleased]
 
-- Bundle a software OpenGL renderer (Mesa llvmpipe, pinned + sha256-verified in
-  CI) with the Windows build so the app runs on VMs, RDP sessions, and GPU-less
-  Windows where there is no OpenGL driver (previously: `WGL: driver does not
-  support OpenGL` at launch). Ships `opengl32.dll` + its `libgallium_wgl.dll`
-  backend beside the exe; installed by `Setup.exe` and `install.ps1`.
-- Tray icon shows a red badge when an update is available, in addition to the
-  "Update to … & Restart" menu item.
-- App icons: real `.icns` on the macOS bundle and an embedded `.ico` on the
+_Nothing yet._
+
+## [0.1.12] — 2026-08-12
+
+### Added
+- **Windows software OpenGL:** the Windows build bundles Mesa's llvmpipe renderer
+  (`opengl32.dll` + its `libgallium_wgl.dll` backend, pinned + sha256-verified in
+  CI) beside the exe, so the app runs on VMs, RDP sessions, and GPU-less Windows
+  where there is no OpenGL driver (previously died at launch with `WGL: driver
+  does not support OpenGL`). Installed by `Setup.exe` and `install.ps1`.
+- **Update UX:** the tray icon shows a red badge when an update is available, and
+  a popup dialog ("Update & Restart" / "Later") appears once per new version — on
+  top of the existing "Update to … & Restart" menu item.
+- **App icons:** a real `.icns` on the macOS bundle and an embedded `.ico` on the
   Windows exe (previously the generic file icon).
+
+### Fixed
+- The in-app updater now runs `brew update` before `brew upgrade` on macOS, so it
+  actually sees a new release in the custom tap instead of no-op'ing with "latest
+  already installed".
 
 ## [0.1.11] — 2026-08-12
 
