@@ -15,6 +15,9 @@ func TestBuildBrewScript(t *testing.T) {
 	if !strings.Contains(s, "kill -0 4321 ") {
 		t.Errorf("pid not a literal int in wait loop: %q", s)
 	}
+	if !strings.Contains(s, "'/opt/homebrew/bin/brew' update\n") {
+		t.Errorf("brew update (tap refresh) line missing: %q", s)
+	}
 	if !strings.Contains(s, "'/opt/homebrew/bin/brew' upgrade --cask openfortitray") {
 		t.Errorf("brew upgrade line wrong: %q", s)
 	}

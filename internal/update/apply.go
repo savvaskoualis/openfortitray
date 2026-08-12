@@ -67,11 +67,16 @@ func buildBrewScript(pid int, brewPath string) (string, error) {
 		return "", fmt.Errorf("update: refusing brew path containing a single quote: %q", brewPath)
 	}
 	// %d is an int (no injection); '%s' is the allowlisted, quote-free brew path.
+	// `brew update` FIRST: our cask lives in a custom tap (not Homebrew's central
+	// API), so brew's local tap clone can be stale and `upgrade` would no-op with
+	// "latest already installed" even when a newer release exists. Refresh the tap,
+	// then upgrade, then relaunch.
 	return fmt.Sprintf(
 		"while kill -0 %d 2>/dev/null; do sleep 0.3; done\n"+
+			"'%s' update\n"+
 			"'%s' upgrade --cask openfortitray\n"+
 			"open -a OpenFortiTray\n",
-		pid, brewPath), nil
+		pid, brewPath, brewPath), nil
 }
 
 // buildWindowsScript builds the PowerShell script the detached Windows updater
