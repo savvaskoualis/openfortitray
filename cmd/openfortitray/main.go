@@ -21,6 +21,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	fyneapp "fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/dialog"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -91,11 +92,17 @@ type app struct {
 	mu sync.Mutex
 	tp tunnelParams
 
-	// updateMu guards updateRel: the newest release the background checker found
-	// to be newer than this build, or nil until one is found. UpdateClicked reads
-	// it to decide between applying a pending update and kicking off a fresh check.
+	// updateMu guards updateRel and lastPromptedTag: the newest release the
+	// background checker found to be newer than this build, or nil until one is
+	// found. UpdateClicked reads updateRel to decide between applying a pending
+	// update and kicking off a fresh check.
 	updateMu  sync.Mutex
 	updateRel *update.Release
+	// lastPromptedTag is the release tag the update dialog was last shown for, so
+	// the 6-hourly re-check surfaces the popup only ONCE per distinct version (the
+	// badge + menu item update every check; the dialog does not nag). Guarded by
+	// updateMu; consulted via shouldPromptUpdate.
+	lastPromptedTag string
 }
 
 // tunnelParams is the subset of config the tunnel dials with, snapshotted so the
@@ -244,7 +251,10 @@ func (a *app) startUpdateChecker(ctx context.Context) {
 }
 
 // checkForUpdate runs one release check; if a newer version exists it records the
-// release and relabels the tray's update item on the UI goroutine.
+// release, badges the tray + relabels its update item, and — only ONCE per
+// distinct version — pops the update dialog. The badge/menu update on every check
+// (cheap, idempotent); the dialog shows once per new tag so the 6-hourly re-check
+// does not nag. All UI runs on the UI goroutine and honours the quitting gate.
 func (a *app) checkForUpdate(ctx context.Context) {
 	rel, err := updateChecker().Available(ctx, version)
 	if err != nil {
@@ -260,11 +270,59 @@ func (a *app) checkForUpdate(ctx context.Context) {
 	if a.quitting.Load() {
 		return
 	}
+	prompt := a.shouldPromptUpdate(rel.Tag)
 	fyne.Do(func() {
-		if a.tray != nil && !a.quitting.Load() {
+		if a.quitting.Load() {
+			return
+		}
+		if a.tray != nil {
 			a.tray.SetUpdateAvailable(rel.Tag)
 		}
+		if prompt {
+			a.promptUpdate(rel)
+		}
 	})
+}
+
+// shouldPromptUpdate reports whether the update dialog should be shown for tag,
+// recording it so the same version is never prompted twice. A new (distinct,
+// non-empty) tag prompts once; a repeat of the last-prompted tag, or an empty
+// tag, does not. It is a pure decision guarded by updateMu, unit-tested directly
+// (wiring a headless fyne dialog in a test is impractical, so the actual
+// dialog.Show lives in the thin promptUpdate wrapper).
+func (a *app) shouldPromptUpdate(tag string) bool {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	if tag == "" || tag == a.lastPromptedTag {
+		return false
+	}
+	a.lastPromptedTag = tag
+	return true
+}
+
+// promptUpdate shows the "Update available" confirm dialog on the UI goroutine,
+// parented on the hidden settings window (brought forward so the modal has a
+// visible parent, mirroring the first-run bootstrap dialogs). "Update & Restart"
+// runs the SAME applyUpdate path as the tray item; "Later" just dismisses, so the
+// badge + menu item remain for the user to act on. It is a thin wrapper: the
+// once-per-version decision lives in shouldPromptUpdate. Nil-checks a.win.
+func (a *app) promptUpdate(rel *update.Release) {
+	if a.win == nil {
+		return
+	}
+	a.win.Show()
+	a.win.RequestFocus()
+	d := dialog.NewConfirm("Update available",
+		fmt.Sprintf("OpenFortiTray %s is available.\nUpdate and restart now?", rel.Tag),
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			go a.applyUpdate(rel)
+		}, a.win)
+	d.SetConfirmText("Update & Restart")
+	d.SetDismissText("Later")
+	d.Show()
 }
 
 // UpdateClicked is the tray update item's action (UI goroutine). With a pending

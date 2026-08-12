@@ -99,6 +99,31 @@ func TestConnectWithGatewayStartsSupervisor(t *testing.T) {
 	}
 }
 
+// The update dialog must surface only ONCE per distinct version: the badge and
+// menu item update on every 6-hourly check (cheap), but re-prompting the same
+// version every 6h would nag. shouldPromptUpdate is the pure decision behind the
+// thin promptUpdate wrapper (a headless fyne dialog is impractical to drive in a
+// test); this pins its once-per-version contract.
+func TestShouldPromptUpdateOncePerVersion(t *testing.T) {
+	a := &app{}
+
+	if !a.shouldPromptUpdate("v1.0.0") {
+		t.Error("a newly-found version must prompt")
+	}
+	if a.shouldPromptUpdate("v1.0.0") {
+		t.Error("the same version must not prompt again (no 6-hourly nag)")
+	}
+	if !a.shouldPromptUpdate("v1.1.0") {
+		t.Error("a new distinct version must prompt again")
+	}
+	if a.shouldPromptUpdate("v1.1.0") {
+		t.Error("the now-current version must not re-prompt")
+	}
+	if a.shouldPromptUpdate("") {
+		t.Error("an empty tag must never prompt")
+	}
+}
+
 // fakeSupervisor records the teardown calls the graceful-shutdown path makes, so
 // tests can assert Disconnect+Wait ran once and were not double-run.
 type fakeSupervisor struct {

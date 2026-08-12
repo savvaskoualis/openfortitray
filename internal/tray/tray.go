@@ -52,6 +52,20 @@ type Controller struct {
 	updateItem     *fyne.MenuItem
 
 	resGray, resGreen, resYellow, resRed fyne.Resource
+	// Badged ("update available") variants of the four state icons, composed once
+	// at construction (see newController). resourceFor returns these instead of the
+	// plain resources once updateAvailable is set.
+	resGrayU, resGreenU, resYellowU, resRedU fyne.Resource
+
+	// updateAvailable, once set by SetUpdateAvailable, makes resourceFor return the
+	// badged variant of whatever state icon is current — so the red dot rides on
+	// top of the connection-state colour. It stays set for the process's life (the
+	// app updates/relaunches to clear it).
+	updateAvailable bool
+	// currentIcon is the base (unbadged) PNG of the icon Apply last rendered, so
+	// SetUpdateAvailable can re-apply the CURRENT state's icon with the badge. It
+	// starts as the gray/disconnected icon Setup installs.
+	currentIcon []byte
 }
 
 // Setup builds the tray menu on the given fyne app and installs it. It must run
@@ -95,6 +109,15 @@ func newController(app App) *Controller {
 		resGreen:  fyne.NewStaticResource("openfortitray_green.png", iconGreen),
 		resYellow: fyne.NewStaticResource("openfortitray_yellow.png", iconYellow),
 		resRed:    fyne.NewStaticResource("openfortitray_red.png", iconRed),
+		// Their "update available" variants — the same icons with a red dot
+		// composed on at runtime (badge.go). Built once here, like the plain ones.
+		resGrayU:   badgedResource("openfortitray_gray_update.png", iconGray),
+		resGreenU:  badgedResource("openfortitray_green_update.png", iconGreen),
+		resYellowU: badgedResource("openfortitray_yellow_update.png", iconYellow),
+		resRedU:    badgedResource("openfortitray_red_update.png", iconRed),
+		// Setup installs the gray/disconnected icon first, so that is what is
+		// current until Apply renders an event.
+		currentIcon: iconGray,
 	}
 
 	// A fixed, disabled header so the popover names the app. fyne's desktop tray
@@ -175,6 +198,7 @@ func (c *Controller) toggleAutostart() {
 // per-item setter, so the supported route is field mutation + (*Menu).Refresh.
 func (c *Controller) Apply(e tunnel.Event) {
 	v := viewFor(e)
+	c.currentIcon = v.icon
 	c.desk.SetSystemTrayIcon(c.resourceFor(v.icon))
 	c.statusItem.Label = v.title
 	// canConnect and its opposite are always exact opposites (see view).
@@ -184,24 +208,46 @@ func (c *Controller) Apply(e tunnel.Event) {
 }
 
 // SetUpdateAvailable relabels the update row to offer a one-click update to
-// `version` and restart. It must run on the UI goroutine (the caller marshals it
-// through fyne.Do); like Apply it mutates the item and refreshes the menu.
+// `version` and restart, and overlays the red "update available" dot on the
+// menu-bar icon. It sets updateAvailable so resourceFor badges every subsequent
+// icon too, then re-applies the CURRENT state's icon badged. It must run on the
+// UI goroutine (the caller marshals it through fyne.Do); like Apply it mutates
+// the item and refreshes the menu. desk is nil before Setup and in the wiring
+// tests, so the icon re-apply is guarded.
 func (c *Controller) SetUpdateAvailable(version string) {
 	c.updateItem.Label = "Update to " + version + " & Restart"
+	c.updateAvailable = true
+	if c.desk != nil {
+		c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
+	}
 	c.menu.Refresh()
 }
 
 // resourceFor maps a viewFor icon (raw PNG bytes, kept that way so viewFor stays
-// pure and unit-testable) to the pre-wrapped fyne resource.
+// pure and unit-testable) to the pre-wrapped fyne resource. Once an update is
+// available it returns the badged variant, so the red dot rides on top of
+// whatever connection-state colour is current.
 func (c *Controller) resourceFor(icon []byte) fyne.Resource {
 	switch {
 	case bytes.Equal(icon, iconGreen):
+		if c.updateAvailable {
+			return c.resGreenU
+		}
 		return c.resGreen
 	case bytes.Equal(icon, iconYellow):
+		if c.updateAvailable {
+			return c.resYellowU
+		}
 		return c.resYellow
 	case bytes.Equal(icon, iconRed):
+		if c.updateAvailable {
+			return c.resRedU
+		}
 		return c.resRed
 	default:
+		if c.updateAvailable {
+			return c.resGrayU
+		}
 		return c.resGray
 	}
 }

@@ -68,6 +68,57 @@ func TestUpdateItemWiresAndRelabels(t *testing.T) {
 	}
 }
 
+// Once an update is available the menu-bar icon must carry the red dot: for each
+// state icon, resourceFor returns a badged variant that is non-nil and not
+// byte-equal to the plain resource (a pixel-exact check is unnecessary). Before
+// SetUpdateAvailable it returns the plain resource unchanged.
+func TestUpdateBadgeOverlaysTrayIcon(t *testing.T) {
+	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
+
+	f := &fakeApp{}
+	c := newController(f)
+
+	for _, tc := range []struct {
+		name string
+		icon []byte
+	}{
+		{"gray", iconGray},
+		{"green", iconGreen},
+		{"yellow", iconYellow},
+		{"red", iconRed},
+	} {
+		if got := c.resourceFor(tc.icon); !bytes.Equal(got.Content(), tc.icon) {
+			t.Errorf("%s: before an update, resourceFor should return the plain icon", tc.name)
+		}
+	}
+
+	c.SetUpdateAvailable("v9")
+	if !c.updateAvailable {
+		t.Fatal("SetUpdateAvailable must set updateAvailable")
+	}
+
+	for _, tc := range []struct {
+		name string
+		icon []byte
+	}{
+		{"gray", iconGray},
+		{"green", iconGreen},
+		{"yellow", iconYellow},
+		{"red", iconRed},
+	} {
+		got := c.resourceFor(tc.icon)
+		if got == nil {
+			t.Fatalf("%s: badged resource is nil", tc.name)
+		}
+		if len(got.Content()) == 0 {
+			t.Errorf("%s: badged resource has no bytes", tc.name)
+		}
+		if bytes.Equal(got.Content(), tc.icon) {
+			t.Errorf("%s: badged resource is byte-equal to the plain icon; the red dot was not composed", tc.name)
+		}
+	}
+}
+
 func itemByLabel(m *fyne.Menu, label string) *fyne.MenuItem {
 	for _, it := range m.Items {
 		if it.Label == label {
