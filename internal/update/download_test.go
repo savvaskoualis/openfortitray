@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -99,13 +100,17 @@ func TestDownloadAndVerifyHappyPath(t *testing.T) {
 	if sha256Hex(got) != sha256Hex(payload) {
 		t.Errorf("digest of verified file does not line up")
 	}
-	// The file must be private (0600).
+	// The file must be private (0600) on POSIX. Windows has no POSIX mode bits —
+	// Go reports 0666 for any writable file there and privacy comes from the
+	// 0700 parent dir + the user-profile temp root — so skip the bit check.
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat verified file: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Errorf("file perm = %o, want 600", perm)
+	if runtime.GOOS != "windows" {
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("file perm = %o, want 600", perm)
+		}
 	}
 }
 

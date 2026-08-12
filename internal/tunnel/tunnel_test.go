@@ -633,7 +633,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 			})
 		},
 		wantState:  Error,
-		wantDetail: "scripts/install.sh", // the message has to say what fixes it
+		wantDetail: installHintFor(runtime.GOOS), // OS-aware: the detail must lead with the fix
 		wantRuns:   1,
 		terminal:   true,
 	}, {
