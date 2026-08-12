@@ -10,7 +10,13 @@ APP_BUNDLE := $(DIST)/$(APP).app
 APP_PLIST  := scripts/Info.plist
 ICON_SRC   := assets/icons/gate_dock.svg
 
-.PHONY: all build test release clean install app
+# VERSION stamps the .dmg filename. Locally it derives from git (a tag when on
+# one, else the short SHA); CI overrides it with the release tag
+# (make dmg VERSION=$GITHUB_REF_NAME). `?=` so the CI override wins.
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+DMG     := $(DIST)/$(APP)-$(VERSION).dmg
+
+.PHONY: all build test release clean install app dmg
 
 all: build
 
@@ -86,6 +92,54 @@ endif
 		echo "make app: iconutil/rsvg-convert not found — skipping .icns (not a blocker)"; \
 	fi
 	@echo "make app: assembled $(APP_BUNDLE)"
+
+# dmg wraps the .app in a double-click, drag-to-Applications disk image — the
+# primary macOS download. Depends on `app`, so the bundle is fresh. macOS only
+# (hdiutil/create-dmg are Darwin). Idempotent: the target rm's the image first.
+#
+# Two builders, both yielding a dmg with OpenFortiTray.app beside an
+# /Applications symlink:
+#   - create-dmg (the create-dmg/create-dmg Homebrew formula, `brew install
+#     create-dmg`) when present: adds the drop-link and lays out the window
+#     (icon positions, sizes) via Finder/AppleScript for the polished look.
+#   - hdiutil otherwise (and if create-dmg fails — it drives Finder over
+#     AppleScript, which has no GUI session on a CI runner and errors there):
+#     stage the .app + `ln -s /Applications`, then `hdiutil create ... UDZO`.
+#     Plainer window, identical drag-install behaviour. CI deliberately runs
+#     this path (it does not install create-dmg) for headless reliability.
+dmg: app
+ifneq ($(shell uname -s),Darwin)
+	@echo "make dmg: macOS only (this is $(shell uname -s)); skipping" && exit 1
+endif
+	rm -f "$(DMG)"
+	@stage="$$(mktemp -d)"; \
+	cp -R "$(APP_BUNDLE)" "$$stage/"; \
+	if command -v create-dmg >/dev/null 2>&1; then \
+		echo "make dmg: using create-dmg for a laid-out drag-install window"; \
+		if create-dmg \
+			--volname "$(APP)" \
+			--window-pos 200 120 \
+			--window-size 640 400 \
+			--icon-size 128 \
+			--icon "$(APP).app" 160 200 \
+			--app-drop-link 480 200 \
+			--no-internet-enable \
+			"$(DMG)" "$$stage"; then \
+			:; \
+		else \
+			echo "make dmg: create-dmg failed (likely no GUI session) — falling back to hdiutil"; \
+			rm -f "$(DMG)"; \
+			ln -s /Applications "$$stage/Applications"; \
+			hdiutil create -volname "$(APP)" -srcfolder "$$stage" -ov -format UDZO "$(DMG)"; \
+		fi; \
+	else \
+		echo "make dmg: create-dmg not found — using hdiutil (plain drag-install layout)"; \
+		ln -s /Applications "$$stage/Applications"; \
+		hdiutil create -volname "$(APP)" -srcfolder "$$stage" -ov -format UDZO "$(DMG)"; \
+	fi; \
+	rm -rf "$$stage"
+	@echo "make dmg: built $(DMG)"
+	@ls -l "$(DMG)"
 
 # Installs on this machine (macOS/Linux): openconnect, binary, privileged
 # helper, sudoers rule. Prompts for sudo.

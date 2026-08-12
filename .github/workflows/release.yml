@@ -7,7 +7,8 @@ name: Release
 # build on every OS, so the old "cross-build linux + windows from one ubuntu
 # host with CGO_ENABLED=0" model is dead. Each OS is now built on its own
 # native runner with CGO_ENABLED=1. macOS additionally ships a real .app
-# bundle (fyne menu-bar apps need one), zipped for release.
+# bundle (fyne menu-bar apps need one) inside a drag-to-/Applications .dmg,
+# the primary macOS download.
 on:
   push:
     tags:
@@ -30,7 +31,7 @@ jobs:
   # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
   # guard — it only serves pre-2020 Intel macs.
   build-darwin:
-    name: Build darwin (arm64 + amd64 + .app)
+    name: Build darwin (arm64 + amd64 + .dmg)
     runs-on: macos-14
     env:
       CGO_ENABLED: '1'
@@ -74,14 +75,18 @@ jobs:
           file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
 
       # A fyne menu-bar app needs a real .app bundle (Info.plist + LSUIElement)
-      # to host the status item reliably and stay off the Dock. `make app`
-      # rebuilds the host-arch (arm64) binary and assembles the bundle with the
-      # hand-rolled Info.plist + generated .icns. Then zip it, preserving the
-      # bundle directory, with ditto (the macOS-native, resource-fork-safe zip).
-      - name: Bundle and zip OpenFortiTray.app
+      # to host the status item reliably and stay off the Dock. `make dmg`
+      # depends on `make app` (which rebuilds the host-arch arm64 binary and
+      # assembles the bundle with the hand-rolled Info.plist + generated .icns),
+      # then wraps it in a double-click, drag-to-/Applications disk image — the
+      # primary macOS download, superseding the old OpenFortiTray.app.zip.
+      # VERSION stamps the filename to OpenFortiTray-<tag>.dmg. The runner is
+      # headless, so `make dmg` uses its hdiutil builder (create-dmg is not
+      # installed here): a valid, mountable UDZO image with the Applications
+      # symlink, just a plainer window than a create-dmg layout.
+      - name: Build OpenFortiTray.dmg
         run: |
-          make app
-          ditto -c -k --keepParent dist/OpenFortiTray.app dist/openfortitray-darwin-arm64.app.zip
+          make dmg VERSION="${GITHUB_REF_NAME}"
           ls -l dist
 
       # Checksums are computed HERE, on the runner that produced the bytes, so
@@ -95,7 +100,7 @@ jobs:
           shasum -a 256 \
             openfortitray-darwin-arm64 \
             openfortitray-darwin-amd64 \
-            openfortitray-darwin-arm64.app.zip > SHA256SUMS.darwin
+            "OpenFortiTray-${GITHUB_REF_NAME}.dmg" > SHA256SUMS.darwin
           cat SHA256SUMS.darwin
 
       - name: Upload darwin artifacts
@@ -105,7 +110,7 @@ jobs:
           path: |
             dist/openfortitray-darwin-arm64
             dist/openfortitray-darwin-amd64
-            dist/openfortitray-darwin-arm64.app.zip
+            dist/OpenFortiTray-${{ github.ref_name }}.dmg
             dist/SHA256SUMS.darwin
           if-no-files-found: error
           retention-days: 7
@@ -266,7 +271,7 @@ jobs:
         # upload-artifact does not preserve the exec bit. Done after
         # verification: chmod changes the mode, not the bytes, so ordering is
         # cosmetic, but verifying the artifacts exactly as received is clearer.
-        # The .app.zip (a bundle) and the .exe are left alone.
+        # The .dmg (a disk image) and the .exe are left alone.
         working-directory: dist
         run: chmod +x openfortitray-darwin-arm64 openfortitray-darwin-amd64 openfortitray-linux-amd64
 
@@ -284,9 +289,9 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             --verify-tag \
+            "dist/OpenFortiTray-${GITHUB_REF_NAME}.dmg" \
             dist/openfortitray-darwin-arm64 \
             dist/openfortitray-darwin-amd64 \
-            dist/openfortitray-darwin-arm64.app.zip \
             dist/openfortitray-linux-amd64 \
             dist/openfortitray-windows-amd64.exe \
             dist/SHA256SUMS

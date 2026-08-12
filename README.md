@@ -130,11 +130,38 @@ to `config.json`.
 Since the move to Fyne the binary is larger — roughly **25 MB** — because Fyne
 statically links the GL bindings, a font shaper and the default theme. On macOS the
 app ships as **`OpenFortiTray.app`**, a menu-bar (`LSUIElement`) bundle, not a bare
-executable.
+executable, delivered in a double-click **`.dmg`** you drag to `/Applications`.
 
 ## Install
 
-### macOS and Linux
+### macOS — the `.dmg` (primary download)
+
+The macOS release ships **`OpenFortiTray-<version>.dmg`**. Download it, double-click
+to mount, and **drag `OpenFortiTray.app` onto the `/Applications` alias** in the
+window. That is the whole app install.
+
+> **The `.dmg` installs the app only — not the privileged helper.** On macOS the
+> tunnel is brought up by a small root-owned helper reached through a scoped
+> `sudoers` rule (see [Privilege](#privilege)). The `.dmg` does not install that
+> helper or the rule, so **the first Connect will fail until the helper is in
+> place.** After dragging the app across, install the helper once from a checkout of
+> this repository:
+>
+> ```sh
+> OPENFORTITRAY_GATEWAY=vpn.example.com:10443 bash scripts/install.sh
+> ```
+>
+> Run as your normal user (it calls `sudo` itself). On a machine that already has
+> `/Applications/OpenFortiTray.app` from the `.dmg`, `scripts/install.sh` rebuilds
+> and reinstalls the same bundle and adds the helper + `sudoers` rule + a starter
+> `config.json` — so the drag-install and the script converge on the same state. If
+> you would rather not build from source at all, running `scripts/install.sh` (next
+> section) does the whole thing end to end and you can skip the `.dmg`.
+
+Because the release artifact is unsigned and un-notarized, macOS quarantines it — see
+[macOS Gatekeeper](#macos-gatekeeper) below to clear the attribute after the drag.
+
+### macOS and Linux — `scripts/install.sh` (helper + sudoers, all-in-one)
 
 From a checkout of this repository:
 
@@ -192,9 +219,9 @@ it stops before touching anything and prints both ways to reconcile them — pas
 
 #### macOS Gatekeeper
 
-Release artifacts (the binaries and `OpenFortiTray.app.zip`) are unsigned and
-un-notarized. Anything you download with a browser carries the quarantine attribute,
-and macOS will refuse to run it. Clear it:
+Release artifacts (the binaries and the `.dmg`) are unsigned and un-notarized.
+Anything you download with a browser carries the quarantine attribute, and macOS will
+refuse to run it. After dragging `OpenFortiTray.app` to `/Applications`, clear it:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/OpenFortiTray.app
@@ -529,6 +556,7 @@ make build     # go build -o openfortitray ./cmd/openfortitray
 make test      # go vet ./... && go test -race ./...
 make release   # cross-build the host's release binaries into dist/
 make app       # macOS only: assemble dist/OpenFortiTray.app
+make dmg       # macOS only: build dist/OpenFortiTray-<version>.dmg (drag-to-Applications)
 make install   # bash scripts/install.sh on this machine
 ```
 
@@ -558,9 +586,10 @@ See [`assets/README.md`](assets/README.md).
 ### Releasing
 
 Push a `v*` tag. `.github/workflows/release.yml` builds the matrix on native runners
-(`CGO_ENABLED=1` everywhere), verifies the darwin architectures, bundles and zips
-`OpenFortiTray.app`, generates `SHA256SUMS` on the runner that produced each artifact,
-verifies the round trip, and publishes a GitHub release with generated notes:
+(`CGO_ENABLED=1` everywhere), verifies the darwin architectures, packages
+`OpenFortiTray.app` into a drag-to-`/Applications` `.dmg`, generates `SHA256SUMS` on
+the runner that produced each artifact, verifies the round trip, and publishes a
+GitHub release with generated notes:
 
 ```sh
 git tag v0.1.0
@@ -569,7 +598,7 @@ git push origin v0.1.0
 
 The release carries the four binaries (`openfortitray-darwin-arm64`,
 `openfortitray-darwin-amd64`, `openfortitray-linux-amd64`,
-`openfortitray-windows-amd64.exe`), the macOS `openfortitray-darwin-arm64.app.zip`, and
+`openfortitray-windows-amd64.exe`), the macOS `OpenFortiTray-<version>.dmg`, and
 `SHA256SUMS`. Binaries carry no version stamp yet, and are neither signed nor notarized.
 
 ## Contributing
