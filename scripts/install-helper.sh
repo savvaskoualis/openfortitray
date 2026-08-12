@@ -15,7 +15,7 @@
 #
 # RUN IT AS ROOT — it IS the privileged step:
 #
-#   curl -fsSL https://raw.githubusercontent.com/savvaskoualis/openfortitray/v0.1.3/scripts/install-helper.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/savvaskoualis/openfortitray/v0.1.5/scripts/install-helper.sh | sudo bash
 #
 # `sudo` sets SUDO_USER to you; the sudoers rule is written for that user, never for
 # root (a rule naming root would grant the human nothing).
@@ -66,8 +66,8 @@ export PATH
 # THE RELEASE PROCESS MUST BUMP BOTH TOGETHER: cutting a new tag that changes the
 # helper without updating this hash makes every checkout-free install abort (which is
 # the safe failure), and updating the hash without the tag serves stale bytes.
-VERSION=v0.1.3
-EXPECTED_SHA256=1cdda4f6936090882cbf171d17e077106d8d5ef826f879ef294cc954dac2213f
+VERSION=v0.1.5
+EXPECTED_SHA256=a08c5e65a3627319182f67d22cb34aa53618fd77141d33400b2cce3f34e6b76c
 
 REF="${OPENFORTITRAY_REF:-$VERSION}"
 RAW_BASE=https://raw.githubusercontent.com/savvaskoualis/openfortitray
