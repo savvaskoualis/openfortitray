@@ -165,6 +165,13 @@ func (a *app) Disconnect()            { a.sup.Disconnect() }
 func (a *app) AutostartEnabled() bool { return autostart.IsEnabled() }
 func (a *app) LogPath() string        { return a.logPath }
 
+// version is stamped at build time via -ldflags "-X main.version=<tag>"
+// (Makefile / .github/workflows/release.yml). Unstamped local builds report "dev".
+var version = "dev"
+
+// Version returns the build version string shown in the tray header.
+func (a *app) Version() string { return version }
+
 // ShowSettings reveals the settings window (tray.App). It is built once at
 // startup; this only shows the existing, hidden window.
 func (a *app) ShowSettings() {

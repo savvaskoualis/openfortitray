@@ -21,6 +21,8 @@ type App interface {
 	SetAutostart(on bool) error
 	AutostartEnabled() bool
 	LogPath() string
+	// Version is the build version string, shown under the title row.
+	Version() string
 	// ShowSettings reveals (and focuses) the settings window. The window is built
 	// once at startup and hidden; this only shows the existing one.
 	ShowSettings()
@@ -98,6 +100,12 @@ func newController(app App) *Controller {
 	titleItem := fyne.NewMenuItem("OpenFortiTray", nil)
 	titleItem.Disabled = true
 
+	// The build version, shown as a second disabled row directly under the title.
+	// Verbatim: the string already carries the leading "v" for tagged builds, or
+	// "dev" for an unstamped local build.
+	versionItem := fyne.NewMenuItem(app.Version(), nil)
+	versionItem.Disabled = true
+
 	c.statusItem = fyne.NewMenuItem("Disconnected", nil)
 	c.statusItem.Disabled = true
 
@@ -121,6 +129,7 @@ func newController(app App) *Controller {
 
 	c.menu = fyne.NewMenu("OpenFortiTray",
 		titleItem,
+		versionItem,
 		fyne.NewMenuItemSeparator(),
 		c.statusItem,
 		fyne.NewMenuItemSeparator(),

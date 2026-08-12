@@ -30,6 +30,7 @@ func (f *fakeApp) Quit()                  { f.quits++ }
 func (f *fakeApp) ShowSettings()          { f.settings++ }
 func (f *fakeApp) AutostartEnabled() bool { return f.autostartOn }
 func (f *fakeApp) LogPath() string        { return "" }
+func (f *fakeApp) Version() string        { return "v9.9.9-test" }
 func (f *fakeApp) SetAutostart(on bool) error {
 	f.autostartSet = append(f.autostartSet, on)
 	if f.setAutostartE != nil {
@@ -95,8 +96,18 @@ func TestMenuActionsWireToApp(t *testing.T) {
 	if title.Label != "OpenFortiTray" || !title.Disabled || title.Action != nil {
 		t.Errorf("first item = %+v, want a disabled, action-less \"OpenFortiTray\" title", title)
 	}
-	if len(c.menu.Items) < 2 || !c.menu.Items[1].IsSeparator {
-		t.Error("title row must be followed by a separator, then the status line")
+	// The build-version row sits directly under the title: a disabled,
+	// action-less label showing App.Version() verbatim, before the first
+	// separator.
+	if len(c.menu.Items) < 2 {
+		t.Fatal("menu has no version row after the title")
+	}
+	ver := c.menu.Items[1]
+	if ver.Label != f.Version() || !ver.Disabled || ver.Action != nil {
+		t.Errorf("second item = %+v, want a disabled, action-less %q version row", ver, f.Version())
+	}
+	if len(c.menu.Items) < 3 || !c.menu.Items[2].IsSeparator {
+		t.Error("title and version rows must be followed by a separator, then the status line")
 	}
 
 	// The status item exists, is disabled, and carries no action (it is a label).

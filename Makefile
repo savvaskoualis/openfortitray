@@ -43,7 +43,7 @@ winres:
 
 build:
 	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
-	go build -o $(BIN) $(PKG)
+	go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
 
 test:
 	go vet ./...
@@ -53,6 +53,11 @@ test:
 # shaper and the default theme/font, so a release binary is ~15-30 MB heavier
 # than the old systray one; -s -w (strip symbol table + DWARF) claws some back.
 LDFLAGS_TRIM := -s -w
+
+# Stamp the build version into main.version (shown in the tray header). VERSION
+# is the same value that names the .dmg (defined above; git describe locally,
+# the tag in CI via `make ... VERSION=$GITHUB_REF_NAME`).
+LDFLAGS_VER := -X main.version=$(VERSION)
 
 # Build/CI reality since the fyne v2 migration: fyne renders via OpenGL/GLFW, so
 # cmd/openfortitray is a cgo build on EVERY OS. That kills the old pure
@@ -74,17 +79,17 @@ LDFLAGS_TRIM := -s -w
 release: clean
 	mkdir -p $(DIST)
 ifeq ($(shell uname -s),Darwin)
-	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
-	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
 	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
 	@file $(DIST)/$(BIN)-darwin-amd64 | grep -q 'x86_64'
 	@echo "make release: built darwin arm64 + amd64. linux/windows come from CI (native runners)."
 else ifeq ($(shell uname -s),Linux)
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
 else
 	$(MAKE) winres
-	CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+	CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
 	@echo "make release: built windows amd64 (manifest embedded, runs elevated). darwin/linux come from CI (native runners)."
 endif
 	@ls -l $(DIST)

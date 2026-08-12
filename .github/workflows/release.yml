@@ -57,19 +57,18 @@ jobs:
           xcode-select -p
           xcrun --sdk macosx --show-sdk-path
 
-      # NOTE: no -X main.version stamp — cmd/openfortitray declares no `version`
-      # var today. If one is added, append -X main.version=${GITHUB_REF_NAME}
-      # to the -ldflags below (merging with -s -w, and with -H=windowsgui on the
-      # windows job).
+      # The build version is stamped into main.version (shown in the tray header)
+      # via -X main.version=${GITHUB_REF_NAME}, merged into the -ldflags below
+      # (alongside -s -w, and -H=windowsgui on the windows job).
       - name: Build darwin binaries
         # -s -w strips the symbol table and DWARF to claw back some of fyne's
         # size (a fyne binary is ~15-30 MB heavier than the old systray one).
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -ldflags="-s -w" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -ldflags="-s -w" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
           ls -l dist
 
       - name: Verify architectures
@@ -150,7 +149,7 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-            go build -ldflags="-s -w" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
           ls -l dist
 
       - name: Checksum linux binary
@@ -232,7 +231,7 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOARCH=amd64 \
-            go build -ldflags="-s -w -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
+            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
           ls -l dist
 
       # Inno Setup is preinstalled on windows-latest (6.7.x); the build step below
