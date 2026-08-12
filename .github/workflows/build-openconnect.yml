@@ -247,10 +247,18 @@ jobs:
           ntldd -R staging/openconnect/openconnect.exe > ntldd.txt || true
           echo "== ntldd -R output =="
           cat ntldd.txt
-          grep -oE '/mingw64/bin/[A-Za-z0-9._+-]+\.dll' ntldd.txt \
+          # ntldd prints resolved paths in WINDOWS form, e.g.
+          #   libxml2-16.dll => D:\a\_temp\msys64\mingw64\bin\libxml2-16.dll (0x..)
+          # Take every resolved DLL under a mingw64\bin dir (skips the "not found"
+          # api-sets and C:\Windows\System32 system DLLs), strip the "=> " prefix and
+          # the trailing "(0x..)", normalise backslashes, cygpath to POSIX, and copy.
+          grep -iE '=>[[:space:]].*mingw64.bin.*\.dll' ntldd.txt \
+            | sed -E 's/.*=>[[:space:]]*//; s/[[:space:]]*\(0x[0-9a-fA-F]+\)[[:space:]]*$//' \
+            | tr '\\' '/' \
             | sort -u \
             | while read -r dll; do
-                cp -v "$dll" staging/openconnect/
+                p="$(cygpath -u "$dll" 2>/dev/null || echo "$dll")"
+                cp -v "$p" staging/openconnect/
               done
           rm -f ntldd.txt
           echo "== staged DLLs =="
