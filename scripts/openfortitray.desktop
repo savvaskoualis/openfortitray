@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenFortiTray
+Comment=FortiGate SSL-VPN tray client
+Exec=/usr/local/bin/openfortitray
+Icon=openfortitray
+Categories=Network;Security;
+Terminal=false
+StartupNotify=false
