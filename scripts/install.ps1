@@ -55,13 +55,31 @@ if (-not (Get-Command openconnect -ErrorAction SilentlyContinue)) {
 # 3. Tray binary.
 Copy-Item $exeSource $exeTarget -Force
 
-# 4. Elevated logon task. /RL HIGHEST runs the app elevated so openconnect
+# 4. Start Menu shortcut so the app shows up in Start search (the logon task
+#    launches it at login; without this it is nowhere in the Start menu). Written
+#    to the per-user Programs folder and overwritten each run so it stays current.
+#    IconLocation points at the exe itself: if the exe embeds an icon the shortcut
+#    shows it, otherwise Windows falls back to the generic exe icon — the shortcut
+#    still launches either way.
+$startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+$shortcutPath = Join-Path $startMenuDir "OpenFortiTray.lnk"
+New-Item -ItemType Directory -Force -Path $startMenuDir | Out-Null
+$wsh = New-Object -ComObject WScript.Shell
+$shortcut = $wsh.CreateShortcut($shortcutPath)
+$shortcut.TargetPath  = $exeTarget
+$shortcut.IconLocation = $exeTarget
+$shortcut.WorkingDirectory = $installDir
+$shortcut.Description = "OpenFortiTray - FortiGate SSL-VPN tray client"
+$shortcut.Save()
+Write-Host "wrote Start Menu shortcut $shortcutPath"
+
+# 5. Elevated logon task. /RL HIGHEST runs the app elevated so openconnect
 #    inherits admin; the quoted /TR value survives spaces in Program Files.
 #    Task name must stay "OpenFortiTray" — internal/autostart toggles this exact
 #    task from the tray checkbox.
 schtasks /Create /TN "OpenFortiTray" /SC ONLOGON /RL HIGHEST /TR "`"$exeTarget`"" /F | Out-Null
 
-# 5. Start now.
+# 6. Start now.
 Start-ScheduledTask -TaskName "OpenFortiTray"
 Write-Host "OpenFortiTray installed; tray icon should appear. First connect opens a browser SAML login."
 Write-Host "Quit FortiClient before connecting."

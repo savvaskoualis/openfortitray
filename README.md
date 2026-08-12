@@ -498,6 +498,8 @@ rm -rf ~/Library/Application\ Support/openfortitray
 
 ```sh
 rm -f ~/.config/autostart/openfortitray.desktop
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/openfortitray.desktop"
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/openfortitray.png"
 sudo rm -f /usr/local/bin/openfortitray /usr/local/libexec/openfortitray-tunnel /etc/sudoers.d/openfortitray
 rm -rf ~/.config/openfortitray
 ```
@@ -512,6 +514,7 @@ From an elevated PowerShell:
 
 ```powershell
 schtasks /Delete /TN "OpenFortiTray" /F
+Remove-Item -Force "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\OpenFortiTray.lnk"
 Remove-Item -Recurse -Force "$env:ProgramFiles\openfortitray"
 Remove-Item -Recurse -Force "$env:APPDATA\openfortitray"
 ```

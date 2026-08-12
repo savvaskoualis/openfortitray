@@ -500,6 +500,52 @@ install_binary() {
 	fi
 }
 
+# install_launcher installs the application-menu .desktop entry and its icon into
+# the user's XDG data dirs so OpenFortiTray is searchable and launchable from the
+# desktop's application menu. This is SEPARATE from the autostart .desktop that
+# internal/autostart writes to ~/.config/autostart (that one only makes the app
+# start at login). Linux only; on macOS the /Applications .app bundle already makes
+# it Spotlight-searchable. Files land in the user's home, so writes go through
+# as_principal to stay user-owned when the installer is run under sudo.
+install_launcher() {
+	local home data apps icons desktop_src icon_src desktop_target icon_target
+	home="$(principal_home)"
+	# XDG_DATA_HOME is honoured only when not root, for the same reason config_dir
+	# honours XDG_CONFIG_HOME only then: under sudo it would be root's, not the user's.
+	if [[ "$(id -u)" -ne 0 && -n "${XDG_DATA_HOME:-}" ]]; then
+		data="$XDG_DATA_HOME"
+	else
+		data="$home/.local/share"
+	fi
+	apps="$data/applications"
+	icons="$data/icons/hicolor/256x256/apps"
+	desktop_src="$REPO_DIR/scripts/openfortitray.desktop"
+	icon_src="$REPO_DIR/assets/icons/openfortitray-256.png"
+	desktop_target="$apps/openfortitray.desktop"
+	icon_target="$icons/openfortitray.png"
+
+	[[ -f "$desktop_src" ]] || die "launcher template missing: $desktop_src"
+	[[ -f "$icon_src" ]] || die "launcher icon missing: $icon_src"
+
+	as_principal mkdir -p "$apps" "$icons"
+	# The template's Exec is $BIN_TARGET (/usr/local/bin/openfortitray) — the same
+	# path install_binary places the tray at on Linux; keep the two in step.
+	as_principal cp "$desktop_src" "$desktop_target"
+	as_principal chmod 0644 "$desktop_target"
+	as_principal cp "$icon_src" "$icon_target"
+	as_principal chmod 0644 "$icon_target"
+	log "installed $desktop_target and $icon_target (application-menu entry)"
+
+	# Best-effort cache refreshes so the entry and icon appear without a re-login.
+	# Both tools are optional; a minimal or headless system may have neither.
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		as_principal update-desktop-database "$apps" >/dev/null 2>&1 || true
+	fi
+	if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+		as_principal gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
+	fi
+}
+
 # install_helper bakes the verified openconnect path into the installed copy. The
 # repo copy keeps the @OPENCONNECT@ placeholder and refuses to run, so a helper
 # that skipped this step cannot start a tunnel.
@@ -587,6 +633,9 @@ install_binary
 install_helper
 install_sudoers
 verify
+if [[ "$OS" == Linux ]]; then
+	install_launcher
+fi
 
 if [[ "$OS" == Darwin ]]; then
 	log "done. Launch the app with: open '$APP_TARGET'  (or from Launchpad)"
