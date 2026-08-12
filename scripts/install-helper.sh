@@ -276,8 +276,12 @@ sha256_hex() {
 # (placeholder-bearing) download at $DOWNLOADED.
 download_helper() {
 	command -v curl >/dev/null 2>&1 || die "curl is required to download the helper"
-	# REF is embedded in a URL; refuse anything with characters that could alter it.
+	# REF is embedded in a URL; refuse anything with characters that could alter it,
+	# and refuse a leading '/' or any '..' so a non-default ref can't redirect the raw
+	# URL outside the repo (e.g. '../other/repo/ref').
 	[[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "OPENFORTITRAY_REF contains unsafe characters: '$REF'"
+	[[ "$REF" != /* ]] || die "OPENFORTITRAY_REF must not start with '/': '$REF'"
+	[[ "$REF" != *..* ]] || die "OPENFORTITRAY_REF must not contain '..': '$REF'"
 
 	WORKDIR="$(mktemp -d)"
 	DOWNLOADED="$WORKDIR/openfortitray-tunnel"
@@ -372,21 +376,29 @@ verify() {
 	log "verified passwordless invocation of $HELPER_TARGET as $PRINCIPAL"
 }
 
-require_root
-resolve_principal
-# Path safety of the (possibly not-yet-existing) helper location, before anything is
-# downloaded or installed.
-check_chain "$HELPER_TARGET" abort || true
-ensure_openconnect
-resolve_openconnect
-download_helper
-install_helper
-install_sudoers
-verify
+# main wraps the whole invocation sequence in one function called on the LAST line, so
+# a partially-transferred `curl | sudo bash` cannot execute a truncated prefix of these
+# commands — bash does not start running until the closing brace and the final call
+# have both arrived. Standard hygiene for a piped installer.
+main() {
+	require_root
+	resolve_principal
+	# Path safety of the (possibly not-yet-existing) helper location, before anything
+	# is downloaded or installed.
+	check_chain "$HELPER_TARGET" abort || true
+	ensure_openconnect
+	resolve_openconnect
+	download_helper
+	install_helper
+	install_sudoers
+	verify
 
-log "done — the privileged helper and sudoers rule for '$PRINCIPAL' are in place."
-log "Next steps:"
-log "  1. Quit FortiClient if it is running — two clients must not share the tunnel."
-log "  2. Open OpenFortiTray (from /Applications on macOS, or launch the binary on Linux)."
-log "  3. Open Settings…, set your gateway (host:port), and click Connect."
-log "This installer did not touch the app or config.json; the gateway is set in the app."
+	log "done — the privileged helper and sudoers rule for '$PRINCIPAL' are in place."
+	log "Next steps:"
+	log "  1. Quit FortiClient if it is running — two clients must not share the tunnel."
+	log "  2. Open OpenFortiTray (from /Applications on macOS, or launch the binary on Linux)."
+	log "  3. Open Settings…, set your gateway (host:port), and click Connect."
+	log "This installer did not touch the app or config.json; the gateway is set in the app."
+}
+
+main "$@"
