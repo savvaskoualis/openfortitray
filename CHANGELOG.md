@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.19] — 2026-08-12
+
+### Added
+- **Windows bundles openconnect 9.12 + wintun + vpnc-script** inside `Setup.exe`.
+  openconnect is built from source once (`build-openconnect` workflow) into a
+  pinned, sha256-verified zip that the release just downloads — MSYS2 has no
+  openconnect package and winget is unavailable on locked-down Cloud PCs. The
+  tunnel backend now needs no separate install. See `THIRD_PARTY_LICENSES`.
+
 ## [0.1.18] — 2026-08-12
 
 ### Added

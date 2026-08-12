@@ -274,98 +274,36 @@ jobs:
           test -s dist/libgallium_wgl.dll
           ls -l dist/opengl32.dll dist/libgallium_wgl.dll
 
-      # Bundle openconnect + its FULL transitive DLL closure + wintun.dll next to
-      # the app so Windows is turnkey. There is no reliable way to obtain
-      # openconnect on a locked-down Cloud PC — winget is a dead stub there and no
-      # package lands on PATH — so we ship it, exactly as we ship Mesa. The app
-      # resolves this bundled binary at runtime (resolveOpenconnectPath).
-      #
-      # This step runs in the setup-msys2 MINGW64 shell (not Git Bash) so pacman
-      # and ntldd are available; /mingw64/bin is on PATH there, which is where the
-      # mingw-w64 openconnect package and all its runtime DLLs install.
-      #
-      # SUPPLY CHAIN / CLOSURE GUARD: openconnect won't launch if even ONE
-      # transitive DLL is missing, so we walk the dependency graph with `ntldd -R`
-      # (recursive), copy every resolved DLL that lives under /mingw64/bin into
-      # dist/openconnect/, and then self-check by running
-      # `dist/openconnect/openconnect.exe --version` with /mingw64/bin and the msys
-      # dirs STRIPPED from PATH — so the DLLs can only resolve from the exe's own
-      # directory (Windows searches the application directory first). If the
-      # closure is incomplete the exe fails to start and the build fails here,
-      # rather than shipping an openconnect that dies on the user's machine.
-      #
-      # MSYS2 is a rolling distro, so an exact pacman version pin is not possible
-      # the way Mesa's is; we install the current mingw-w64-x86_64-openconnect,
-      # LOG its exact version (recorded in the release notes / THIRD_PARTY_LICENSES
-      # at ship time), and fail hard on any of the guards below.
-      - name: Bundle openconnect + DLL closure + wintun
-        shell: 'msys2 {0}'
+      # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
+      # the app so Windows is turnkey. There is no reliable way to install
+      # openconnect on a locked-down Cloud PC (winget is a dead stub; MSYS2 has no
+      # openconnect package), so we BUILD it once from source
+      # (.github/workflows/build-openconnect.yml) and download the pinned,
+      # sha256-verified result here — same pattern as the Mesa bundle. The prebuilt
+      # zip was itself validated in the build workflow by a stripped-PATH
+      # `openconnect --version` self-check, so an incomplete DLL closure could never
+      # have been published. The app resolves this bundled binary at runtime
+      # (resolveOpenconnectPath). Re-run build-openconnect + re-pin below only to
+      # bump the openconnect/wintun version.
+      - name: Bundle openconnect (prebuilt, pinned + verified)
         env:
-          # Official Wintun, pinned + sha256-verified (fail on mismatch), used only
-          # if the MSYS2 wintun package is unavailable. Same discipline as Mesa.
-          WINTUN_VERSION: '0.14.1'
-          WINTUN_SHA256: '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          OC_BUNDLE_URL: 'https://github.com/savvaskoualis/openfortitray/releases/download/deps-openconnect-9.12/openconnect-win-amd64-9.12.zip'
+          OC_BUNDLE_SHA256: '147008a42e68dcfcf7a311340e1aabc71f5affe026c7996c25948fea5cb2c595'
         run: |
           set -euo pipefail
-
-          # openconnect + a recursive dependency walker. --needed skips reinstalls;
-          # ntldd resolves the full transitive DLL closure of a PE binary.
-          pacman -S --noconfirm --needed mingw-w64-x86_64-openconnect mingw-w64-x86_64-ntldd
-
-          echo "== installed openconnect package =="
-          pacman -Qi mingw-w64-x86_64-openconnect | grep -E '^(Name|Version)'
-          echo "== openconnect --version =="
-          /mingw64/bin/openconnect.exe --version || { echo "openconnect did not run under /mingw64/bin"; exit 1; }
-
-          mkdir -p dist/openconnect
-          cp /mingw64/bin/openconnect.exe dist/openconnect/
-
-          # Walk the transitive closure. `ntldd -R` prints lines like
-          #   libgnutls-30.dll => /mingw64/bin/libgnutls-30.dll (0x...)
-          # Take every resolved path under /mingw64/bin and copy it in. System DLLs
-          # (kernel32, etc.) resolve outside /mingw64/bin and are intentionally
-          # skipped — they are present on every Windows host.
-          ntldd -R /mingw64/bin/openconnect.exe > ntldd.txt
-          cat ntldd.txt
-          grep -oE '/mingw64/bin/[A-Za-z0-9._+-]+\.dll' ntldd.txt \
-            | sort -u \
-            | while read -r dll; do
-                cp -v "$dll" dist/openconnect/
-              done
-
-          # wintun.dll — openconnect's Windows tunnel driver. It is NOT part of the
-          # openconnect DLL closure (loaded at runtime from the exe's own dir), so
-          # collect it explicitly. Prefer the MSYS2 package; else fall back to the
-          # pinned, sha256-verified official download.
-          pacman -S --noconfirm --needed mingw-w64-x86_64-wintun || true
-          if [ -f /mingw64/bin/wintun.dll ]; then
-            echo "wintun.dll: using MSYS2 package"
-            cp -v /mingw64/bin/wintun.dll dist/openconnect/
-          else
-            echo "wintun.dll: MSYS2 package unavailable, downloading pinned ${WINTUN_VERSION}"
-            pacman -S --noconfirm --needed unzip
-            url="https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
-            curl -fsSL -o wintun.zip "$url"
-            echo "${WINTUN_SHA256}  wintun.zip" | sha256sum -c -
-            unzip -o wintun.zip -d wintun-extract
-            cp -v wintun-extract/wintun/bin/amd64/wintun.dll dist/openconnect/
-            rm -rf wintun.zip wintun-extract
-          fi
-
-          # Guards: the exe is present, we collected at least one DLL, wintun is
-          # present, and — the real closure check — the exe actually starts with
-          # ONLY its own directory available for DLL resolution.
+          curl -fsSL --retry 3 -o oc-bundle.zip "$OC_BUNDLE_URL"
+          echo "${OC_BUNDLE_SHA256}  oc-bundle.zip" | sha256sum -c -
+          mkdir -p dist
+          # The zip contains a top-level openconnect/ dir, so it extracts to
+          # dist/openconnect/ — exactly what openfortitray.iss installs into {app}.
+          unzip -o oc-bundle.zip -d dist
+          rm -f oc-bundle.zip
           test -s dist/openconnect/openconnect.exe
+          test -s dist/openconnect/libopenconnect-5.dll
           test -s dist/openconnect/wintun.dll
-          dll_count=$(ls dist/openconnect/*.dll | wc -l)
-          echo "collected $dll_count DLLs into dist/openconnect/"
-          [ "$dll_count" -gt 0 ]
-          echo "== closure self-check (PATH stripped of /mingw64/bin + msys dirs) =="
-          PATH="/c/Windows/System32:/c/Windows" \
-            ./dist/openconnect/openconnect.exe --version \
-            || { echo "BROKEN DLL CLOSURE: bundled openconnect.exe failed to start"; exit 1; }
-          rm -f ntldd.txt
-          ls -l dist/openconnect
+          test -s dist/openconnect/vpnc-script-win.js
+          echo "== bundled openconnect =="
+          ls -l dist/openconnect | head -50
 
       # Inno Setup is preinstalled on windows-latest (6.7.x); the build step below
       # calls ISCC.exe by its fixed install path. We deliberately do NOT
