@@ -239,7 +239,12 @@ jobs:
       - name: Collect transitive DLL closure (ntldd -R)
         run: |
           set -euxo pipefail
-          ntldd -R staging/openconnect/openconnect.exe > ntldd.txt
+          # ntldd -R exits non-zero when it lists Windows api-set virtual DLLs
+          # (ext-ms-win-*) as "not found" — those are not real files (the OS
+          # provides them) and resolve outside /mingw64/bin, so the grep below
+          # correctly ignores them. Capture the output regardless of exit code;
+          # the stripped-PATH --version self-check is the real completeness gate.
+          ntldd -R staging/openconnect/openconnect.exe > ntldd.txt || true
           echo "== ntldd -R output =="
           cat ntldd.txt
           grep -oE '/mingw64/bin/[A-Za-z0-9._+-]+\.dll' ntldd.txt \
