@@ -242,22 +242,29 @@ case "$EXPECTED_SHA" in
 esac
 [ -x "$OC" ] || die "$OC is not executable"
 
-# The helper text was written by the unprivileged app to $SRC. Verify it byte for
-# byte against the hash the signed app computed from its embedded copy before
-# trusting it as root: the embedded (signed) bytes, not the temp file, are the
-# source of truth.
+# The helper text was written by the unprivileged app to $SRC.
 [ -f "$SRC" ] || die "helper source $SRC is missing"
-actual=$(shasum -a 256 "$SRC" | awk '{print $1}')
-[ "$actual" = "$EXPECTED_SHA" ] || die "helper source hash mismatch (expected $EXPECTED_SHA, got $actual)"
 
 # Root-owned scratch dir so nothing we stage can be swapped between validation and
-# install.
+# install. Clean up this run's staging file too, in case we die after staging.
 RTMP=$(mktemp -d) || die "cannot create a temp dir"
-trap 'rm -rf "$RTMP"' EXIT
+trap 'rm -rf "$RTMP"; rm -f "$HELPER_DIR/.openfortitray-tunnel.tmp.$$"' EXIT
 
-# Bake the resolved openconnect path into the helper, replacing the single
-# placeholder line. A line-by-line copy (never sed) keeps path characters from
-# being reinterpreted; the count guard mirrors scripts/install-helper.sh.
+# Copy the user-written helper into the root-owned scratch dir ONCE, then both
+# verify and build from THAT copy. Re-opening the user-writable $SRC after hashing
+# would let the bytes we hashed differ from the bytes we install; hashing and
+# installing must read the identical, root-owned copy. Verify it byte for byte
+# against the hash the signed app computed from its embedded copy before trusting
+# it as root: the embedded (signed) bytes, not the temp file, are the source of
+# truth.
+cp "$SRC" "$RTMP/src" || die "cannot copy helper source"
+actual=$(shasum -a 256 "$RTMP/src" | awk '{print $1}')
+[ "$actual" = "$EXPECTED_SHA" ] || die "helper source hash mismatch (expected $EXPECTED_SHA, got $actual)"
+
+# Bake the resolved openconnect path into the (verified, root-owned) copy,
+# replacing the single placeholder line. A line-by-line copy (never sed) keeps
+# path characters from being reinterpreted; the count guard mirrors
+# scripts/install-helper.sh.
 subs=0
 while IFS= read -r line; do
   if [ "$line" = "OPENCONNECT='@OPENCONNECT@'" ]; then
@@ -266,7 +273,7 @@ while IFS= read -r line; do
   else
     printf '%s\n' "$line"
   fi
-done < "$SRC" > "$RTMP/built"
+done < "$RTMP/src" > "$RTMP/built"
 [ "$subs" -eq 1 ] || die "expected exactly one @OPENCONNECT@ placeholder, substituted $subs"
 sh -n "$RTMP/built" || die "generated helper is not valid shell"
 
@@ -280,19 +287,32 @@ check_path() {
   fi
 }
 
+# walk_up dies unless $1 and every directory above it are root-owned and not
+# writable by others: a helper reachable through a user-writable directory would
+# be passwordless root for whoever can write there.
+walk_up() {
+  _p="$1"
+  while :; do
+    _problem=$(check_path "$_p")
+    [ -z "$_problem" ] || die "$_problem; anything on a passwordless-root path must be root-owned and not writable by others (try: sudo chown root:wheel $HELPER_DIR && sudo chmod 755 $HELPER_DIR)"
+    [ "$_p" = "/" ] && break
+    _p=$(dirname "$_p")
+  done
+}
+
 install -d -o root -g wheel -m 0755 "$HELPER_DIR" || die "cannot create $HELPER_DIR"
 
-# Walk the install dir and every ancestor: a helper reachable through a
-# user-writable directory would be passwordless root for whoever can write there.
-p="$HELPER_DIR"
-while :; do
-  problem=$(check_path "$p")
-  [ -z "$problem" ] || die "$problem; anything on a passwordless-root path must be root-owned and not writable by others (try: sudo chown root:wheel $HELPER_DIR && sudo chmod 755 $HELPER_DIR)"
-  [ "$p" = "/" ] && break
-  p=$(dirname "$p")
-done
+# Walk the LITERAL ancestry and the fully symlink-resolved ancestry (pwd -P): a
+# root-owned symlink pointing into a user-writable directory would otherwise pass
+# the literal walk while redirecting the real install target. This matches the
+# double walk scripts/install-helper.sh does with readlink -f.
+walk_up "$HELPER_DIR"
+RESOLVED=$(cd "$HELPER_DIR" 2>/dev/null && pwd -P) || RESOLVED="$HELPER_DIR"
+[ "$RESOLVED" = "$HELPER_DIR" ] || walk_up "$RESOLVED"
 
-# Land the helper atomically: stage into the root-owned target dir, then rename.
+# Remove any stale staging file a previously crashed run left behind, then land
+# the helper atomically: stage into the root-owned target dir, then rename.
+rm -f "$HELPER_DIR"/.openfortitray-tunnel.tmp.* 2>/dev/null || true
 STAGED="$HELPER_DIR/.openfortitray-tunnel.tmp.$$"
 install -o root -g wheel -m 0755 "$RTMP/built" "$STAGED" || die "cannot stage the helper"
 mv -f "$STAGED" "$HELPER_TARGET" || { rm -f "$STAGED"; die "cannot install $HELPER_TARGET"; }
@@ -399,11 +419,14 @@ func installWith(ready func() bool, run func() error) error {
 	return run()
 }
 
-// isUserCancel recognises osascript's "user cancelled" reply (error -128) so a
-// dismissed password prompt is reported as ErrUserCancelled rather than a scary
-// failure.
+// isUserCancel recognises osascript's user-cancel reply so a dismissed password
+// prompt is reported as ErrUserCancelled rather than a scary failure. osascript
+// emits, on stderr, e.g.  "… execution error: User canceled. (-128)". Match that
+// specific signal — the parenthesised "(-128)" error form, or the literal
+// "User cancel(l)ed" text — NOT a bare "-128" substring, which could appear in an
+// unrelated failure's output.
 func isUserCancel(out string) bool {
-	if strings.Contains(out, "-128") {
+	if strings.Contains(out, "(-128)") {
 		return true
 	}
 	lower := strings.ToLower(out)

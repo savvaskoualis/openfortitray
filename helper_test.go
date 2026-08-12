@@ -241,6 +241,9 @@ func TestIsUserCancel(t *testing.T) {
 		{"User cancelled", true},
 		{"some other failure", false},
 		{"", false},
+		// A real failure whose text merely contains a bare "-128" must NOT be
+		// mistaken for a user cancel (M3): only the "(-128)" error form counts.
+		{"openconnect exited: checksum 9f-128 mismatch", false},
 	}
 	for _, tc := range tests {
 		if got := isUserCancel(tc.in); got != tc.want {
