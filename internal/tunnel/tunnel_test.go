@@ -182,8 +182,8 @@ func TestReconnectOnDrop(t *testing.T) {
 		}
 	}
 	e := c.waitFor(t, Reconnecting, 2*time.Second)
-	if e.Detail != "link dropped" {
-		t.Errorf("Reconnecting detail = %q, want the backend error text", e.Detail)
+	if e.Detail != "connection lost — reconnecting" {
+		t.Errorf("Reconnecting detail = %q, want the clean reconnecting text", e.Detail)
 	}
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
@@ -253,6 +253,43 @@ func TestAuthRejectedAfterHealthySessionReauthsImmediately(t *testing.T) {
 	c.waitFor(t, Connected, 2*time.Second)
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
+}
+
+// After a healthy session, if reconnect attempts keep getting rejected WITHOUT
+// coming back up (the one-per-user gateway handed our slot to another login), the
+// supervisor must STOP with a "session ended — click Connect" Error rather than
+// spin SAML (which pops the browser and, unattended, times out).
+func TestSessionTakenAfterHealthyStops(t *testing.T) {
+	events := make(chan Event, 128)
+	c := collect(events)
+	defer c.close()
+
+	var runs atomic.Int32
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		if runs.Add(1) == 1 {
+			connected("10.0.0.5")
+			time.Sleep(20 * time.Millisecond) // one healthy session...
+			return ErrAuthRejected            // ...then the slot is taken
+		}
+		return ErrAuthRejected // reconnects rejected without ever coming up
+	}
+	s := New(auth, run, events)
+	s.backoffBase, s.backoffMax, s.minHealthy = 5*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond
+	s.maxEarlyRetries = 0
+	s.Connect()
+	e := c.waitForDetail(t, Error, "session ended", 3*time.Second)
+	if !strings.Contains(e.Detail, "Connect") {
+		t.Errorf("session-ended detail should prompt Connect, got %q", e.Detail)
+	}
+	settled := runs.Load()
+	time.Sleep(120 * time.Millisecond) // a spinning supervisor would keep re-running
+	if got := runs.Load(); got != settled {
+		t.Errorf("supervisor kept re-running after session-ended (SAML spin): runs %d -> %d", settled, got)
+	}
+	// Terminal by design: the supervisor stays in the Error state (Connect
+	// clickable) rather than emitting Disconnected — exactly like ErrPermanent.
+	s.Disconnect() // must not panic on an already-stopped supervisor
 }
 
 // Connecting briefly and then being rejected must not buy a zero-delay re-auth:
@@ -643,7 +680,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 			return failingSudo(t, "sudo: a password is required")
 		},
 		wantState:  Error,
-		wantDetail: "a password is required",
+		wantDetail: "install is broken", // clean first-line hint; the sudo/openconnect specifics stay in the log
 		wantRuns:   1,
 		terminal:   true,
 	}, {
@@ -654,7 +691,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 				"which bakes in the openconnect path")
 		},
 		wantState:  Error,
-		wantDetail: "not installed",
+		wantDetail: "install is broken", // clean first-line hint; the diagnostic tail stays in the log
 		wantRuns:   1,
 		terminal:   true,
 	}, {
@@ -673,7 +710,7 @@ func TestPermanentFailureIsTerminalUnlessTheTunnelWorked(t *testing.T) {
 			}
 		},
 		wantState:  Reconnecting,
-		wantDetail: "a password is required",
+		wantDetail: "install is broken", // clean first-line hint; the sudo/openconnect specifics stay in the log
 		wantRuns:   2,
 		terminal:   false,
 	}}

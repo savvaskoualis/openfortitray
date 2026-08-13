@@ -205,6 +205,32 @@ func (s *Supervisor) finish(gen uint64) {
 // gateway that keeps rejecting cookies cannot spin the SAML flow.
 const maxImmediateReauths = 1
 
+// sessionEndedThreshold is how many auth-rejections AFTER a healthy session it
+// takes to conclude the session was ended elsewhere (this gateway is
+// one-session-per-user) rather than a benign expiry, and stop retrying so we do
+// not pop the SAML browser unattended.
+const sessionEndedThreshold = 3
+
+// friendlyDetail maps a supervisor error to a SHORT, human message for the tray —
+// never openconnect's multi-line route/stderr output or the helper's root-owner
+// warning (those stay in the log). An empty string means the state label alone
+// (e.g. "Reconnecting…") is enough.
+func friendlyDetail(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrAuthRejected):
+		return "" // transient; the Connecting/Reconnecting state says enough
+	case errors.Is(err, ErrPermanent):
+		// ErrPermanent leads with the install hint; keep only that first line and
+		// drop the "tunnel: " prefix + the diagnostic tail.
+		line := strings.SplitN(err.Error(), "\n", 2)[0]
+		return strings.TrimPrefix(line, "tunnel: ")
+	default:
+		return "connection lost — reconnecting"
+	}
+}
+
 func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struct{}) {
 	defer close(done) // runs last: the next loop waits for this
 	emittedError := false
@@ -246,6 +272,12 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
 	earlyRetries := 0 // quiet same-cookie retries used before the first bring-up
+	// postHealthyRejects counts consecutive auth-rejections AFTER the tunnel has
+	// been healthy this Connect. This gateway allows one SSL-VPN session per user,
+	// so when another device logs in it kills ours and our cookie starts getting
+	// rejected. A one-off is a benign expiry; a run of them means the session was
+	// taken elsewhere — surface that calmly and back off hard instead of fighting.
+	postHealthyRejects := 0
 	backoff := s.backoffBase
 	for {
 		if ctx.Err() != nil {
@@ -257,7 +289,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			if err != nil {
 				if ctx.Err() == nil {
 					emittedError = true
-					s.emit(gen, Error, "login failed: "+err.Error())
+					s.emit(gen, Error, "sign-in didn't complete — click Connect")
 				}
 				return
 			}
@@ -283,6 +315,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		if wasConnected {
 			everConnected = true
 			backoff = s.backoffBase
+			postHealthyRejects = 0 // a fresh healthy bring-up clears the session-taken tally
 			if time.Since(time.Unix(0, connectedAt.Load())) >= s.minHealthy {
 				proven = true // the cookie worked for a real session
 			}
@@ -302,7 +335,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		// would be worse than backing off and trying again.
 		if errors.Is(err, ErrPermanent) && !everConnected {
 			emittedError = true
-			s.emit(gen, Error, err.Error())
+			s.emit(gen, Error, friendlyDetail(err))
 			return
 		}
 
@@ -334,6 +367,19 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 				continue
 			}
 			cookie = ""
+			if everConnected {
+				postHealthyRejects++
+				if postHealthyRejects >= sessionEndedThreshold {
+					// A run of rejections after a healthy session: this one-per-user
+					// gateway almost certainly handed our slot to another login. Re-
+					// running SAML now would pop the browser and, unattended (e.g.
+					// overnight), just time out. Stop and leave Connect clickable so the
+					// user signs in again when they choose, instead of spinning.
+					emittedError = true
+					s.emit(gen, Error, "VPN session ended — click Connect to sign in")
+					return
+				}
+			}
 			if proven && immediateReauths < maxImmediateReauths {
 				// A cookie that once carried a healthy session has gone stale
 				// (e.g. server-side session kill): re-authenticate at once.
@@ -344,11 +390,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// that refuses fresh cookies cannot spin the SAML browser flow.
 		}
 
-		detail := ""
-		if err != nil {
-			detail = err.Error()
-		}
-		s.emit(gen, Reconnecting, detail)
+		s.emit(gen, Reconnecting, friendlyDetail(err))
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
