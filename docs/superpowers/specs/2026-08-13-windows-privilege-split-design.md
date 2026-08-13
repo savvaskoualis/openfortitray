@@ -111,10 +111,27 @@ a file written by another process.
   `Setup.exe` silently. An unelevated GUI cannot, so the update either goes through
   the runner or prompts for elevation once — to be decided before implementation.
 
-## Open questions for review
+## Review outcome
 
-1. Does the elevated-task path need to refuse to run when the request file's owner is
-   not the task's user, in case the machine gains other users later?
-2. Should the runner enforce a single concurrent tunnel by itself, rather than
-   trusting the GUI's single-instance mutex?
-3. Updater: route through the runner, or accept one UAC prompt per update?
+Reviewed in `2026-08-13-windows-privilege-split-review.md`. The approach stands;
+the design as written above does not, until six defects are fixed. Read the review
+before writing any code — it is a requirements document, not commentary. In short:
+
+- The runner's log/state/config directory must be **admin-owned**, or an elevated
+  write into a user-writable path is an arbitrary administrator file write.
+- The runner must pin its working directory (DLL search order).
+- The request file needs an owner check, delete-on-read, and a DPAPI-wrapped cookie.
+- Gateway must be rejected if it starts with `-`; flags matched as whole tokens;
+  `validateCookie` reused verbatim.
+- `stop` must verify the target's image path before terminating a recorded PID.
+- The existing `OpenFortiTray` logon task must be recreated with `/RL LIMITED`, or
+  `asInvoker` changes nothing (a child inherits its parent's elevated token).
+
+One item must be checked on real hardware *before* implementation, because failing
+it kills this approach: whether unelevated code can modify the tunnel task
+(`schtasks /Change`). And one risk is accepted and documented rather than fixed: an
+arbitrary gateway means route control.
+
+The three open questions are resolved there — owner check: yes, mandatory; single
+tunnel: enforced by the runner itself; updater: accept one UAC prompt, which
+`Setup.exe` raises via its own manifest anyway.
