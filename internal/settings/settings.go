@@ -55,6 +55,10 @@ type Controller struct {
 	banner      *fyne.Container
 	bannerLabel *widget.Label
 
+	// forms is every widget.Form the tabs are built from, so a theme or validation
+	// change can be pushed through all of them at once.
+	forms []*widget.Form
+
 	nameEntry     *widget.Entry
 	gatewayEntry  *widget.Entry
 	customPort    *widget.Check
@@ -63,9 +67,14 @@ type Controller struct {
 	authNote      *widget.Label
 	usernameEntry *widget.Entry
 	certPathEntry *widget.Entry
-	realmEntry    *widget.Entry
-	autoConnect   *widget.Check
-	keepAlive     *widget.Check
+	// The rows that appear and disappear with the chosen auth method, each in its
+	// own container so hiding one reclaims its space as well as its label (see row).
+	authNoteRow *fyne.Container
+	usernameRow *fyne.Container
+	certPathRow *fyne.Container
+	realmEntry  *widget.Entry
+	autoConnect *widget.Check
+	keepAlive   *widget.Check
 
 	// Advanced tab.
 	dualStack       *widget.Check
@@ -73,7 +82,7 @@ type Controller struct {
 	rememberSession *widget.Check
 	certMode        *widget.RadioGroup
 	certPin         *widget.Entry
-	certPinItem     *widget.FormItem
+	certPinRow      *fyne.Container
 	splitDNS        *widget.Entry
 	samlPortEntry   *widget.Entry
 	openconnectPath *widget.Entry
@@ -173,7 +182,7 @@ func (c *Controller) build() {
 	// The banner sits at the top; while hidden BorderLayout gives it no space.
 	content := container.NewBorder(c.banner, bottom, left, nil, c.tabs)
 	c.win.SetContent(content)
-	c.win.Resize(fyne.NewSize(680, 460))
+	c.win.Resize(fyne.NewSize(700, 520))
 	// The red close button hides the window; the app only ever exits via the
 	// tray's Quit item. Without this, closing the first-shown window would quit
 	// the whole app (fyne's master-window rule).
@@ -199,7 +208,7 @@ func (c *Controller) buildList() {
 	}
 }
 
-func (c *Controller) buildBasicTab() *widget.Form {
+func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	c.nameEntry = widget.NewEntry()
 	c.nameEntry.Validator = func(s string) error { return validateName(s, c.work.Profiles, c.sel) }
 	c.nameEntry.OnChanged = func(s string) {
@@ -274,6 +283,10 @@ func (c *Controller) buildBasicTab() *widget.Form {
 		c.work.Profiles[c.sel].Auth.CertPath = s
 	}
 
+	c.authNoteRow = c.row("", c.authNote)
+	c.usernameRow = c.row("Username", c.usernameEntry)
+	c.certPathRow = c.row("Certificate", c.certPathEntry)
+
 	c.realmEntry = widget.NewEntry()
 	c.realmEntry.OnChanged = func(s string) {
 		if c.loading {
@@ -300,20 +313,96 @@ func (c *Controller) buildBasicTab() *widget.Form {
 		c.work.Profiles[c.sel].KeepAlive = on
 	})
 
-	form := widget.NewForm(
-		widget.NewFormItem("Profile name", c.nameEntry),
-		widget.NewFormItem("Gateway host", c.gatewayEntry),
-		widget.NewFormItem("", c.customPort),
-		widget.NewFormItem("Port", c.portEntry),
-		widget.NewFormItem("Authentication", c.authSelect),
-		widget.NewFormItem("", c.authNote),
-		widget.NewFormItem("Username", c.usernameEntry),
-		widget.NewFormItem("Certificate", c.certPathEntry),
-		widget.NewFormItem("Realm", c.realmEntry),
-		widget.NewFormItem("", c.autoConnect),
-		widget.NewFormItem("", c.keepAlive),
+	// Same eleven fields, same order — grouped under captions instead of dumped in
+	// one column. The grouping is the whole change: a flat eleven-row form gives a
+	// reader no way to tell which fields belong together, and "Realm" next to
+	// "Auto-connect at login" implies a relationship that does not exist.
+	return sections(
+		c.section("Connection",
+			widget.NewFormItem("Profile name", c.nameEntry),
+			widget.NewFormItem("Gateway host", c.gatewayEntry),
+			widget.NewFormItem("", c.customPort),
+			widget.NewFormItem("Port", c.portEntry),
+		),
+		c.group("Authentication",
+			c.row("Method", c.authSelect),
+			// The three conditional rows sit outside that form, each in its own
+			// container, so the group closes up under SAML instead of leaving a hole.
+			c.authNoteRow,
+			c.usernameRow,
+			c.certPathRow,
+			c.row("Realm", c.realmEntry),
+		),
+		c.section("Startup",
+			widget.NewFormItem("", c.autoConnect),
+			widget.NewFormItem("", c.keepAlive),
+		),
 	)
-	return form
+}
+
+// section is one captioned group of form rows: an uppercase caption in the muted
+// foreground, then the rows.
+//
+// The caption is plain uppercase with no letter-spacing. fyne offers no tracking,
+// and the usual hack — inserting spaces between characters — breaks text selection
+// and reads the letters out individually to a screen reader, which is a real cost
+// for a cosmetic gain.
+func (c *Controller) section(caption string, items ...*widget.FormItem) fyne.CanvasObject {
+	form := widget.NewForm(items...)
+	c.forms = append(c.forms, form)
+	return c.group(caption, form)
+}
+
+// show reveals or hides one of those rows. A nil row is tolerated so the
+// build order does not have to be perfect.
+func show(row *fyne.Container, visible bool) {
+	if row == nil {
+		return
+	}
+	if visible {
+		row.Show()
+	} else {
+		row.Hide()
+	}
+	row.Refresh()
+}
+
+// group is a captioned stack of arbitrary objects, for the groups that mix a form
+// with rows that come and go (see row).
+func (c *Controller) group(caption string, objs ...fyne.CanvasObject) fyne.CanvasObject {
+	label := canvas.NewText(strings.ToUpper(caption), theme.Color(theme.ColorNamePlaceHolder))
+	label.TextSize = theme.Size(theme.SizeNameCaptionText)
+	label.TextStyle = fyne.TextStyle{Bold: true}
+	return container.NewVBox(append([]fyne.CanvasObject{label}, objs...)...)
+}
+
+// row builds a single form row inside its own container, so it can be hidden
+// COMPLETELY — label, widget and the vertical space they occupied.
+//
+// This is the only arrangement that works. Hiding a FormItem's widget leaves its
+// label drawn beside empty space; blanking item.Text as well removes the text but
+// fyne's form layout still reserves the row's height, so the Authentication group
+// kept a three-row hole under SAML — which is every real install. A hidden
+// container is skipped by the enclosing VBox entirely, which is what "hidden"
+// should have meant in the first place.
+func (c *Controller) row(label string, w fyne.CanvasObject) *fyne.Container {
+	form := widget.NewForm(widget.NewFormItem(label, w))
+	c.forms = append(c.forms, form)
+	return container.NewVBox(form)
+}
+
+// sections stacks captioned groups with a separator between them, inside a
+// scroller so a tab taller than the window stays reachable — the Advanced tab is,
+// on a small display.
+func sections(groups ...fyne.CanvasObject) fyne.CanvasObject {
+	objs := make([]fyne.CanvasObject, 0, len(groups)*2)
+	for i, g := range groups {
+		if i > 0 {
+			objs = append(objs, widget.NewSeparator())
+		}
+		objs = append(objs, g)
+	}
+	return container.NewVScroll(container.NewPadded(container.NewVBox(objs...)))
 }
 
 func (c *Controller) buildActionStrip() fyne.CanvasObject {
@@ -347,7 +436,9 @@ func (c *Controller) buildBanner() {
 	c.bannerLabel.Wrapping = fyne.TextWrapWord
 	c.bannerLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	bg := canvas.NewRectangle(color.NRGBA{R: 0xB8, G: 0x86, B: 0x0B, A: 0x33})
+	// The banner ground is the theme's warning colour at low alpha, so it tracks the
+	// OS light/dark setting instead of being an amber mixed for one of them.
+	bg := canvas.NewRectangle(withAlpha(theme.Color(theme.ColorNameWarning), 0x33))
 	icon := widget.NewIcon(theme.WarningIcon())
 	dismiss := widget.NewButtonWithIcon("", theme.CancelIcon(), c.hideBanner)
 	dismiss.Importance = widget.LowImportance
@@ -355,6 +446,13 @@ func (c *Controller) buildBanner() {
 	inner := container.NewBorder(nil, nil, icon, dismiss, container.NewPadded(c.bannerLabel))
 	c.banner = container.NewStack(bg, container.NewPadded(inner))
 	c.banner.Hide()
+}
+
+// withAlpha returns c at the given alpha, for the translucent washes (the banner
+// ground) that must still follow the theme's hue.
+func withAlpha(c color.Color, a uint8) color.Color {
+	r, g, b, _ := c.RGBA()
+	return color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: a}
 }
 
 // showBanner fills the banner with msg and reveals it.
@@ -510,16 +608,21 @@ func (c *Controller) updateAuthNote() {
 	switch method {
 	case config.AuthPassword:
 		c.authNote.SetText("(username/password auth not yet supported — use SAML/SSO)")
-		c.usernameEntry.Show()
-		c.certPathEntry.Hide()
+		show(c.authNoteRow, true)
+		show(c.usernameRow, true)
+		show(c.certPathRow, false)
 	case config.AuthCert:
 		c.authNote.SetText("(client-certificate auth not yet supported — use SAML/SSO)")
-		c.usernameEntry.Hide()
-		c.certPathEntry.Show()
+		show(c.authNoteRow, true)
+		show(c.usernameRow, false)
+		show(c.certPathRow, true)
 	default:
+		// SAML: no sub-field and no note, so the note row goes too rather than
+		// leaving an empty gap under the Method select.
 		c.authNote.SetText("")
-		c.usernameEntry.Hide()
-		c.certPathEntry.Hide()
+		show(c.authNoteRow, false)
+		show(c.usernameRow, false)
+		show(c.certPathRow, false)
 	}
 }
 
@@ -555,7 +658,7 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 		}
 		c.work.Profiles[c.sel].ServerCert.Pin = s
 	}
-	c.certPinItem = widget.NewFormItem("Fingerprint", c.certPin)
+	c.certPinRow = c.row("Fingerprint", c.certPin)
 
 	c.certMode = widget.NewRadioGroup(certModeLabels, func(label string) {
 		if c.loading {
@@ -615,22 +718,36 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 	rememberNote := widget.NewLabel("Skips the browser login while the session is valid; off never stores it.")
 	rememberNote.Wrapping = fyne.TextWrapWord
 
-	form := widget.NewForm(
-		widget.NewFormItem("", c.dualStack),
-		widget.NewFormItem("", c.dtls),
-		widget.NewFormItem("", c.rememberSession),
-		widget.NewFormItem("", rememberNote),
-		widget.NewFormItem("Server certificate", c.certMode),
-		c.certPinItem,
-		widget.NewFormItem("Split-DNS domains", c.splitDNS),
-		widget.NewFormItem("", splitDNSNote),
-		widget.NewFormItem("SAML redirect port", c.samlPortEntry),
-		widget.NewFormItem("openconnect binary", c.openconnectPath),
-		widget.NewFormItem("", openconnectNote),
-		widget.NewFormItem("Privileged helper", c.helperPath),
-		widget.NewFormItem("", helperNote),
+	// Same rows, same order, grouped. The Paths group last on purpose: it is where
+	// the two fields live that break the app if they are wrong, so it should not be
+	// the first thing a browsing user reaches for.
+	return sections(
+		c.section("Tunnel",
+			widget.NewFormItem("", c.dualStack),
+			widget.NewFormItem("", c.dtls),
+		),
+		c.section("Session",
+			widget.NewFormItem("", c.rememberSession),
+			widget.NewFormItem("", rememberNote),
+		),
+		c.group("Server certificate",
+			c.row("Verification", c.certMode),
+			// Its own container, so the group closes up when the certificate is not
+			// pinned rather than leaving a reserved empty row.
+			c.certPinRow,
+		),
+		c.section("DNS",
+			widget.NewFormItem("Split-DNS domains", c.splitDNS),
+			widget.NewFormItem("", splitDNSNote),
+		),
+		c.section("Paths",
+			widget.NewFormItem("SAML redirect port", c.samlPortEntry),
+			widget.NewFormItem("openconnect binary", c.openconnectPath),
+			widget.NewFormItem("", openconnectNote),
+			widget.NewFormItem("Privileged helper", c.helperPath),
+			widget.NewFormItem("", helperNote),
+		),
 	)
-	return container.NewVScroll(form)
 }
 
 // applyCertMode reveals the fingerprint entry only when the Pin mode is chosen.
@@ -638,11 +755,11 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 // its validator tolerates empty so a hidden field never blocks the form.
 func (c *Controller) applyCertMode(mode config.ServerCertMode) {
 	if mode == config.CertPin {
-		c.certPinItem.Widget.Show()
+		show(c.certPinRow, true)
 		c.certPin.Enable()
 	} else {
 		c.certPin.Disable()
-		c.certPinItem.Widget.Hide()
+		show(c.certPinRow, false)
 	}
 }
 
@@ -743,15 +860,20 @@ func cloneProfile(p *config.Profile) *config.Profile {
 
 // colorFor maps a status kind to a fixed colour readable on both light and dark
 // window backgrounds.
+// colorFor is the status strip's colour, taken from the theme's semantic tokens
+// rather than from literals as it used to be. Hardcoded hex could not follow the
+// OS light/dark setting — the old amber and red were mixed for a light background
+// and were the wrong contrast on a dark one — and it meant the status strip and
+// the status window's dot could disagree about what "connected" looks like.
 func colorFor(k statusKind) color.Color {
 	switch k {
 	case statusGreen:
-		return color.NRGBA{R: 0x2E, G: 0x7D, B: 0x32, A: 0xFF}
+		return theme.Color(theme.ColorNameSuccess)
 	case statusYellow:
-		return color.NRGBA{R: 0xB8, G: 0x86, B: 0x0B, A: 0xFF}
+		return theme.Color(theme.ColorNameWarning)
 	case statusRed:
-		return color.NRGBA{R: 0xC6, G: 0x28, B: 0x28, A: 0xFF}
+		return theme.Color(theme.ColorNameError)
 	default:
-		return color.NRGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xFF}
+		return theme.Color(theme.ColorNameDisabled)
 	}
 }

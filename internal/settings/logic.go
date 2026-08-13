@@ -18,6 +18,7 @@ import (
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uistate"
 
 	"fyne.io/fyne/v2/data/validation"
 )
@@ -33,45 +34,38 @@ const (
 	statusRed                      // Error (terminal)
 )
 
-// statusFor maps a tunnel event onto what the window's status strip shows. It
-// mirrors the tray's viewFor exactly: active reports whether the tunnel is up
-// enough that Disconnect (not Connect) should be enabled — true for the
-// connecting/connected states, false for Disconnected and the terminal Error
-// (where Connect must be clickable again). Kept pure — no widgets, no colour —
-// so it is table-tested alongside the tray's mapping.
+// statusFor maps a tunnel event onto what the window's status strip shows.
+// active reports whether the tunnel is up enough that Disconnect (not Connect)
+// should be enabled — true for the connecting/connected states, false for
+// Disconnected and the terminal Error (where Connect must be clickable again).
+//
+// It now delegates to internal/uistate rather than deciding anything itself. It
+// used to carry its own copy of the mapping, described in its own comment as
+// mirroring the tray's — and it had already drifted: it cut multi-line detail to
+// the first line but never applied the length cap, so a long openconnect error
+// stretched this strip while the tray truncated the same text. Three copies of
+// "what does Reconnecting say" is two too many. The signature and statusKind stay
+// so the table test above is unchanged, which is what proves the delegation
+// changed no outcome.
 func statusFor(e tunnel.Event) (text string, kind statusKind, active bool) {
-	switch e.State {
-	case tunnel.Connected:
-		text = "Connected"
-		if d := firstLine(e.Detail); d != "" {
-			text += " — " + d
-		}
-		return text, statusGreen, true
-	case tunnel.Authenticating, tunnel.Connecting, tunnel.Reconnecting:
-		text = e.State.String() + "…"
-		if d := firstLine(e.Detail); d != "" {
-			text = e.State.String() + " — " + d
-		}
-		return text, statusYellow, true
-	case tunnel.Error:
-		text = "Error"
-		if d := firstLine(e.Detail); d != "" {
-			text = "Error: " + d
-		}
-		return text, statusRed, false
-	default:
-		return "Disconnected", statusGray, false
-	}
+	v := uistate.ViewFor(e)
+	return v.MenuLabel, kindFor(v.Kind), !v.CanConnect
 }
 
-// firstLine reduces multi-line event detail (openconnect can wrap errors over
-// many lines) to its first non-empty-trimmed line, so the status strip stays a
-// single line.
-func firstLine(detail string) string {
-	if i := strings.IndexAny(detail, "\r\n"); i >= 0 {
-		detail = detail[:i]
+// kindFor translates the shared severity into this package's local one. The two
+// enums exist separately because statusKind predates uistate and is referenced by
+// the tests; it is a straight rename, not a second judgement.
+func kindFor(k uistate.Kind) statusKind {
+	switch k {
+	case uistate.KindOK:
+		return statusGreen
+	case uistate.KindBusy:
+		return statusYellow
+	case uistate.KindBad:
+		return statusRed
+	default:
+		return statusGray
 	}
-	return strings.TrimSpace(detail)
 }
 
 // defaultPort is the FortiGate SSL-VPN port a profile uses when "Use custom
