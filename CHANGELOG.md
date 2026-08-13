@@ -8,6 +8,21 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.31] — 2026-08-13
+
+### Fixed
+- **Windows: the same cookie truncation as 0.1.30.** Windows runs openconnect
+  directly instead of through the privileged helper, so the 0.1.30 fix did not
+  reach it. It now passes the cookie in a private file there too, so long cookies
+  survive.
+- **The connect status no longer blames your gateway.** It used to say "the VPN
+  allows one session per user" while retrying — a guess that later evidence
+  contradicted. It now says only what is known: "gateway refused the session —
+  retrying".
+- **macOS: the helper prompt says "Update" when a helper is already installed**,
+  and the log records why a connect is waiting on it, instead of the app appearing
+  to sit idle.
+
 ## [0.1.30] — 2026-08-13
 
 ### Fixed
