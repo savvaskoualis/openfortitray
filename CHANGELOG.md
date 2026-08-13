@@ -8,6 +8,18 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.23] — 2026-08-13
+
+### Fixed
+- **Connect is ~6s faster on networks that block the VPN's UDP port.** Timing the
+  handshake showed openconnect had the full tunnel config in 0.32s, then spent
+  5.0s waiting for a DTLS (UDP) handshake nothing would answer and re-ran the
+  config exchange over HTTPS — 6.7s to a usable tunnel, on every connect. The app
+  now notices when a gateway refuses DTLS, remembers it, and stops asking, so
+  later connects go straight over HTTPS. The record expires after a week, so a
+  network that starts allowing UDP gets DTLS back automatically. The `dtls`
+  profile toggle still overrides this.
+
 ## [0.1.22] — 2026-08-13
 
 ### Changed
