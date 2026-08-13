@@ -112,6 +112,17 @@ type app struct {
 	cookieDelete func(key string) error
 	samlAuth     func(ctx context.Context, prof config.Profile) (string, error)
 
+	// notify posts a desktop notification. It is the fyne app's
+	// SendNotification in production and a recorder in tests; nil means "no
+	// notifications" (the pump null-checks it). Only the pump goroutine calls
+	// it, via notifyFor, so no extra synchronisation is needed.
+	notify func(title, body string)
+	// lastNotified is the state the last notification described, so the pump
+	// notifies on TRANSITIONS only — the supervisor re-emits the same state on
+	// every retry round, and one toast per backoff tick is exactly the noise
+	// this is meant to avoid. Pump-goroutine-only; not part of the UI state.
+	lastNotified tunnel.State
+
 	// updateMu guards updateRel and lastPromptedTag: the newest release the
 	// background checker found to be newer than this build, or nil until one is
 	// found. UpdateClicked reads updateRel to decide between applying a pending
@@ -593,6 +604,10 @@ func (a *app) pump() {
 			continue
 		}
 		e := e
+		// Notify before the UI hop: notifyFor is pure bookkeeping plus one
+		// SendNotification, both safe off the UI goroutine, and doing it here
+		// keeps it out of the fyne.Do closure that a teardown can skip.
+		a.notifyFor(e)
 		fyne.Do(func() {
 			// Re-check inside the closure: the pre-check above is not atomic with
 			// fyne.Do, and once fyne has drained its queue fyne.Do runs the closure
@@ -618,6 +633,60 @@ func (a *app) pump() {
 			}
 		})
 	}
+}
+
+// notifyFor posts a desktop notification for the events a user actually wants
+// to be interrupted for, and only on a state TRANSITION.
+//
+// The menu-bar icon already carries the live state, so a notification is for
+// the moments the user is looking at another window:
+//
+//   - Connected — the tunnel came up (with the assigned IP, when we have one).
+//   - Reconnecting — an established tunnel dropped. Notified only when the
+//     previous notified state was Connected, so the retry rounds that follow
+//     (the supervisor re-emits Reconnecting on every backoff tick) stay silent,
+//     and a reconnect that never got connected in the first place never fires.
+//   - Error — terminal: the session was taken, sign-in didn't complete, or the
+//     install is broken. Always worth surfacing; Detail is already the short
+//     human text friendlyDetail produced (never raw openconnect stderr).
+//
+// Disconnected is deliberately silent: the user asked for it.
+func (a *app) notifyFor(e tunnel.Event) {
+	if a.notify == nil {
+		return
+	}
+	prev := a.lastNotified
+	if e.State == prev {
+		return
+	}
+	// Track every state we see, notified or not, so "was connected" is answered
+	// by the real previous state rather than the last state that made a sound.
+	a.lastNotified = e.State
+
+	var title, body string
+	switch e.State {
+	case tunnel.Connected:
+		title = "VPN connected"
+		body = "Tunnel is up."
+		if e.Detail != "" {
+			body = "Tunnel is up (" + e.Detail + ")."
+		}
+	case tunnel.Reconnecting:
+		if prev != tunnel.Connected {
+			return
+		}
+		title = "VPN dropped"
+		body = "Reconnecting…"
+	case tunnel.Error:
+		title = "VPN disconnected"
+		body = e.Detail
+		if body == "" {
+			body = "Connection failed — open openfortitray to retry."
+		}
+	default:
+		return
+	}
+	a.notify(title, body)
 }
 
 // Quit is invoked from the tray's Quit item on the UI goroutine. It routes to the
@@ -946,6 +1015,13 @@ func main() {
 	}
 	a.tray = ctrl
 	log.Print("tray: system tray menu installed")
+
+	// Desktop notifications for the transitions worth interrupting for (see
+	// notifyFor). Wired only now that the fyne app exists; before this the pump
+	// would have had nothing to send through, and a.notify == nil is a no-op.
+	a.notify = func(title, body string) {
+		a.fyneApp.SendNotification(fyne.NewNotification(title, body))
+	}
 
 	// Best-effort menu-bar tooltip. fyne has no tooltip API, so this reaches the
 	// systray singleton fyne drives. It must run after the tray is live: fyne
