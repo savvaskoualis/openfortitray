@@ -22,6 +22,12 @@ _Nothing yet._
 - **macOS: the helper prompt says "Update" when a helper is already installed**,
   and the log records why a connect is waiting on it, instead of the app appearing
   to sit idle.
+- **A stale saved session no longer blocks connecting for ~100 seconds.** 0.1.28
+  made the retries re-send the same cookie to stop a browser tab opening per
+  attempt; with the truncation above fixed, a refused cookie really is stale and
+  only a fresh login recovers, so re-sending it just stalled the connect. A refused
+  cookie is now replaced immediately, and a connect that cannot succeed stops after
+  a few minutes with "couldn't connect — click Connect to try again".
 
 ## [0.1.30] — 2026-08-13
 
