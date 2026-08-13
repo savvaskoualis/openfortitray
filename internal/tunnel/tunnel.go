@@ -101,13 +101,6 @@ type Supervisor struct {
 	// retried forever, and because each round re-minted the cookie, it opened a
 	// browser tab per round — indefinitely. Exposed for tests.
 	maxConnectRounds int
-	// remintEveryRounds is how many refused backoff rounds pass before the cookie
-	// is thrown away and SAML re-run. Re-minting is the only thing that opens a
-	// browser, and when a gateway refuses because it still holds a previous session
-	// it refuses FRESH cookies too (measured: five distinct cookies refused over
-	// 3.5 minutes), so a new cookie every round buys nothing but tabs. Retrying the
-	// cookie we have is silent and costs one ~0.3s attempt. Exposed for tests.
-	remintEveryRounds int
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -129,19 +122,18 @@ func New(authFn func(ctx context.Context) (string, error),
 		// then the WaitDelay backstop = 2*10s+12s = 32s), with margin, and no more:
 		// past that point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
-		// A FortiGate that still holds a previous session refuses cookies until it
-		// releases it. Measured over 25 reconnects on a real gateway, that took a
-		// median of 25s and 90% of the time under ~75s (worst seen: 4.5 minutes). So
-		// retry at a STEADY 5s for ~100s — same cookie, no browser, no backoff. A
-		// backoff here is actively wrong: it makes us miss the moment the gateway
-		// frees up and sit out a 30s or 60s wait for nothing.
-		earlyRetryDelay: 5 * time.Second,
-		maxEarlyRetries: 20,
-		// ~8 rounds of a 15s..2min backoff spans several minutes, which covers the
-		// worst observed wait for this gateway to release a session, and then stops
-		// instead of retrying (and re-authenticating) forever.
-		maxConnectRounds:  8,
-		remintEveryRounds: 4,
+		// A rejected cookie at startup is nearly always a stored one whose session has
+		// ended, so re-mint promptly — a couple of tries, seconds apart, is enough to
+		// cover that and a gateway that is briefly still releasing a previous session.
+		// The re-auth is seamless (the IdP session is cached), and bounding it keeps
+		// the browser from being opened more than a couple of times before the app
+		// gives up and says so.
+		earlyRetryDelay: 4 * time.Second,
+		maxEarlyRetries: 3,
+		// Four rounds of a 15s..2min backoff is a few minutes. If four fresh logins
+		// spread over that cannot get in, something needs a human — so stop and say so
+		// rather than reopening the browser indefinitely.
+		maxConnectRounds: 4,
 	}
 }
 
@@ -299,10 +291,8 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	// rejected. A one-off is a benign expiry; a run of them means the session was
 	// taken elsewhere — surface that calmly and back off hard instead of fighting.
 	postHealthyRejects := 0
-	// rejectRounds counts refused rounds since the last mint (gates the periodic
-	// re-mint); connectRounds counts backoff rounds taken without ever coming up
-	// (gates the terminal give-up).
-	rejectRounds := 0
+	// connectRounds counts backoff rounds taken without ever coming up, and gates
+	// the terminal give-up.
 	connectRounds := 0
 	// connectingDetail explains a connect that is taking a while, because a bare
 	// "Connecting…" sitting there for a minute reads as stuck.
@@ -398,15 +388,19 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// rejection takes the proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
-				connectingDetail = "gateway refused the session — retrying"
-				// KEEP the cookie. These early retries used to re-mint, which meant a
-				// SAML login — and a browser tab — every 4 seconds: three tabs before a
-				// connect succeeded, which is what users saw. Re-minting cannot help
-				// here anyway: when the gateway refuses because it still holds a previous
-				// session it refuses freshly minted cookies just as readily (measured:
-				// five distinct cookies refused across 3.5 minutes). Only time helps, so
-				// retry the cookie we have, silently. A cookie that really is dead is
-				// covered by the periodic re-mint on the backoff rounds below.
+				connectingDetail = "gateway refused the session — signing in again"
+				// Re-mint: a rejected cookie is dead, so get a new one.
+				//
+				// This was briefly changed to retry the same cookie instead, to stop a
+				// browser tab opening per retry. That was treating a symptom of the real
+				// bug: the cookie was being TRUNCATED before it reached the gateway (see
+				// the helper's cmd_start), so even brand-new cookies were refused and
+				// re-minting looked useless. With the truncation fixed a rejection means
+				// what it says — the cookie is stale, most often one restored from storage
+				// after its session ended — and only a fresh login recovers. Retrying the
+				// dead one instead left the app looping for a minute and a half on a
+				// cookie that could never work.
+				cookie = ""
 				select {
 				case <-time.After(s.earlyRetryDelay):
 				case <-ctx.Done():
@@ -414,22 +408,14 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 				}
 				continue
 			}
-			if !everConnected {
-				// Never came up yet: KEEP the cookie between backoff rounds unless a
-				// re-mint is due. A gateway refusing because it still holds a previous
-				// session refuses fresh cookies just as readily, so minting one per round
-				// only opens a browser tab per round — what users saw as "tabs keep
-				// opening". Retrying the cookie we have is silent and costs one ~0.3s
-				// attempt; the periodic re-mint still covers a cookie that really expired.
-				rejectRounds++
-				if rejectRounds%s.remintEveryRounds == 0 {
-					cookie = ""
-				}
-			} else {
-				// After a healthy session a rejection means the session was killed
-				// server-side, so the cookie is genuinely dead and a fresh one is the only
-				// way back: re-mint at once, as before.
-				cookie = ""
+			// A rejected cookie is dead, in every case: before the first bring-up it is
+			// usually one restored from storage after its session ended, and after a
+			// healthy session it means the session was killed server-side. Either way
+			// only a fresh login recovers, so always replace it. What bounds the cost —
+			// each login may open a browser — is maxConnectRounds below, not withholding
+			// the re-mint.
+			cookie = ""
+			if everConnected {
 				postHealthyRejects++
 				if postHealthyRejects >= sessionEndedThreshold {
 					// A run of rejections after a healthy session: this one-per-user

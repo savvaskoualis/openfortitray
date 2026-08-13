@@ -208,12 +208,8 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 	s := New(auth, run, events)
 	s.backoffBase = 20 * time.Millisecond
 	// This test pins the clear-cookie + re-auth fallback itself, so disable the
-	// quiet startup re-mints (TestQuietEarlyRetry* covers those) and ask for a
-	// re-mint on every refused round rather than the periodic default — the
-	// periodic default exists to avoid a browser tab per round and is covered by
-	// TestRefusedRoundsDoNotRemintEveryTime.
+	// quiet startup re-mints; TestQuietEarlyRetry* covers those.
 	s.maxEarlyRetries = 0
-	s.remintEveryRounds = 1
 	s.Connect()
 	c.waitFor(t, Connected, 3*time.Second)
 	if n := authCalls.Load(); n < 2 {
@@ -376,12 +372,11 @@ func TestFreshCookieRejectedBacksOff(t *testing.T) {
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
 
-// A cookie refused before the tunnel has ever come up must be RETRIED, not
-// re-minted: the gateway refuses because it still holds a previous session, and
-// it refuses freshly minted cookies just as readily. Re-minting means a SAML
-// login, which means a browser tab — three of them per connect before this was
-// fixed. The retries must be silent and the tray must stay on Connecting…
-func TestQuietEarlyRetryKeepsCookieAndStaysConnecting(t *testing.T) {
+// A cookie refused before the tunnel has ever come up is dead — nearly always one
+// restored from storage after its session ended — so the supervisor must get a
+// FRESH one, quietly, and recover once the gateway accepts it. The tray stays on
+// Connecting… throughout; no Reconnecting/Error flash.
+func TestQuietEarlyRetryRemintsAndStaysConnecting(t *testing.T) {
 	events := make(chan Event, 64)
 	c := collect(events)
 	defer c.close()
@@ -392,37 +387,29 @@ func TestQuietEarlyRetryKeepsCookieAndStaysConnecting(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var cookiesSeen []string
-	var runs atomic.Int32
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
 		mu.Lock()
 		cookiesSeen = append(cookiesSeen, cookie)
+		n := len(cookiesSeen)
 		mu.Unlock()
-		if runs.Add(1) <= 2 {
-			return ErrAuthRejected // gateway still holds the previous session
+		if n == 1 {
+			return ErrAuthRejected // the stored cookie is dead
 		}
-		connected("10.0.0.5") // it lets us in once the session is released
+		connected("10.0.0.5") // the fresh one works
 		<-ctx.Done()
 		return ctx.Err()
 	}
 	s := New(auth, run, events)
 	s.earlyRetryDelay = 10 * time.Millisecond
-	s.backoffBase = time.Hour // the quiet retries, NOT the backoff, must recover
+	s.backoffBase = time.Hour // the quiet re-mint, NOT the backoff, must recover
 	s.Connect()
 	c.waitFor(t, Connected, 2*time.Second)
 
-	if n := authCalls.Load(); n != 1 {
-		t.Errorf("auth calls = %d, want exactly 1 — an early retry must not open a browser", n)
-	}
 	mu.Lock()
 	seen := append([]string(nil), cookiesSeen...)
 	mu.Unlock()
-	if len(seen) < 3 {
-		t.Fatalf("want at least 3 attempts, got %v", seen)
-	}
-	for i, got := range seen {
-		if got != "C1" {
-			t.Errorf("attempt %d used %q, want the original C1 retried", i+1, got)
-		}
+	if len(seen) < 2 || seen[0] == seen[1] {
+		t.Errorf("a rejected cookie must be replaced, got %v", seen)
 	}
 	for _, e := range c.snapshot() {
 		if e.State == Reconnecting || e.State == Error {
@@ -433,11 +420,10 @@ func TestQuietEarlyRetryKeepsCookieAndStaysConnecting(t *testing.T) {
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
 
-// The quiet window must be wide enough to outlast the gateway releasing its
-// session, and every attempt in it stays silent: maxEarlyRetries attempts, all on
-// the same cookie, reaching Connected with exactly one login and no
-// Reconnecting/Error flash.
-func TestQuietEarlyRetriesSpanSeveralAttemptsWithOneLogin(t *testing.T) {
+// The quiet window is bounded: a gateway that refuses every fresh cookie costs a
+// couple of logins, not a browser tab forever, and the app still reaches Connected
+// within the window when the gateway comes good.
+func TestQuietEarlyRetriesAreBoundedAndRecover(t *testing.T) {
 	events := make(chan Event, 128)
 	c := collect(events)
 	defer c.close()
@@ -448,7 +434,7 @@ func TestQuietEarlyRetriesSpanSeveralAttemptsWithOneLogin(t *testing.T) {
 	}
 	var runs atomic.Int32
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		if runs.Add(1) <= 4 {
+		if runs.Add(1) <= 2 {
 			return ErrAuthRejected
 		}
 		connected("10.0.0.5")
@@ -457,13 +443,13 @@ func TestQuietEarlyRetriesSpanSeveralAttemptsWithOneLogin(t *testing.T) {
 	}
 	s := New(auth, run, events)
 	s.earlyRetryDelay = 5 * time.Millisecond
-	s.maxEarlyRetries = 5
-	s.backoffBase = time.Hour // the quiet retries, NOT the backoff, must recover
+	s.maxEarlyRetries = 3
+	s.backoffBase = time.Hour // the quiet re-mints, NOT the backoff, must recover
 	s.Connect()
 	c.waitFor(t, Connected, 2*time.Second)
 
-	if n := authCalls.Load(); n != 1 {
-		t.Errorf("auth calls = %d, want exactly 1 login for the whole quiet window", n)
+	if n := int(authCalls.Load()); n > 1+s.maxEarlyRetries {
+		t.Errorf("auth calls = %d, want at most %d — each one opens a browser", n, 1+s.maxEarlyRetries)
 	}
 	for _, e := range c.snapshot() {
 		if e.State == Reconnecting || e.State == Error {
@@ -498,8 +484,7 @@ func TestQuietEarlyRetryExhaustsThenReauthsAndBacksOff(t *testing.T) {
 
 	// A Reconnecting event is only emitted on the loud fallback, so its arrival
 	// proves the grace was exhausted first. By then the quiet phase (initial +
-	// maxEarlyRetries attempts) has already run — all on the SAME cookie, since
-	// re-minting during the quiet phase is what opened a browser tab per retry.
+	// maxEarlyRetries attempts) has already run, each with its own fresh cookie.
 	c.waitFor(t, Reconnecting, 2*time.Second)
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
@@ -512,17 +497,15 @@ func TestQuietEarlyRetryExhaustsThenReauthsAndBacksOff(t *testing.T) {
 		t.Fatalf("runFn saw %d cookies, want at least %d (initial + %d quiet re-mints); saw %v",
 			len(seen), quiet, s.maxEarlyRetries, seen)
 	}
-	// The quiet phase must reuse the one cookie it was given: a login per retry is
-	// a browser tab per retry, and a fresh cookie does not help a gateway that is
-	// refusing because it still holds a previous session.
+	// Each quiet retry must present a FRESH cookie: a rejected one is dead, and
+	// re-sending it is what left the app looping on a cookie that could never work.
 	for i := 0; i < quiet; i++ {
-		if seen[i] != seen[0] {
-			t.Errorf("quiet retry %d used %q, want the same cookie %q throughout (all: %v)",
-				i, seen[i], seen[0], seen)
+		for j := i + 1; j < quiet; j++ {
+			if seen[i] == seen[j] {
+				t.Errorf("quiet retries must each use a fresh cookie; seen[%d] == seen[%d] == %q (all: %v)",
+					i, j, seen[i], seen)
+			}
 		}
-	}
-	if n := authN.Load(); n != 1 {
-		t.Errorf("auth calls during the quiet phase = %d, want exactly 1", n)
 	}
 }
 
@@ -1630,12 +1613,10 @@ exit 1
 	}
 }
 
-// A Connect that keeps being refused must NOT re-authenticate on every round.
-// Re-minting is the only thing that opens a browser, and a gateway refusing
-// because it still holds a previous session refuses fresh cookies just as
-// readily — so a cookie per round produced a browser tab per round while
-// changing nothing. Retrying the cookie we already have is silent.
-func TestRefusedRoundsDoNotRemintEveryTime(t *testing.T) {
+// A Connect that is refused every time must GIVE UP, with a message saying what
+// to do, rather than retrying (and reopening the browser) forever. The bound is
+// what keeps the cost of always re-minting acceptable.
+func TestRefusedConnectGivesUpWithinBoundedRounds(t *testing.T) {
 	events := make(chan Event, 256)
 	c := collect(events)
 	defer c.close()
@@ -1647,35 +1628,32 @@ func TestRefusedRoundsDoNotRemintEveryTime(t *testing.T) {
 	var runs atomic.Int32
 	run := func(ctx context.Context, cookie string, connected func(string)) error {
 		runs.Add(1)
-		return ErrAuthRejected // the gateway refuses everything, as when it holds a session
+		return ErrAuthRejected // refused no matter what we present
 	}
 	s := New(auth, run, events)
 	s.maxEarlyRetries = 0
 	s.backoffBase = 5 * time.Millisecond
 	s.backoffMax = 5 * time.Millisecond
-	s.remintEveryRounds = 4
-	s.maxConnectRounds = 8
+	s.maxConnectRounds = 4
 	s.Connect()
 
-	// It must give up rather than retry forever, with a message that says what to do.
 	ev := c.waitFor(t, Error, 3*time.Second)
 	if !strings.Contains(ev.Detail, "couldn't connect") || !strings.Contains(ev.Detail, "Connect") {
 		t.Errorf("give-up detail = %q, want it to say it could not connect and to click Connect", ev.Detail)
 	}
 
-	// Over ~8 refused rounds, a re-mint every 4th means far fewer logins than runs.
-	gotAuth, gotRuns := int(authCalls.Load()), int(runs.Load())
-	if gotRuns < 4 {
-		t.Fatalf("runs = %d, want the loop to have retried several times", gotRuns)
+	// Bounded: a handful of attempts, not an unbounded stream of logins.
+	if got := int(runs.Load()); got > s.maxConnectRounds+2 {
+		t.Errorf("attempts = %d, want no more than maxConnectRounds (%d) plus a small margin",
+			got, s.maxConnectRounds)
 	}
-	if gotAuth >= gotRuns {
-		t.Errorf("auth calls = %d for %d attempts: a login (browser tab) per round is exactly what must not happen",
-			gotAuth, gotRuns)
+	// And it must have stopped: no further attempts after the Error.
+	before := runs.Load()
+	time.Sleep(60 * time.Millisecond)
+	if after := runs.Load(); after != before {
+		t.Errorf("kept retrying after giving up: %d -> %d attempts", before, after)
 	}
 }
-
-// Once the tunnel HAS come up, retries must stay unbounded: a real session
-// deserves indefinite reconnection, and only the never-connected case gives up.
 func TestGiveUpDoesNotApplyAfterAHealthySession(t *testing.T) {
 	events := make(chan Event, 256)
 	c := collect(events)
