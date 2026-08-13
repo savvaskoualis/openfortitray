@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 26">
+  <!-- Wider gate arch + status-light dot. The arch is always neutral mid-grey
+       (#9aa0a6) so it stays legible on both light and dark menu bars. Only the
+       centre dot changes colour per tunnel state; render time substitutes the
+       STATE_COLOR fill (see render script / per-state PNGs):
+         disconnected #8b9096, connecting #FFB020,
+         connected    #30D158, error      #FF453A.
+       The dot below shows the connected state as a representative sample. -->
+  <path d="M4 24 V13 A14 11 0 0 1 32 13 V24"
+        fill="none" stroke="#9aa0a6" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="14.5" r="5.2" fill="#30D158"/>
+</svg>
