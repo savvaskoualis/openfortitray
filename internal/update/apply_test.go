@@ -117,3 +117,44 @@ func TestApplyManualUnsupported(t *testing.T) {
 		t.Fatal("expected an error applying MethodManual")
 	}
 }
+
+// The updater runs after the app has exited, so it must leave a trail: an empty
+// update.log is exactly what the DETACHED_PROCESS bug produced, and it said
+// nothing about how far the update got. Every step must announce itself, and the
+// relaunch must not be skippable by an earlier failure — the worst outcome is the
+// user left with no app at all ("the app closes and that's it").
+func TestBuildWindowsScriptLogsAndAlwaysRelaunches(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "Setup.exe")
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := buildWindowsScript(4242, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"Out-File",                 // it writes its own log
+		"updater: waiting for pid", // ...before waiting
+		"updater: running installer",
+		"installer exit code",             // the installer's result is recorded
+		"updater: relaunching via schedu", // and the relaunch attempt
+		"updater: done",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("script does not log %q:\n%s", want, s)
+		}
+	}
+	// A failed install must not abort the script before the relaunch.
+	if strings.Contains(s, "$ErrorActionPreference = 'Stop'") {
+		t.Error("script must not stop on the first error, or a failed install skips the relaunch")
+	}
+	// Fallback start when the scheduled task cannot run the app.
+	if !strings.Contains(s, "starting it directly") {
+		t.Errorf("script has no direct-start fallback:\n%s", s)
+	}
+	if strings.Count(s, "4242") < 2 {
+		t.Errorf("pid should appear in both the log line and Wait-Process: %q", s)
+	}
+}

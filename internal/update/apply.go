@@ -88,11 +88,55 @@ func buildWindowsScript(pid int, installerPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(
-		"Wait-Process -Id %d -ErrorAction SilentlyContinue\n"+
-			"Start-Process -FilePath '%s' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait\n"+
-			"schtasks /Run /TN OpenFortiTray\n",
-		pid, clean), nil
+	// Every step announces itself, because this script runs after the app has
+	// exited: if it fails there is no UI left to report it, and an empty update.log
+	// (which is exactly what the DETACHED_PROCESS bug produced) says nothing about
+	// how far it got. $ErrorActionPreference stays at Continue so one failed step
+	// cannot skip the relaunch below.
+	//
+	// The relaunch is deliberately belt-and-braces: schtasks runs the elevated logon
+	// task, and if that is missing or fails the app is started directly, because the
+	// worst outcome here is the user left with no app at all — which is what
+	// "the app closes and that's it" was.
+	return fmt.Sprintf(`$log = '%s'
+function Say($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $log -Append -Encoding utf8 }
+Say "updater: waiting for pid %d to exit"
+Wait-Process -Id %d -ErrorAction SilentlyContinue
+Say "updater: running installer %s"
+try {
+  $p = Start-Process -FilePath '%s' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+  Say "updater: installer exit code $($p.ExitCode)"
+} catch {
+  Say "updater: installer failed to start: $_"
+}
+Say "updater: relaunching via scheduled task"
+$ok = $false
+try {
+  schtasks /Run /TN %s 2>&1 | ForEach-Object { Say "updater: schtasks: $_" }
+  if ($LASTEXITCODE -eq 0) { $ok = $true }
+} catch { Say "updater: schtasks threw: $_" }
+if (-not $ok) {
+  Say "updater: scheduled task did not start the app; starting it directly"
+  try { Start-Process -FilePath '%s' } catch { Say "updater: direct start failed: $_" }
+}
+Say "updater: done"
+`, updateLogPath(), pid, pid, clean, clean, windowsTaskName, exePathForRelaunch()), nil
+}
+
+// windowsTaskName is the scheduled task internal/autostart creates for the
+// elevated logon launch, and the one the updater asks to run after installing.
+const windowsTaskName = "OpenFortiTray"
+
+// exePathForRelaunch returns this executable's path, used as the updater's
+// fallback way to bring the app back if the scheduled task cannot. An empty
+// string (os.Executable failing) simply leaves the fallback a no-op rather than
+// interpolating something unusable.
+func exePathForRelaunch() string {
+	exe, err := os.Executable()
+	if err != nil || strings.ContainsAny(exe, "'\"`") {
+		return ""
+	}
+	return exe
 }
 
 // validateInstallerPath fails closed unless p, once cleaned, is an absolute path

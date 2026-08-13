@@ -574,6 +574,12 @@ func (a *app) UpdateClicked() {
 // releases page so the user can update by hand — the app keeps running.
 func (a *app) applyUpdate(rel *update.Release) {
 	method := update.InstallMethod()
+	// Log the attempt, not just the failures. When the Windows updater silently
+	// did nothing, the app log held no trace that an update had even been tried,
+	// which made a spawn that died on startup indistinguishable from a click that
+	// never arrived. The updater writes its own steps to update.log; these lines
+	// are what tie the two together.
+	log.Printf("update: applying %s via %s", rel.Tag, method)
 	switch method {
 	case update.MethodHomebrew:
 		if err := update.Apply(method, "", os.Getpid()); err != nil {
@@ -590,12 +596,14 @@ func (a *app) applyUpdate(rel *update.Release) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+		log.Printf("update: downloading %s (%d bytes)", setup.Name, setup.Size)
 		path, err := updateChecker().DownloadAndVerify(ctx, *setup, *sums)
 		if err != nil {
 			log.Printf("update: download/verify failed: %v; opening releases page", err)
 			_ = xopen.URL(releasesPageURL)
 			return
 		}
+		log.Printf("update: verified installer at %s; launching the updater (see update.log)", path)
 		if err := update.Apply(method, path, os.Getpid()); err != nil {
 			log.Printf("update: windows apply failed: %v; opening releases page", err)
 			_ = xopen.URL(releasesPageURL)
