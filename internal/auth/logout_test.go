@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -31,20 +32,23 @@ func TestLogoutSendsCookieToRemoteLogout(t *testing.T) {
 	}
 }
 
-// A 302 to the portal is FortiGate's normal answer to a logout; it means the
-// session is gone and must not be reported as a failure.
-func TestLogoutAcceptsRedirect(t *testing.T) {
+// A redirect must NOT count as a logout. This gateway answers an unauthenticated
+// /remote/logout with a 307 to the SAML identity provider, and counting that as
+// success made the app log "session ended on the gateway" when nothing had ended.
+func TestLogoutRejectsRedirectToIdP(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/remote/logout" {
-			http.Redirect(w, r, "/remote/login", http.StatusFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
+		http.Redirect(w, r, "https://login.microsoftonline.com/x/saml2?SAMLRequest=abc",
+			http.StatusTemporaryRedirect)
 	}))
 	defer srv.Close()
 
-	if err := Logout(context.Background(), srv.Client(), srv.URL, "C"); err != nil {
-		t.Errorf("a redirect to the portal must count as logged out, got %v", err)
+	err := Logout(context.Background(), srv.Client(), srv.URL, "C")
+	if err == nil {
+		t.Fatal("a redirect to the IdP must not be reported as a successful logout")
+	}
+	// The Location carries a SAMLRequest, so it must not be echoed into the log.
+	if strings.Contains(err.Error(), "SAMLRequest") {
+		t.Errorf("error text leaks the redirect URL: %v", err)
 	}
 }
 

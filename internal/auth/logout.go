@@ -47,11 +47,21 @@ func Logout(ctx context.Context, client *http.Client, gatewayURL, cookie string)
 		return fmt.Errorf("auth: logout request: %w", err)
 	}
 	defer resp.Body.Close()
-	// FortiGate answers a logout with 200 or a 302 to the portal; both mean the
-	// session is gone. Anything else is worth logging, but there is no recovery
-	// beyond letting the gateway time the session out.
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("auth: logout returned %d", resp.StatusCode)
+	// Only a 2xx means the gateway accepted the logout.
+	//
+	// A redirect must NOT count as success, however tempting: this gateway answers
+	// an unauthenticated /remote/logout with a 307 to the SAML IdP, and treating
+	// that as "logged out" made the app log "session ended on the gateway" when
+	// nothing had ended. A log line that lies is worse than no log line — it sent
+	// this investigation down the wrong path for a while.
+	if resp.StatusCode >= 300 {
+		loc := resp.Header.Get("Location")
+		if loc != "" {
+			// Do not echo the Location back: it carries a SAMLRequest.
+			return fmt.Errorf("auth: logout not accepted (HTTP %d, redirected to the identity provider — "+
+				"the session was probably already gone from the gateway's point of view)", resp.StatusCode)
+		}
+		return fmt.Errorf("auth: logout not accepted (HTTP %d)", resp.StatusCode)
 	}
 	return nil
 }

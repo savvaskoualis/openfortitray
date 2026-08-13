@@ -129,11 +129,13 @@ func New(authFn func(ctx context.Context) (string, error),
 		// past that point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
 		// A FortiGate that still holds a previous session refuses cookies until it
-		// releases it, which takes seconds to a few minutes. Retry quietly over that
-		// window — same cookie, no browser, tray still on Connecting… — before doing
-		// anything the user would see as an error.
-		earlyRetryDelay: 4 * time.Second,
-		maxEarlyRetries: 5,
+		// releases it. Measured over 25 reconnects on a real gateway, that took a
+		// median of 25s and 90% of the time under ~75s (worst seen: 4.5 minutes). So
+		// retry at a STEADY 5s for ~100s — same cookie, no browser, no backoff. A
+		// backoff here is actively wrong: it makes us miss the moment the gateway
+		// frees up and sit out a 30s or 60s wait for nothing.
+		earlyRetryDelay: 5 * time.Second,
+		maxEarlyRetries: 20,
 		// ~8 rounds of a 15s..2min backoff spans several minutes, which covers the
 		// worst observed wait for this gateway to release a session, and then stops
 		// instead of retrying (and re-authenticating) forever.
@@ -301,6 +303,15 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	// (gates the terminal give-up).
 	rejectRounds := 0
 	connectRounds := 0
+	// connectingDetail explains a connect that is taking a while. A bare
+	// "Connecting…" that sits there for a minute reads as stuck, and the real reason
+	// is worth saying: this gateway permits one SSL-VPN session per user, so it
+	// refuses us both while it releases our own previous session (median 25s,
+	// measured) and for as long as another device holds it — the case where two
+	// machines are signed in as the same user and evict each other. Neither is
+	// something the client can shorten, but a user who is told can act on it.
+	connectingDetail := ""
+
 	backoff := s.backoffBase
 	for {
 		if ctx.Err() != nil {
@@ -319,7 +330,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			cookie, proven = c, false
 		}
 
-		s.emit(gen, Connecting, "")
+		s.emit(gen, Connecting, connectingDetail)
 		// These may be written from another goroutine if runFn reports
 		// asynchronously, hence the atomics.
 		var up atomic.Bool
@@ -384,6 +395,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// rejection takes the proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
+				connectingDetail = "gateway busy — the VPN allows one session per user"
 				// KEEP the cookie. These early retries used to re-mint, which meant a
 				// SAML login — and a browser tab — every 4 seconds: three tabs before a
 				// connect succeeded, which is what users saw. Re-minting cannot help
