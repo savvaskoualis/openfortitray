@@ -5,6 +5,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/dialog"
@@ -31,6 +33,11 @@ func (a *app) connectWithBootstrap() {
 			fyne.Do(a.startTunnel)
 			return
 		}
+		// Say why Connect did not dial. Without this the app simply sits there
+		// after launch — the dialog is up, but the log shows nothing, and an idle
+		// app with no explanation is indistinguishable from a hang.
+		log.Printf("helper: not ready for this build (need ABI %d); offering to install it",
+			oft.RequiredHelperABI)
 		fyne.Do(a.offerBootstrapInstall)
 	}()
 }
@@ -45,9 +52,18 @@ func (a *app) offerBootstrapInstall() {
 	// invoked from the tray while the window is hidden).
 	a.win.Show()
 	a.win.RequestFocus()
-	dialog.ShowConfirm("Install VPN helper",
+	// The same gate covers a first install and an upgrade of an existing helper, so
+	// the wording has to fit both: telling someone who has used the app for weeks
+	// that it "needs to install" a helper reads like a mistake.
+	title, body := "Install VPN helper",
 		"OpenFortiTray needs to install a small helper to run the VPN.\n"+
-			"This will ask for your Mac password. Install now?",
+			"This will ask for your Mac password. Install now?"
+	if _, err := os.Stat(oft.HelperPath); err == nil {
+		title = "Update VPN helper"
+		body = "OpenFortiTray needs to update its VPN helper before it can connect.\n" +
+			"This will ask for your Mac password. Update now?"
+	}
+	dialog.ShowConfirm(title, body,
 		func(ok bool) {
 			if !ok {
 				return

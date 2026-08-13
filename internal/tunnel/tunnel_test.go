@@ -1158,42 +1158,42 @@ func TestStartArgv(t *testing.T) {
 		name:     "direct run (Windows: already elevated), DTLS on and dual-stack on emit no extra flags",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw.example.com:10443", DTLS: true, DualStack: true},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw.example.com:10443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "gw.example.com:10443"},
 	}, {
 		name:     "DTLS off appends --no-dtls",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: false, DualStack: true},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--no-dtls", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "--no-dtls", "gw:443"},
 	}, {
 		name:     "dual-stack off appends --disable-ipv6",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: false},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--disable-ipv6", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "--disable-ipv6", "gw:443"},
 	}, {
 		name:     "pin mode appends --servercert <pin>",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "pin", ServerCertPin: "sha256:AB:CD"},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--servercert", "sha256:AB:CD", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "--servercert", "sha256:AB:CD", "gw:443"},
 	}, {
 		name:     "trust mode with a pin appends --servercert <pin>",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "trust", ServerCertPin: "AB:CD"},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--servercert", "AB:CD", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "--servercert", "AB:CD", "gw:443"},
 	}, {
 		name:     "trust mode with no pin emits no cert flag (openconnect has no accept-invalid option)",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "trust"},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "gw:443"},
 	}, {
 		name:     "warn mode emits no cert flag",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: true, DualStack: true, ServerCertMode: "warn"},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "gw:443"},
 	}, {
 		name:     "all toggles together preserve flag order",
 		opts:     Options{OpenconnectPath: "openconnect", Gateway: "gw:443", DTLS: false, DualStack: false, ServerCertMode: "pin", ServerCertPin: "FF"},
 		wantName: "openconnect",
-		wantArgs: []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter", "--no-dtls", "--disable-ipv6", "--servercert", "FF", "gw:443"},
+		wantArgs: []string{"--protocol=fortinet", "--config", "/tmp/oc.conf", "--non-inter", "--no-dtls", "--disable-ipv6", "--servercert", "FF", "gw:443"},
 	}, {
 		name:     "helper path gets the toggles after the gateway (allowlisted flags reach the helper)",
 		opts:     Options{HelperPath: "/opt/h", Gateway: "gw:443", UseSudo: true, DTLS: false, DualStack: false, ServerCertMode: "pin", ServerCertPin: "FF"},
@@ -1224,7 +1224,7 @@ func TestStartArgv(t *testing.T) {
 	}}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			name, args := tc.opts.startArgv()
+			name, args := tc.opts.startArgv("/tmp/oc.conf")
 			if name != tc.wantName {
 				t.Errorf("command = %q, want %q", name, tc.wantName)
 			}
@@ -1707,5 +1707,96 @@ func TestGiveUpDoesNotApplyAfterAHealthySession(t *testing.T) {
 	}
 	if runs.Load() < 4 {
 		t.Errorf("runs = %d, want it to have kept retrying", runs.Load())
+	}
+}
+
+// The direct (Windows) path must hand openconnect the cookie WHOLE, in a file:
+// --cookie-on-stdin truncates at 1024 bytes and this gateway's cookies exceed
+// that, which showed up only as "Cookie was rejected by server".
+func TestCookieConfigFileCarriesFullCookieAndIsPrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sub")
+	long := strings.Repeat("aB3._~%=+/-", 130) // 1430 bytes: truncated by the old path
+
+	path, err := cookieConfigFile(dir, long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(data)), "cookie=SVPNCOOKIE="+long; got != want {
+		t.Errorf("config file = %q, want the cookie whole (%d bytes)", got, len(long))
+	}
+	// The file holds a live session credential.
+	if runtime.GOOS != "windows" {
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("config file mode = %o, want 600", perm)
+		}
+	}
+}
+
+// SECURITY: an openconnect config file accepts any option, including script=,
+// which openconnect runs — and on Windows the app is elevated, so that would run
+// as administrator. A cookie must never be able to introduce a second line, so
+// anything outside the character set a real SVPNCOOKIE uses is refused before a
+// byte is written.
+func TestCookieConfigFileRefusesInjection(t *testing.T) {
+	for _, tc := range []struct{ name, cookie string }{
+		{"newline then a root-executing option", "GOOD\nscript=/tmp/evil"},
+		{"carriage return", "GOOD\rscript=/tmp/evil"},
+		{"space", "GOOD script=/tmp/evil"},
+		{"leading dash looks like a flag", "-oProxyCommand=evil"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if _, err := cookieConfigFile(dir, tc.cookie); err == nil {
+				t.Fatalf("accepted a cookie it must refuse: %q", tc.cookie)
+			}
+			// And it must not have left a partial file behind.
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Errorf("wrote %d file(s) for a refused cookie", len(entries))
+			}
+		})
+	}
+}
+
+// The config file must be gone once the tunnel process has exited — a session
+// cookie must not outlive the session on disk.
+func TestDirectRunRemovesTheCookieConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	dir := t.TempDir()
+	confDir := filepath.Join(dir, "conf")
+	seen := filepath.Join(dir, "seen")
+	// The stub records the config path it was given, then exits.
+	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
+prev=
+for a in "$@"; do
+  if [ "$prev" = --config ]; then printf '%s' "$a" > `+seen+`; fi
+  prev=$a
+done
+echo "Configured as 10.0.0.3, with SSL connected"
+exit 0
+`)
+	run := RunOpenconnect(Options{OpenconnectPath: fake, Gateway: "gw:10443", ConfDir: confDir})
+	_ = run(context.Background(), "COOKIEVALUE", func(string) {})
+
+	got, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("openconnect was not given a --config path: %v", err)
+	}
+	if _, err := os.Stat(string(got)); !os.IsNotExist(err) {
+		t.Errorf("config file %s still exists after the run (err=%v)", got, err)
 	}
 }

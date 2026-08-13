@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -303,13 +304,15 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	// (gates the terminal give-up).
 	rejectRounds := 0
 	connectRounds := 0
-	// connectingDetail explains a connect that is taking a while. A bare
-	// "Connecting…" that sits there for a minute reads as stuck, and the real reason
-	// is worth saying: this gateway permits one SSL-VPN session per user, so it
-	// refuses us both while it releases our own previous session (median 25s,
-	// measured) and for as long as another device holds it — the case where two
-	// machines are signed in as the same user and evict each other. Neither is
-	// something the client can shorten, but a user who is told can act on it.
+	// connectingDetail explains a connect that is taking a while, because a bare
+	// "Connecting…" sitting there for a minute reads as stuck.
+	//
+	// It deliberately reports the SYMPTOM rather than naming a cause. An earlier
+	// version claimed "the VPN allows one session per user", which was a guess that
+	// turned out to be wrong most of the time — the usual cause was a truncated
+	// cookie (see the helper's cmd_start) — and the app then confidently told users
+	// something false about their gateway. If the reason cannot be established from
+	// here, say only what is known.
 	connectingDetail := ""
 
 	backoff := s.backoffBase
@@ -395,7 +398,7 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// rejection takes the proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
-				connectingDetail = "gateway busy — the VPN allows one session per user"
+				connectingDetail = "gateway refused the session — retrying"
 				// KEEP the cookie. These early retries used to re-mint, which meant a
 				// SAML login — and a browser tab — every 4 seconds: three tabs before a
 				// connect succeeded, which is what users saw. Re-minting cannot help
@@ -667,6 +670,11 @@ type Options struct {
 	// ServerCertPin is the fingerprint passed to --servercert when pinning.
 	ServerCertPin string
 
+	// ConfDir is the directory the DIRECT path writes its short-lived openconnect
+	// config file into (the one carrying the cookie). Empty falls back to a
+	// subdirectory of the system temp dir. Unused on the privileged path.
+	ConfDir string
+
 	// Logout, when non-nil, is called with the cookie a session used, once the
 	// backend for that session has exited. It exists because openconnect has no
 	// logout for the Fortinet protocol at all — its logout endpoints cover Juniper
@@ -755,6 +763,16 @@ func (o Options) openconnectFlags() []string {
 	return flags
 }
 
+// confDir is where the direct path writes its short-lived openconnect config. It
+// sits beside the app's own state (the caller sets ConfDir; os.TempDir is the
+// fallback) rather than in a world-writable temp root.
+func (o Options) confDir() string {
+	if o.ConfDir != "" {
+		return o.ConfDir
+	}
+	return filepath.Join(os.TempDir(), "openfortitray")
+}
+
 func (o Options) helperPath() string {
 	if o.HelperPath == "" {
 		return DefaultHelperPath
@@ -779,16 +797,75 @@ func (o Options) sudo() string {
 // (`start <gateway> <flags...>`) and follow the fixed flags on the direct path.
 // They are the same set; the helper validates each against an exact allowlist,
 // so threading them through sudo does not widen what can run as root.
-func (o Options) startArgv() (string, []string) {
+// startArgv returns the command to run. confPath is the openconnect config file
+// holding the cookie on the DIRECT path (Windows); it is empty on the privileged
+// path, where the helper writes its own config from the cookie it reads on stdin.
+func (o Options) startArgv(confPath string) (string, []string) {
 	if o.UseSudo {
 		args := []string{"-n", o.helperPath(), "start", o.Gateway}
 		args = append(args, o.openconnectFlags()...)
 		return o.sudo(), args
 	}
-	args := []string{"--protocol=fortinet", "--cookie-on-stdin", "--non-inter"}
+	// --config, not --cookie-on-stdin: openconnect reads a stdin cookie into a
+	// 1024-byte buffer and silently truncates anything longer, and this gateway's
+	// cookies routinely exceed that (1288 bytes observed), which surfaces only as
+	// an opaque "Cookie was rejected by server". Not --cookie either: that would put
+	// the session cookie in the process table for the tunnel's whole life.
+	args := []string{"--protocol=fortinet", "--config", confPath, "--non-inter"}
 	args = append(args, o.openconnectFlags()...)
 	args = append(args, o.Gateway)
 	return o.OpenconnectPath, args
+}
+
+// cookieConfigFile writes an openconnect config file carrying the cookie, for the
+// direct (Windows) path, and returns its path. The caller removes it once
+// openconnect has exited.
+//
+// SECURITY: an openconnect config file accepts ANY option, including script=,
+// which openconnect executes — and on Windows the app is elevated, so that would
+// be an administrator-level command. validateCookie is what stops a cookie from
+// introducing a second line; it runs before anything is written.
+func cookieConfigFile(dir, cookie string) (string, error) {
+	if err := validateCookie(cookie); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("cannot create %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, "openconnect-*.conf")
+	if err != nil {
+		return "", fmt.Errorf("cannot create the openconnect config: %w", err)
+	}
+	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("cannot restrict %s: %w", f.Name(), err)
+	}
+	if _, err := fmt.Fprintf(f, "cookie=SVPNCOOKIE=%s\n", cookie); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("cannot write the openconnect config: %w", err)
+	}
+	return f.Name(), nil
+}
+
+// cookieRe is the character set a FortiGate SVPNCOOKIE uses (base64/hex with
+// URL-safe and percent-encoding punctuation). Anything else — whitespace, a
+// newline, a control character — could start a new line in the config file, so it
+// is refused rather than escaped. Mirrors validate_cookie in the privileged
+// helper; the two must stay in step.
+var cookieRe = regexp.MustCompile(`^[A-Za-z0-9._~%=+/-]+$`)
+
+func validateCookie(cookie string) error {
+	if cookie == "" {
+		return errors.New("empty cookie")
+	}
+	if strings.HasPrefix(cookie, "-") {
+		return errors.New("cookie must not start with '-'")
+	}
+	if !cookieRe.MatchString(cookie) {
+		return errors.New("cookie contains characters that are not valid in a session cookie")
+	}
+	return nil
 }
 
 // stopArgv returns the command that tears the tunnel down, and whether one is
@@ -1014,7 +1091,23 @@ func (o Options) withSplitDNS(inner func(ctx context.Context, cookie string, con
 // resolvers around the connection (see withSplitDNS).
 func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, connected func(ip string)) error {
 	base := func(ctx context.Context, cookie string, connected func(ip string)) error {
-		name, args := opts.startArgv()
+		// On the direct path the cookie travels in a config file we write here (see
+		// startArgv for why not stdin and not the argv). On the privileged path it
+		// still goes to the helper on stdin and the helper writes its own file, so
+		// nothing is written here and confPath stays empty.
+		confPath := ""
+		if !opts.UseSudo {
+			p, err := cookieConfigFile(opts.confDir(), cookie)
+			if err != nil {
+				return fmt.Errorf("openconnect config: %w", err)
+			}
+			confPath = p
+			// Removed once openconnect has exited: it re-reads nothing after startup,
+			// but leaving a session cookie on disk for the life of the tunnel — or
+			// after a crash — is not acceptable.
+			defer os.Remove(confPath)
+		}
+		name, args := opts.startArgv(confPath)
 		cmd := exec.CommandContext(ctx, name, args...)
 		if stopName, stopArgs, viaHelper := opts.stopArgv(); viaHelper {
 			cmd.Cancel = func() error { return runHelperStop(cmd, stopName, stopArgs) }

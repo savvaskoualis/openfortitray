@@ -1048,7 +1048,11 @@ func main() {
 			OpenconnectPath: tp.openconnectPath,
 			HelperPath:      tp.helperPath,
 			UseSudo:         runtime.GOOS != "windows",
-			SplitDNS:        splitDNS,
+			// Where the direct (Windows) path writes the short-lived openconnect
+			// config holding the cookie: the app's own config directory, not a
+			// shared temp root.
+			ConfDir:  filepath.Join(a.cfgDir, "run"),
+			SplitDNS: splitDNS,
 			// Tunnel-shaping toggles from the active profile. They reach
 			// openconnect on BOTH paths: the direct (Windows) path and the
 			// privileged helper path, which validates each flag against an exact
