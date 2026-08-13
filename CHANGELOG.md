@@ -8,6 +8,26 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.25] — 2026-08-13
+
+### Fixed
+- **Connect is ~12s faster.** 0.1.21 re-sent a rejected session cookie four times,
+  three seconds apart, before falling back to a fresh login. Measuring 43 real
+  attempts showed why that was wrong: a reused cookie was refused on all 30
+  attempts (a FortiGate session cookie is bound to its session, so one it has
+  rejected can never start working), while a fresh login was accepted on the first
+  try every single time. The re-sends only delayed the login that actually works.
+  A rejected cookie now goes straight to a fresh login, and the dead one is
+  deleted so the next connect does not retry it.
+
+### Removed
+- **The automatic "skip DTLS" behaviour from 0.1.23 is gone.** The same
+  measurements showed `--no-dtls` prevents authentication on this gateway
+  (10 fresh cookies refused with it, interleaved with successes without it). The
+  ~5s DTLS handshake wait it was meant to avoid is real, but it needs the
+  gateway's UDP port opened, not this flag. If you have `dtls` turned off in a
+  profile and cannot connect, turn it back on.
+
 ## [0.1.24] — 2026-08-13
 
 ### Fixed
