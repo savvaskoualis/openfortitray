@@ -8,6 +8,19 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.26] — 2026-08-13
+
+### Fixed
+- **Reconnecting is no longer blocked for minutes after a disconnect.** openconnect
+  has no logout for the Fortinet protocol (it supports Juniper and GlobalProtect
+  only), so closing the tunnel left the session established on the FortiGate until
+  the gateway timed it out — and because the gateway allows one SSL-VPN session per
+  user, every reconnect during that window was refused. Measured: five separate
+  fresh logins rejected across 3.5 minutes after a clean disconnect. The app now
+  sends the logout the gateway expects when the tunnel goes down, as FortiClient
+  does, so the session is released immediately and the next connect works first
+  try. It is best-effort and bounded, so an unresponsive gateway cannot delay quit.
+
 ## [0.1.25] — 2026-08-13
 
 ### Fixed
