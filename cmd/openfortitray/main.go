@@ -142,6 +142,11 @@ type app struct {
 	// every retry round, and one toast per backoff tick is exactly the noise
 	// this is meant to avoid. Pump-goroutine-only; not part of the UI state.
 	lastNotified tunnel.State
+	// retryNotified records that the CURRENT retry episode has already produced a
+	// notification, so a reconnect storm posts one toast rather than one per round.
+	// Cleared when the episode ends: Connected, Disconnected, or the terminal Error.
+	// Pump-goroutine-only, like lastNotified.
+	retryNotified bool
 
 	// updateMu guards updateRel and lastPromptedTag: the newest release the
 	// background checker found to be newer than this build, or nil until one is
@@ -852,26 +857,69 @@ func (a *app) notifyFor(e tunnel.Event) {
 	var title, body string
 	switch e.State {
 	case tunnel.Connected:
+		a.retryNotified = false
 		title = "VPN connected"
 		body = "Tunnel is up."
 		if e.Detail != "" {
 			body = "Tunnel is up (" + e.Detail + ")."
 		}
+
 	case tunnel.Reconnecting:
-		if prev != tunnel.Connected {
+		// One notification per RETRY EPISODE, not per Reconnecting event.
+		//
+		// The transition check above is not enough on its own: the supervisor's
+		// retry rounds alternate Reconnecting → Connecting → Reconnecting, so each
+		// Reconnecting looks like a fresh transition and an ungated notify would
+		// post one toast per round. retryNotified is cleared only when the episode
+		// actually ends — on Connected, on a user Disconnect, or on the terminal
+		// Error — so a reconnect storm produces exactly one toast.
+		if a.retryNotified {
+			log.Printf("notify: %v suppressed (already notified this retry episode)", e.State)
 			return
 		}
-		title = "VPN dropped"
-		body = "Reconnecting…"
+		a.retryNotified = true
+		if prev == tunnel.Connected {
+			title = "VPN dropped"
+			body = "Reconnecting…"
+		} else {
+			// A retry that never had a healthy session. This used to stay silent, on
+			// the reasoning that the menu-bar icon already shows it trying — but the
+			// icon is a colour in the corner of the screen, and a connect that
+			// quietly retries for a minute and a half before giving up reads as the
+			// app having done nothing at all. It says something different from the
+			// drop case because nothing was dropped.
+			title = "VPN reconnecting"
+			body = "Couldn't connect — retrying."
+			if e.Detail != "" {
+				body = e.Detail
+			}
+		}
+
 	case tunnel.Error:
+		a.retryNotified = false
 		title = "VPN disconnected"
 		body = e.Detail
 		if body == "" {
 			body = "Connection failed — open openfortitray to retry."
 		}
+
 	default:
+		// Disconnected is the user's own doing, and Connecting/Authenticating are
+		// expected steps they just triggered. Silent — but the episode ends here, so
+		// the next retry is allowed to speak.
+		if e.State == tunnel.Disconnected {
+			a.retryNotified = false
+		}
+		log.Printf("notify: %v is not a notifying state", e.State)
 		return
 	}
+
+	// Logged because SendNotification reports nothing back: it cannot fail visibly,
+	// so without this line a missing toast is indistinguishable from a toast the app
+	// never tried to post. That ambiguity cost real debugging time — on macOS the
+	// authorization failure is logged by fyne through NSLog, which only reaches this
+	// file because redirectStderr repoints fd 2 (see redirect_unix.go).
+	log.Printf("notify: posting %q — %q", title, body)
 	a.notify(title, body)
 }
 

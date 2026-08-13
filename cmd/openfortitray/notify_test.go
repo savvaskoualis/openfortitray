@@ -59,18 +59,106 @@ func TestNotifyOnlyOnTransition(t *testing.T) {
 	}
 }
 
-// A reconnect that never had a healthy session (the connect-time retry dance)
-// must stay silent — the tray already shows it is trying.
-func TestNoDropNotificationWithoutHealthySession(t *testing.T) {
+// A retry that never had a healthy session now DOES notify, once, and says
+// something different from a drop.
+//
+// It used to stay silent, on the reasoning that the menu-bar icon already showed
+// it trying. That was wrong in practice: the icon is a colour in the corner of the
+// screen, and a connect that quietly retried for ninety seconds before giving up
+// read as the app having done nothing at all. The wording must not claim a drop —
+// nothing was dropped.
+func TestRetryWithoutHealthySessionNotifiesOnce(t *testing.T) {
 	a, got := notifyRecorder()
 	feed(a,
 		tunnel.Event{State: tunnel.Authenticating},
 		tunnel.Event{State: tunnel.Connecting},
-		tunnel.Event{State: tunnel.Reconnecting, Detail: "connection lost — reconnecting"},
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "gateway refused the session — signing in again"},
 		tunnel.Event{State: tunnel.Connecting},
 	)
-	if len(*got) != 0 {
-		t.Fatalf("want no notifications before a healthy session, got %+v", *got)
+	if len(*got) != 1 {
+		t.Fatalf("want exactly one retry notification, got %d: %+v", len(*got), *got)
+	}
+	if (*got)[0].title == "VPN dropped" {
+		t.Error("a retry that never connected must not claim the VPN dropped")
+	}
+	if (*got)[0].title != "VPN reconnecting" {
+		t.Errorf("title = %q, want \"VPN reconnecting\"", (*got)[0].title)
+	}
+	if !strings.Contains((*got)[0].body, "gateway refused") {
+		t.Errorf("body = %q, want the supervisor's reason", (*got)[0].body)
+	}
+}
+
+// The retry rounds alternate Reconnecting → Connecting → Reconnecting, so every
+// Reconnecting looks like a fresh transition. Without per-episode gating this is
+// one toast per round — which is exactly the noise the transition rule exists to
+// prevent, reintroduced through the back door.
+func TestRetryStormNotifiesOncePerEpisode(t *testing.T) {
+	a, got := notifyRecorder()
+	evs := []tunnel.Event{{State: tunnel.Connecting}}
+	for i := 0; i < 6; i++ {
+		evs = append(evs,
+			tunnel.Event{State: tunnel.Reconnecting, Detail: "still trying"},
+			tunnel.Event{State: tunnel.Connecting})
+	}
+	feed(a, evs...)
+	if len(*got) != 1 {
+		t.Fatalf("want 1 notification for the whole episode, got %d: %+v", len(*got), *got)
+	}
+}
+
+// A drop after a healthy session, then retries, then success: three toasts, in
+// that order — and the second one must be the drop wording, not the retry wording.
+func TestDropThenRetriesThenReconnect(t *testing.T) {
+	a, got := notifyRecorder()
+	feed(a,
+		tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.5"},
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "connection lost"},
+		tunnel.Event{State: tunnel.Connecting},
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "connection lost"},
+		tunnel.Event{State: tunnel.Connecting},
+		tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.7"},
+	)
+	if len(*got) != 3 {
+		t.Fatalf("want 3 notifications (connected, dropped, connected), got %d: %+v", len(*got), *got)
+	}
+	if (*got)[1].title != "VPN dropped" {
+		t.Errorf("second notification = %+v, want the drop wording", (*got)[1])
+	}
+	if (*got)[2].title != "VPN connected" || !strings.Contains((*got)[2].body, "10.0.0.7") {
+		t.Errorf("third notification = %+v, want the reconnect with the new IP", (*got)[2])
+	}
+}
+
+// A second episode, after the first ended, must be able to speak again — the
+// per-episode flag is a mute for one storm, not a permanent one.
+func TestNewEpisodeNotifiesAgain(t *testing.T) {
+	a, got := notifyRecorder()
+	feed(a,
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "first"},
+		tunnel.Event{State: tunnel.Error, Detail: "gave up"},
+		tunnel.Event{State: tunnel.Connecting},
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "second"},
+	)
+	if len(*got) != 3 {
+		t.Fatalf("want 3 (retry, error, retry-again), got %d: %+v", len(*got), *got)
+	}
+	if (*got)[2].title != "VPN reconnecting" {
+		t.Errorf("third = %+v, want the second episode to notify", (*got)[2])
+	}
+}
+
+// A user Disconnect ends the episode too, so a later retry is not muted by a flag
+// left set from before.
+func TestUserDisconnectClearsTheEpisode(t *testing.T) {
+	a, got := notifyRecorder()
+	feed(a,
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "first"},
+		tunnel.Event{State: tunnel.Disconnected},
+		tunnel.Event{State: tunnel.Reconnecting, Detail: "second"},
+	)
+	if len(*got) != 2 {
+		t.Fatalf("want 2 retry notifications either side of the disconnect, got %d: %+v", len(*got), *got)
 	}
 }
 
