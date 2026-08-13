@@ -145,29 +145,50 @@ The installer must recreate the task with `/RL LIMITED` (`/F` makes it idempoten
 it is running elevated and say so in the log — a mismatch between the two designs is
 worth a breadcrumb rather than silence.
 
-### 7. MUST VERIFY ON HARDWARE — the tunnel task's DACL
+### 7. VERIFIED ON HARDWARE — the task's DACL is execute-only, which is what this needs
 
-If unelevated code can *modify* the `OpenFortiTrayTunnel` task, the entire design
-collapses into one step: rewrite the task's action to `cmd.exe`, trigger it, get
-`RunLevel: Highest`. Inheritance from `C:\Windows\System32\Tasks` should prevent
-that, and `schtasks` exposes no way to set a task's security descriptor, so this
-rests on defaults rather than on anything the design chose.
+If unelevated code can *modify* the tunnel task, the design collapses into one step:
+rewrite the action to `cmd.exe`, trigger it, get `RunLevel: Highest`. `schtasks`
+exposes no way to set a task's security descriptor, so this rested on Windows
+defaults rather than on anything the design chose — and defaults are not evidence.
 
-Defaults are not evidence. Before the runner ships, on the VM:
+Measured on the Cloud PC (2026-08-13), from a WSL shell at **Medium** integrity with
+`BUILTIN\Administrators` present but "used for deny only" — precisely the attacker's
+position — against the existing `OpenFortiTray` task, which the installer registered
+through the same `schtasks /Create ... /RL HIGHEST` path the tunnel task will use:
+
+| Probe | Result |
+|---|---|
+| Modify the action (`Set-ScheduledTask`, COM API) | **Access is denied** |
+| Self-register a *new* `RunLevel: Highest` task | **Access is denied** |
+| Trigger it (`Start-ScheduledTask`) | **Succeeded** — the design requires this |
+| Delete it (`Unregister-ScheduledTask`) | **Access is denied** |
 
 ```
-icacls C:\Windows\System32\Tasks\OpenFortiTrayTunnel
-schtasks /Query /TN OpenFortiTrayTunnel /XML
-whoami /groups
+icacls C:\Windows\System32\Tasks\OpenFortiTray
+  AzureAD\<user>:(R)                          <-- read only
+  BUILTIN\Administrators:(I)(R,W,D,WDAC,WO)
+  NT AUTHORITY\SYSTEM:(I)(R,W,D,WDAC,WO)
 ```
 
-and, from an unelevated shell as the same user, attempt
-`schtasks /Change /TN OpenFortiTrayTunnel /TR calc.exe` and confirm it is refused.
-If write is *not* refused, Option B is dead as specified and the task must be
-registered through the COM API with an explicit SDDL.
+`schtasks /Change` is not a valid probe: it prompts for the principal's run-as
+password and never reaches the access check, which is why the COM API — the path
+real malware uses — is what was tested.
+
+Execute-but-not-modify is exactly the permission shape Option B needs, and it held
+on the one machine that matters. Two things follow:
+
+- The refused self-registration is worth noting on its own: unelevated code
+  *cannot* mint its own `Highest` task, which confirms the threat model above is
+  real rather than theoretical. The elevation this design creates is genuinely new
+  capability, and our task is the only gate in front of it.
+- Re-run these four probes against `OpenFortiTrayTunnel` once the installer
+  registers it, rather than inferring from this one. Same registration path is
+  strong evidence, not proof.
 
 Also set `MultipleInstances: IgnoreNew` in the task definition, so a flood of
-`schtasks /Run` calls cannot spawn a fleet of runners.
+`schtasks /Run` calls cannot spawn a fleet of runners. The existing task already
+carries it, so the installer's current command produces it by default.
 
 ### 8. ACCEPTED RISK — arbitrary gateway means route control
 
@@ -219,8 +240,8 @@ matches macOS, where `brew upgrade --cask` needs no privilege at all.
 
 ## Implementation gate
 
-Findings 1-6 are requirements on the implementation plan, not review notes to
-weigh later. Finding 7 is a hardware check that must pass **before** the runner is
-written, because a failure invalidates the approach. Finding 8 goes in the README's
-security section, so the bargain is stated where a user can read it rather than
-only in a spec.
+Findings 1-6 are requirements on the implementation plan, not review notes to weigh
+later. Finding 7 was the check that could have invalidated the whole approach; it
+passed on hardware, so implementation is unblocked. Finding 8 goes in the README's
+security section, so the bargain is stated where a user can read it rather than only
+in a spec.
