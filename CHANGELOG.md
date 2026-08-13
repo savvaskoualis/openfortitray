@@ -6,6 +6,10 @@ tags. Dates are the release date.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.34] — 2026-08-13
+
 ### Added
 - **Status window** (`Status…` in the tray menu). Shows the connection state with a
   colour-coded indicator, the assigned IP, gateway, protocol and DTLS setting, a
