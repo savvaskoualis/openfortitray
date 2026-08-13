@@ -41,11 +41,40 @@ _Nothing yet._
 - **The update prompt** shows the installed and available versions as a lined-up
   comparison rather than a single sentence, and is tall enough for its own buttons.
 
+- **Retries now notify.** A reconnect that never had a healthy session used to be
+  silent, on the reasoning that the tray icon already showed it trying — but the
+  icon is a colour in the corner of the screen, and a connect that quietly retried
+  for ninety seconds before giving up read as the app having done nothing. It says
+  "VPN reconnecting" rather than "VPN dropped", because nothing was dropped, and it
+  carries the gateway's own reason when there is one.
+
+  The gating moved from per-transition to per-**episode**, which is what makes that
+  safe: the retry rounds alternate Reconnecting → Connecting → Reconnecting, so
+  every Reconnecting looks like a fresh transition and an ungated notification would
+  post one per round. One toast per episode; a later episode can speak again.
+
 ### Fixed
 - Three copies of "what does this tunnel state say" collapsed into one
   (`internal/uistate`). They had already drifted: the settings strip cut a
   multi-line error to its first line but never applied the length cap, so a long
   openconnect error stretched that strip while the tray truncated the same text.
+- Notification attempts are logged. `SendNotification` reports nothing back, so a
+  missing toast was indistinguishable from one the app never tried to post; the log
+  now records either that it posted or which state it declined and why.
+
+### Known limitation
+- **macOS may not display notifications after an update.** The app is ad-hoc signed
+  rather than Developer-ID signed, so every build has a different code signature and
+  macOS can treat it as a different app — silently withholding notification
+  authorization until it is granted again in System Settings → Notifications →
+  OpenFortiTray. Unrelated to the changes above; the app posts either way, as the
+  log shows.
+
+  fyne reports such a failure through `NSLog`, which does **not** reach the app's
+  log file on macOS: a bundled `.app` has file descriptor 2 wired to the system-log
+  socket, and Cocoa re-establishes that during fyne's driver init, undoing the
+  redirect this release added (verified with `lsof` against the live process). The
+  redirect is kept for Linux and for early-startup output.
 
 ### Not included
 - **Traffic counters.** The status window has no sent/received figures: openconnect
