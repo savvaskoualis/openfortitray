@@ -600,6 +600,24 @@ type Options struct {
 	// ServerCertPin is the fingerprint passed to --servercert when pinning.
 	ServerCertPin string
 
+	// Logout, when non-nil, is called with the cookie a session used, once the
+	// backend for that session has exited. It exists because openconnect has no
+	// logout for the Fortinet protocol at all — its logout endpoints cover Juniper
+	// (dana-na/auth/logout.cgi) and GlobalProtect (ssl-vpn/logout.esp) only — so
+	// closing the tunnel leaves the session ESTABLISHED on the gateway until the
+	// gateway's own timeout. On a one-SSL-VPN-session-per-user gateway that means
+	// every reconnect is refused in the meantime: measured, five separate freshly
+	// minted cookies were rejected over 3.5 minutes after a clean disconnect before
+	// one was accepted. FortiClient does not have this problem because it sends the
+	// logout, which is what this hook is for.
+	//
+	// It is called only when the session actually came up (no session, nothing to
+	// log out), from the runFn's goroutine before it returns — so a caller that
+	// waits for teardown, as the app's shutdown path does, waits for this too. It
+	// must be bounded and best-effort: a gateway that will not answer must not be
+	// able to hold up an exit.
+	Logout func(cookie string)
+
 	// SplitDNS lists the domains whose lookups must go to the VPN-pushed DNS via
 	// macOS per-domain scoped resolvers (Profile.SplitDNS). When non-empty on the
 	// privileged (sudo helper) path, the discovered DNS is installed with the
@@ -1006,6 +1024,10 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		_, _ = io.WriteString(stdin, cookie+"\n")
 		stdin.Close()
 
+		// sessionUp records that the gateway actually established a session for this
+		// cookie, which is the precondition for logging it out below. Written and read
+		// only on this goroutine (the scan loop, then after Wait).
+		sessionUp := false
 		var lastLines []string
 		sc := bufio.NewScanner(pr)
 		// Handshake timing. openconnect's own progress lines are the only visibility
@@ -1026,6 +1048,7 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 			if m := connectedRe.FindStringSubmatch(line); m != nil {
 				log.Printf("openconnect: [%6.2fs] tunnel up as %s", time.Since(started).Seconds(), m[1])
 				handshakeLines = maxHandshakeLogLines // stop mirroring: the rest is traffic
+				sessionUp = true
 				connected(m[1])
 				continue
 			}
@@ -1040,6 +1063,15 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		pr.Close()
 
 		err = <-waitErr
+		// End the session on the GATEWAY, not just locally. openconnect has no
+		// Fortinet logout, so without this the session stays established server-side
+		// until the gateway times it out, and a one-session-per-user gateway refuses
+		// every reconnect until then (see Options.Logout). Done before the returns
+		// below so it happens on every exit path — a user disconnect, a drop, or a
+		// shutdown — whenever a session existed.
+		if opts.Logout != nil && sessionUp {
+			opts.Logout(cookie)
+		}
 		if ctx.Err() != nil {
 			return err // we asked it to stop; the exit reason is irrelevant
 		}

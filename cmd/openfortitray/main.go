@@ -1046,7 +1046,27 @@ func main() {
 			// privileged helper path, which validates each flag against an exact
 			// allowlist before openconnect sees it (Task 24; see tunnel.Options
 			// and scripts/openfortitray-tunnel).
-			DTLS:           tp.prof.DTLS,
+			DTLS: tp.prof.DTLS,
+			// End the session on the gateway when the tunnel goes down. openconnect
+			// never does this for Fortinet, so without it the FortiGate holds the
+			// session until its own timeout and refuses every reconnect in between
+			// (one SSL-VPN session per user) — measured at 3.5 minutes of refusals
+			// after a clean disconnect. Best-effort and bounded; the stored cookie is
+			// dropped too, since a logged-out session's cookie is dead.
+			Logout: func(cookie string) {
+				ctx, cancel := context.WithTimeout(context.Background(), auth.LogoutTimeout)
+				defer cancel()
+				if err := auth.Logout(ctx, auth.LogoutClient(), tp.prof.GatewayURL(), cookie); err != nil {
+					log.Printf("tunnel: gateway logout failed (the session will linger until it times out): %v", err)
+				} else {
+					log.Printf("tunnel: session ended on the gateway")
+				}
+				if tp.prof.Gateway != "" {
+					if err := a.cookieDelete(cookieKey(tp.prof.Gateway)); err != nil {
+						log.Printf("tunnel: could not drop the logged-out session cookie: %v", err)
+					}
+				}
+			},
 			DualStack:      tp.prof.DualStack,
 			ServerCertMode: string(tp.prof.ServerCert.Mode),
 			ServerCertPin:  tp.prof.ServerCert.Pin,

@@ -1590,3 +1590,59 @@ func TestWaitHonoursContextDeadline(t *testing.T) {
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
+
+// The runner must call Logout with the session's cookie once the backend exits —
+// and only when a session actually came up. openconnect has no Fortinet logout,
+// so this hook is the only thing that ends the session on the gateway; skipping
+// it leaves a one-session-per-user gateway refusing reconnects until it times out.
+func TestRunOpenconnectLogsOutAfterSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	dir := t.TempDir()
+	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
+echo "Configured as 10.0.0.9, with SSL connected"
+exit 0
+`)
+	var mu sync.Mutex
+	var got []string
+	run := RunOpenconnect(Options{
+		OpenconnectPath: fake,
+		Gateway:         "gw.example.com:10443",
+		Logout:          func(c string) { mu.Lock(); got = append(got, c); mu.Unlock() },
+	})
+	_ = run(context.Background(), "SESSIONCOOKIE", func(string) {})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "SESSIONCOOKIE" {
+		t.Errorf("Logout calls = %v, want exactly one with the session cookie", got)
+	}
+}
+
+// No session, nothing to log out: a cookie the gateway refused never created a
+// session, so calling logout for it would be a pointless request on every retry.
+func TestRunOpenconnectSkipsLogoutWithoutSession(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	dir := t.TempDir()
+	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
+echo "Cookie was rejected by server; exiting."
+exit 1
+`)
+	var mu sync.Mutex
+	calls := 0
+	run := RunOpenconnect(Options{
+		OpenconnectPath: fake,
+		Gateway:         "gw.example.com:10443",
+		Logout:          func(string) { mu.Lock(); calls++; mu.Unlock() },
+	})
+	_ = run(context.Background(), "DEAD", func(string) {})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 0 {
+		t.Errorf("Logout called %d times for a rejected cookie, want 0", calls)
+	}
+}
