@@ -1095,6 +1095,9 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 		}
 		name, args := opts.startArgv(confPath)
 		cmd := exec.CommandContext(ctx, name, args...)
+		// Windows would otherwise put openconnect's console on screen for the life of
+		// the tunnel — and let the user close it, taking the VPN down with it.
+		hideChildConsole(cmd)
 		if stopName, stopArgs, viaHelper := opts.stopArgv(); viaHelper {
 			cmd.Cancel = func() error { return runHelperStop(cmd, stopName, stopArgs) }
 			cmd.WaitDelay = helperWaitDelay
