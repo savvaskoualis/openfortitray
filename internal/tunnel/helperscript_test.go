@@ -320,6 +320,35 @@ func TestHelperRejectsDisallowedFlags(t *testing.T) {
 	}
 }
 
+// stubbedHelper writes a copy of the privileged helper into dir whose openconnect
+// is the given shell script and whose runtime paths (PIDFILE, CONFDIR) point
+// inside dir, so an unprivileged test can run the real start path without write
+// access to /var/run. It returns the helper's path.
+func stubbedHelper(t *testing.T, dir, stubScript string) string {
+	t.Helper()
+	stub := filepath.Join(dir, "openconnect")
+	if err := os.WriteFile(stub, []byte(stubScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(helperScript(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched := strings.Replace(string(src), "OPENCONNECT='@OPENCONNECT@'", "OPENCONNECT='"+stub+"'", 1)
+	patched = strings.Replace(patched, "PIDFILE=/var/run/openfortitray-openconnect.pid", "PIDFILE="+filepath.Join(dir, "pid"), 1)
+	patched = strings.Replace(patched, "CONFDIR=/var/run/openfortitray-conf", "CONFDIR="+filepath.Join(dir, "conf"), 1)
+	if !strings.Contains(patched, "OPENCONNECT='"+stub+"'") ||
+		!strings.Contains(patched, "PIDFILE="+filepath.Join(dir, "pid")) ||
+		!strings.Contains(patched, "CONFDIR="+filepath.Join(dir, "conf")) {
+		t.Fatal("failed to patch the helper copy (placeholder, PIDFILE or CONFDIR line changed?)")
+	}
+	helper := filepath.Join(dir, "openfortitray-tunnel")
+	if err := os.WriteFile(helper, []byte(patched), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return helper
+}
+
 // End to end: a validated flag set actually reaches openconnect's argv, in the
 // order internal/tunnel builds (fixed flags, then the toggles, then the
 // gateway). Darwin only: the run has to get past resolve_openconnect, and on
@@ -345,8 +374,14 @@ func TestHelperAllowlistedFlagsReachOpenconnectArgv(t *testing.T) {
 	}
 	patched := strings.Replace(string(src), "OPENCONNECT='@OPENCONNECT@'", "OPENCONNECT='"+stub+"'", 1)
 	patched = strings.Replace(patched, "PIDFILE=/var/run/openfortitray-openconnect.pid", "PIDFILE="+filepath.Join(dir, "pid"), 1)
-	if !strings.Contains(patched, "OPENCONNECT='"+stub+"'") || !strings.Contains(patched, "PIDFILE="+filepath.Join(dir, "pid")) {
-		t.Fatal("failed to patch the helper copy (placeholder or PIDFILE line changed?)")
+	// CONFDIR holds the short-lived openconnect config file carrying the cookie.
+	// It lives under /var/run in production (root-only); redirect it too, or an
+	// unprivileged test run cannot create it.
+	patched = strings.Replace(patched, "CONFDIR=/var/run/openfortitray-conf", "CONFDIR="+filepath.Join(dir, "conf"), 1)
+	if !strings.Contains(patched, "OPENCONNECT='"+stub+"'") ||
+		!strings.Contains(patched, "PIDFILE="+filepath.Join(dir, "pid")) ||
+		!strings.Contains(patched, "CONFDIR="+filepath.Join(dir, "conf")) {
+		t.Fatal("failed to patch the helper copy (placeholder, PIDFILE or CONFDIR line changed?)")
 	}
 	helper := filepath.Join(dir, "openfortitray-tunnel")
 	if err := os.WriteFile(helper, []byte(patched), 0o755); err != nil {
@@ -364,9 +399,117 @@ func TestHelperAllowlistedFlagsReachOpenconnectArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openconnect was never exec'd with the validated flags: %v", err)
 	}
-	want := "--protocol=fortinet --cookie-on-stdin --non-inter --no-dtls --disable-ipv6 --servercert pin-sha256:AAAA gw:10443"
-	if strings.TrimSpace(string(got)) != want {
-		t.Errorf("openconnect argv = %q, want %q", strings.TrimSpace(string(got)), want)
+	argv := strings.TrimSpace(string(got))
+	conf := filepath.Join(dir, "conf", "openconnect.conf")
+	want := "--protocol=fortinet --config " + conf +
+		" --non-inter --no-dtls --disable-ipv6 --servercert pin-sha256:AAAA gw:10443"
+	if argv != want {
+		t.Errorf("openconnect argv = %q, want %q", argv, want)
+	}
+	// The cookie must never reach the argv: it would then be visible in `ps` for
+	// the tunnel's whole life.
+	if strings.Contains(argv, "COOKIE") {
+		t.Errorf("the session cookie leaked into openconnect's argv: %q", argv)
+	}
+}
+
+// The helper hands the cookie to openconnect through a config file because
+// --cookie-on-stdin truncates at 1024 bytes and silently breaks longer cookies
+// (1288-byte cookies observed from this gateway, rejected with an opaque "Cookie
+// was rejected by server"). So the file must carry the cookie WHOLE.
+func TestHelperConfigFileCarriesTheFullCookie(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX helper only")
+	}
+	dir := t.TempDir()
+	// Long enough to have been truncated by the old path, and made of the
+	// characters a real SVPNCOOKIE uses.
+	long := strings.Repeat("aB3._~%=+/-", 130) // 1430 chars
+	confDump := filepath.Join(dir, "conf-dump")
+	helper := stubbedHelper(t, dir, `#!/bin/sh
+# Record the config file openconnect was handed, before the helper unlinks it.
+for a in "$@"; do
+  case "$prev" in --config) cp "$a" `+confDump+` ;; esac
+  prev=$a
+done
+exit 0
+`)
+	cmd := exec.Command("/bin/sh", helper, "start", "gw:10443")
+	cmd.Stdin = strings.NewReader(long + "\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper failed: %v (%s)", err, out)
+	}
+
+	data, err := os.ReadFile(confDump)
+	if err != nil {
+		t.Fatalf("openconnect was not given a config file: %v", err)
+	}
+	want := "cookie=SVPNCOOKIE=" + long
+	if strings.TrimSpace(string(data)) != want {
+		t.Errorf("config file = %q,\nwant the cookie whole (%d chars)", string(data), len(long))
+	}
+}
+
+// SECURITY: the config file format accepts any openconnect option, including
+// script=, which openconnect runs as ROOT. So a cookie must never be able to
+// introduce a second config line.
+//
+// Two defences, both asserted here. The helper reads the cookie with a single
+// `read -r`, so anything after a newline is never read at all; and validate_cookie
+// restricts the value to the characters a real SVPNCOOKIE uses, so a value with
+// whitespace (which could otherwise carry an option on the same line) is refused
+// outright.
+func TestHelperCookieCannotInjectConfigOptions(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("resolve_openconnect refuses a non-root-owned stub on Linux")
+	}
+	dir := t.TempDir()
+	confDump := filepath.Join(dir, "conf-dump")
+	helper := stubbedHelper(t, dir, "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --config ]; then cp \"$a\" "+confDump+"; fi\n  prev=$a\ndone\nexit 0\n")
+
+	cmd := exec.Command("/bin/sh", helper, "start", "gw:10443")
+	cmd.Stdin = strings.NewReader("GOODCOOKIE\nscript=/tmp/evil\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper failed: %v (%s)", err, out)
+	}
+	data, err := os.ReadFile(confDump)
+	if err != nil {
+		t.Fatalf("no config file was produced: %v", err)
+	}
+	if strings.Contains(string(data), "script=") {
+		t.Errorf("a newline in the cookie injected a config option — openconnect runs script= as root:\n%s", data)
+	}
+	if got := strings.TrimSpace(string(data)); got != "cookie=SVPNCOOKIE=GOODCOOKIE" {
+		t.Errorf("config file = %q, want only the first line's cookie", got)
+	}
+}
+
+// Values that could carry an option on the SAME line, or be mistaken for a flag,
+// must be refused before openconnect is started at all.
+func TestHelperRejectsUnsafeCookies(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("resolve_openconnect refuses a non-root-owned stub on Linux")
+	}
+	for _, tc := range []struct{ name, cookie string }{
+		{"space could carry another option", "GOOD script=/tmp/evil"},
+		{"tab", "GOOD\tscript=/tmp/evil"},
+		{"leading dash looks like a flag", "-oProxyCommand=evil"},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "ran")
+			helper := stubbedHelper(t, dir, "#!/bin/sh\ntouch "+marker+"\nexit 0\n")
+			cmd := exec.Command("/bin/sh", helper, "start", "gw:10443")
+			cmd.Stdin = strings.NewReader(tc.cookie + "\n")
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Errorf("helper accepted a cookie it must reject: %q (output %s)", tc.cookie, out)
+			}
+			if _, statErr := os.Stat(marker); statErr == nil {
+				t.Error("openconnect was started with an invalid cookie")
+			}
+		})
 	}
 }
 

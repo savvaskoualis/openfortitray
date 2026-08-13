@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"os/user"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -388,16 +389,47 @@ func currentPrincipal() (string, error) {
 	return u.Username, nil
 }
 
-// HelperReady reports whether the privileged helper is installed AND callable
-// passwordlessly by this user — the real end-to-end check, not just a file stat.
-// It is what decides whether the first-run bootstrap is needed. `stop` on no
-// running tunnel is a no-op, so the probe is cheap and side-effect-free.
+// RequiredHelperABI is the app<->helper contract this build needs. The installed
+// helper prints its own with `openfortitray-tunnel abi`, and a mismatch means the
+// helper predates something the app depends on, so the bootstrap must reinstall it.
+//
+// ABI 2: the helper stopped handing the cookie to openconnect via
+// --cookie-on-stdin, whose 1024-byte read buffer silently truncated the longer
+// cookies this gateway issues (1288 bytes observed) — producing an opaque "Cookie
+// was rejected by server" that looked for a long time like a gateway fault. An
+// ABI-1 helper cannot connect with such a cookie at all, so shipping the app
+// without upgrading the helper would fix nothing.
+const RequiredHelperABI = 2
+
+// HelperReady reports whether the privileged helper is installed, callable
+// passwordlessly by this user, AND current enough for this build — the real
+// end-to-end check, not just a file stat. It is what decides whether the
+// first-run bootstrap is needed. `stop` on no running tunnel is a no-op, so the
+// probe is cheap and side-effect-free.
 func HelperReady() bool {
 	return helperReadyAt(HelperPath, func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), helperProbeTimeout)
 		defer cancel()
 		return exec.CommandContext(ctx, "sudo", "-n", HelperPath, "stop").Run()
-	})
+	}) && helperABIAt(HelperPath) >= RequiredHelperABI
+}
+
+// helperABIAt returns the ABI the installed helper reports, or 0 if it cannot be
+// determined — which is the case for every helper predating the `abi` subcommand
+// (they exit non-zero on an unknown one). 0 is below any requirement, so an
+// unknown helper is treated as outdated and gets reinstalled.
+func helperABIAt(path string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), helperProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sudo", "-n", path, "abi").Output()
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // helperReadyAt is the testable core of HelperReady: the helper file must exist

@@ -100,6 +100,14 @@ export PATH
 OPENCONNECT='@OPENCONNECT@'
 
 PIDFILE=/var/run/openfortitray-openconnect.pid
+# Directory for the short-lived openconnect config file that carries the session
+# cookie (see cmd_start). Root-only, so the cookie is readable by nobody the
+# helper does not already trust.
+CONFDIR=/var/run/openfortitray-conf
+# HELPER_ABI is bumped whenever the app<->helper contract changes, so the app can
+# tell an outdated helper from a current one and offer to reinstall it. ABI 2
+# stopped passing the cookie via --cookie-on-stdin (see cmd_start).
+HELPER_ABI=2
 # Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
 # openconnect uses this window to send its logout request to the FortiGate, so
 # the server-side session is released and does NOT linger to reject the next
@@ -131,6 +139,26 @@ die() {
 # validate_gateway rejects anything that is not a plain host:port. Without this,
 # a caller could smuggle openconnect options (--script=..., --csd-wrapper=...)
 # into the argument list and get arbitrary root code execution.
+# validate_cookie is a SECURITY BOUNDARY, not a sanity check.
+#
+# cmd_start writes the cookie into an openconnect config file, and that file
+# format accepts ANY openconnect long option — including script=, which
+# openconnect runs as root. A cookie containing a newline could therefore append
+# arbitrary options and turn "start a tunnel" into "run this as root". So the
+# cookie is restricted to the characters a FortiGate SVPNCOOKIE actually uses
+# (base64/hex with URL-safe and percent-encoding punctuation): no whitespace, no
+# newlines, no control characters, nothing that could begin a new config line.
+#
+# It must also be non-empty, and must not start with '-' so it can never be
+# mistaken for a flag by anything downstream.
+validate_cookie() {
+	case "$1" in
+	'') die "empty cookie" ;;
+	-*) die "cookie must not start with '-'" ;;
+	*[!A-Za-z0-9._~%=+/-]*) die "cookie contains invalid characters" ;;
+	esac
+}
+
 validate_gateway() {
 	case "$1" in
 	-*) die "gateway must not start with '-'" ;;
@@ -359,15 +387,41 @@ cmd_start() {
 	umask 022
 	echo $$ >"$PIDFILE" || die "cannot write $PIDFILE"
 
-	# --non-inter: never prompt (there is no tty); --cookie-on-stdin: the cookie
-	# arrives on stdin, which sudo passes through, so it stays off the argv and
-	# out of the process table. The validated flags ("$@") sit before the gateway,
-	# matching the order internal/tunnel builds for the direct path.
-	exec "$oc" --protocol=fortinet --cookie-on-stdin --non-inter "$@" "$gateway"
+	# The cookie arrives on stdin (sudo passes it through), so it never touches the
+	# argv or the process table. It does NOT go on to openconnect's stdin, though:
+	# openconnect's --cookie-on-stdin reads the cookie with a 1024-byte buffer and
+	# silently TRUNCATES anything longer, and this gateway's SAML cookies routinely
+	# exceed that (1288 bytes observed). A truncated cookie is rejected with an
+	# opaque "Cookie was rejected by server", which looked for a long time like a
+	# gateway problem: same cookie, --cookie-on-stdin refused and --cookie accepted,
+	# proven side by side.
+	#
+	# So hand it over through a config file instead. Not the argv (--cookie would
+	# publish the session cookie in `ps` for the tunnel's whole life) and not
+	# /dev/fd (openconnect needs a seekable config): a 0600 file in a 0700
+	# root-owned directory, unlinked a few seconds later, once openconnect has
+	# parsed it at startup.
+	IFS= read -r cookie || die "no cookie on stdin"
+	validate_cookie "$cookie"
+	rm -rf "$CONFDIR" || die "cannot clear $CONFDIR"
+	(umask 077 && mkdir -p "$CONFDIR") || die "cannot create $CONFDIR"
+	conf=$CONFDIR/openconnect.conf
+	(umask 077 && printf 'cookie=SVPNCOOKIE=%s\n' "$cookie" >"$conf") ||
+		die "cannot write $conf"
+	# A trap cannot survive exec, so schedule the unlink in a detached child.
+	# openconnect parses its config within milliseconds of starting; a few seconds
+	# is generous and bounded, and cmd_stop clears the directory too.
+	(sleep 5; rm -rf "$CONFDIR") >/dev/null 2>&1 &
+
+	# --non-inter: never prompt (there is no tty). The validated flags ("$@") sit
+	# before the gateway, matching the order internal/tunnel builds for the direct
+	# path.
+	exec "$oc" --protocol=fortinet --config "$conf" --non-inter "$@" "$gateway"
 }
 
 cmd_stop() {
 	[ $# -eq 0 ] || die "usage: openfortitray-tunnel stop"
+	rm -rf "$CONFDIR" # never leave a cookie file behind
 	terminate_running
 	exit 0 # stop is idempotent: "already gone" is success
 }
@@ -428,12 +482,19 @@ cmd_dns_clear() {
 	exit 0
 }
 
-[ $# -ge 1 ] || die "usage: openfortitray-tunnel {start <host:port>|stop|dns-set|dns-clear}"
+[ $# -ge 1 ] || die "usage: openfortitray-tunnel {start <host:port>|stop|dns-set|dns-clear|abi}"
 sub=$1
 shift
 case "$sub" in
 start) cmd_start "$@" ;;
 stop) cmd_stop "$@" ;;
+abi) # Print the app<->helper contract version, so the app can spot an outdated
+	# helper and offer to reinstall it instead of failing in a way that looks
+	# like a gateway problem. Takes no arguments and changes nothing.
+	[ $# -eq 0 ] || die "usage: openfortitray-tunnel abi"
+	echo "$HELPER_ABI"
+	exit 0
+	;;
 dns-set) cmd_dns_set "$@" ;;
 dns-clear) cmd_dns_clear "$@" ;;
 *) die "unknown subcommand: $sub" ;;
