@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.22] — 2026-08-13
+
+### Changed
+- **Connect timing is now visible in the log.** openconnect's progress lines are
+  mirrored into `openfortitray.log` with elapsed seconds, from launch until the
+  tunnel comes up (and only until then — after that the same stream is ordinary
+  traffic chatter). A connect that feels slow can now be attributed to a phase:
+  TLS, the gateway's config exchange, tunnel setup, or the routing script.
+
 ## [0.1.21] — 2026-08-13
 
 ### Fixed
