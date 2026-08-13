@@ -4,8 +4,6 @@ package tray
 import (
 	"bytes"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -69,15 +67,8 @@ type Controller struct {
 	// starts as the gray/disconnected icon Setup installs.
 	currentIcon []byte
 
-	// native, once ReassertTray has installed it, is the menu built directly on
-	// fyne.io/systray. Runtime updates go to it because they then land on the
-	// EXISTING native rows, which an open menu picks up — fyne's own refresh
-	// rebuilds the whole menu and is invisible until the menu is reopened (see
-	// native.go). nil means that takeover is unavailable (not started yet, headless,
-	// or unsupported), and everything falls back to the fyne menu.
-	native *nativeMenu
-	// lastView is the view most recently applied, so the native takeover can adopt
-	// the current state instead of starting from the "Disconnected" defaults.
+	// lastView is the view most recently applied. Kept so a future re-assert can
+	// re-render the current state rather than the defaults.
 	lastView view
 }
 
@@ -209,10 +200,6 @@ func (c *Controller) setAutostart(want bool) {
 		return
 	}
 	c.autoItem.Checked = want
-	if c.native != nil {
-		c.native.setAutoChecked(want)
-		return
-	}
 	c.menu.Refresh()
 }
 
@@ -236,12 +223,6 @@ func (c *Controller) Apply(e tunnel.Event) {
 	// canConnect and its opposite are always exact opposites (see view).
 	c.connectItem.Disabled = !v.canConnect
 	c.disconnectItem.Disabled = v.canConnect
-	if c.native != nil {
-		// In place, so a menu the user is holding open updates as the state changes
-		// rather than showing whatever it showed when it opened.
-		c.native.apply(v)
-		return
-	}
 	c.menu.Refresh()
 }
 
@@ -258,10 +239,6 @@ func (c *Controller) SetUpdateAvailable(version string) {
 	c.updateAvailable = true
 	if c.desk != nil {
 		c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
-	}
-	if c.native != nil {
-		c.native.setUpdateLabel(label)
-		return
 	}
 	c.menu.Refresh()
 }
@@ -283,39 +260,32 @@ func (c *Controller) ReassertTray() {
 	}
 	c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
 	c.desk.SetSystemTrayMenu(c.menu)
-
-	// The tray is live now, which is the first moment the native rows can be built
-	// (see native.go for why they are worth building). Replace fyne's rows with our
-	// own and adopt whatever state has already been rendered, so taking over cannot
-	// reset a connected tray to "Disconnected".
-	//
-	// OPT-IN, and deliberately so. The takeover is the only way to update a menu the
-	// user is holding open, but it cannot be exercised without a real tray — every
-	// systray call panics otherwise — so it is not covered by the tests, and a
-	// takeover that silently failed would leave the menu frozen on a stale state,
-	// which is worse than the staleness it fixes. Until it has been confirmed on a
-	// real desktop, fyne's rebuild-the-menu path stays the default.
-	if os.Getenv(liveMenuEnv) != "1" {
-		log.Printf("tray: menu updates via fyne (rebuild); set %s=1 for in-place updates "+
-			"that also refresh a menu held open", liveMenuEnv)
-		return
-	}
-	if nm := buildNativeMenu(c.app, c.setAutostartFromNative); nm != nil {
-		log.Print("tray: in-place menu updates active")
-		c.native = nm
-		if c.lastView.title != "" {
-			nm.apply(c.lastView)
-		}
-		if c.updateAvailable {
-			nm.setUpdateLabel(c.updateItem.Label)
-		}
-		return
-	}
-	log.Printf("tray: %s=1 but the in-place menu could not be built; using fyne's refresh", liveMenuEnv)
 }
 
-// liveMenuEnv opts into the in-place (systray-level) menu updates. See ReassertTray.
-const liveMenuEnv = "OPENFORTITRAY_LIVE_MENU"
+// KNOWN LIMITATION — a menu held open does not update.
+//
+// fyne's only route to changing a tray menu is (*fyne.Menu).Refresh, which calls
+// SetSystemTrayMenu → systray.ResetMenu(): every native menu item is removed and
+// re-added with new ids. macOS draws an open NSMenu from the snapshot AppKit took
+// when tracking began, so the rebuild is invisible until the menu is closed and
+// reopened. systray's own add_or_update_menu_item WOULD update an existing item in
+// place, and AppKit does reflect that live.
+//
+// A hybrid was tried and reverted (0.1.32/0.1.33): fyne builds the menu, then the
+// rows are rebuilt at the systray level and the handles kept. It cannot work.
+// Anything that makes fyne refresh again removes those items and restores fyne's,
+// so the handles then point at rows that are no longer on screen — updates go
+// nowhere while the visible menu, whose refresh is being skipped, freezes. It froze
+// on "Disconnected" with Disconnect greyed out, on macOS and Windows, leaving the
+// menu unable to control the tunnel at all. Nor can the two be kept in step: the
+// fyne refresh that would fix the visible menu is exactly what destroys the native
+// rows.
+//
+// The two real options are to build the whole tray on fyne.io/systray and not use
+// fyne's tray menu at all (fyne would then no longer start or own the tray), or to
+// fix Refresh upstream in fyne so it updates items in place instead of resetting.
+// Until one of those is done, the menu is correct whenever it is opened and stale
+// only while held open through a state change.
 
 // setAutostartFromNative is the native checkbox's action. It routes to the same
 // persist-then-tick path the fyne item uses.
