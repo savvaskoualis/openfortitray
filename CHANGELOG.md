@@ -8,6 +8,26 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.21] — 2026-08-13
+
+### Fixed
+- **The browser no longer opens several times before the VPN connects.** On a
+  gateway that permits one SSL-VPN session per user, a connect attempted while
+  the previous session is still being reaped is refused — and it refuses a
+  freshly minted cookie just as readily as an old one (logs show four fresh
+  cookies rejected in a row, then an identically produced fifth accepted). The
+  app used to treat every refusal as a dead cookie and run SAML again, costing a
+  browser tab per attempt. It now re-sends the same cookie a few seconds apart
+  while the gateway finishes reaping, and only re-authenticates if that genuinely
+  fails. A still-valid stored session is no longer discarded either.
+- **"Update available" now means installable.** On macOS the update check reads
+  GitHub releases while the install runs `brew upgrade --cask`, so a release
+  published before the Homebrew tap caught up produced an offer that brew
+  declined with "the latest version is already installed" — nothing happened.
+  The tap now bumps itself automatically on every release, and the app withholds
+  the offer until the cask is actually ready (failing open if the tap cannot be
+  read, so a network problem never hides a real update).
+
 ## [0.1.20] — 2026-08-13
 
 Stability and noise release: fewer logins, calmer status, notifications when it
