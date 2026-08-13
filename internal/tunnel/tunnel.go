@@ -95,12 +95,6 @@ type Supervisor struct {
 	earlyRetryDelay time.Duration
 	maxEarlyRetries int
 
-	// sameCookieDelay / maxSameCookieRetries shape the RESEND that now comes
-	// first: a rejected cookie is re-sent unchanged, maxSameCookieRetries times,
-	// sameCookieDelay apart, before any re-mint. See loop(). Exposed for tests.
-	sameCookieDelay      time.Duration
-	maxSameCookieRetries int
-
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
@@ -128,11 +122,6 @@ func New(authFn func(ctx context.Context) (string, error),
 		// the user would see as an error.
 		earlyRetryDelay: 4 * time.Second,
 		maxEarlyRetries: 2,
-		// Resend budget, spent BEFORE any re-mint. Sized from real logs of this
-		// gateway: after a session teardown it refuses cookies for ~10-20s, so
-		// 4 tries 3s apart covers the usual window without a single browser tab.
-		sameCookieDelay:      3 * time.Second,
-		maxSameCookieRetries: 4,
 	}
 }
 
@@ -283,14 +272,6 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
 	earlyRetries := 0 // quiet re-mints used before the first bring-up
-	// sameCookieRetries is the resend budget for this whole Connect, NOT per
-	// cookie: it bounds the total delay we add before falling back to a re-mint
-	// (maxSameCookieRetries * sameCookieDelay), instead of paying that wait again
-	// for every cookie we try. A first cookie that is genuinely dead (a stored one
-	// that expired overnight) therefore costs this wait once before SAML runs —
-	// still less than the time the gateway itself makes us wait when the cookie
-	// was fine all along, and it buys the common case zero browser tabs.
-	sameCookieRetries := 0
 	// postHealthyRejects counts auth-rejections AFTER the tunnel has been healthy
 	// this Connect (any healthy bring-up clears the tally; a non-auth failure in
 	// between does not). This gateway allows one SSL-VPN session per user,
@@ -360,46 +341,25 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		}
 
 		if errors.Is(err, ErrAuthRejected) {
-			// RESEND FIRST — the same cookie, unchanged.
+			// A rejected cookie is DEAD: re-mint, do not re-send it.
 			//
-			// This used to re-mint on every rejection, on the assumption that a
-			// refused cookie is refused outright and only a fresh SAML assertion can
-			// recover. Real logs of this gateway falsify that: four *freshly minted*
-			// cookies were rejected in a row and a fifth, produced identically, was
-			// accepted ~30s after the previous session's teardown. What the gateway
-			// objects to is the lingering server-side session (it allows one SSL-VPN
-			// session per user), not the cookie — so the cookie we hold is very
-			// probably fine and simply early. Re-minting cannot fix a session that
-			// has not been reaped yet; it only costs the user a browser tab per try,
-			// which is exactly what "the browser opens several times before it
-			// connects" was.
+			// 0.1.21 re-sent the same cookie several times first, on the theory that
+			// this gateway refuses cookies while it reaps a previous session. Measuring
+			// 43 real attempts falsified that: a freshly minted cookie was accepted on
+			// the first try in 3 of 3 cases, while a reused/stored one was refused in
+			// all 30 — the gateway's SVPNCOOKIE is bound to its session, so a cookie it
+			// has rejected once cannot start working. Re-sending only delayed the SAML
+			// that actually recovers, by maxSameCookieRetries * sameCookieDelay (~12s
+			// of every slow connect the user reported).
 			//
-			// So spend the cheap, invisible remedy first: re-send this cookie up to
-			// maxSameCookieRetries times, sameCookieDelay apart, while the gateway
-			// finishes reaping. Gated on !everConnected, matching the re-mint path
-			// below; the tray stays on Connecting… throughout (no Reconnecting flash),
-			// and a still-valid stored cookie survives instead of being thrown away.
-			if !everConnected && sameCookieRetries < s.maxSameCookieRetries {
-				sameCookieRetries++
-				select {
-				case <-time.After(s.sameCookieDelay):
-				case <-ctx.Done():
-					return
-				}
-				continue // cookie deliberately kept
-			}
-
-			// The resend budget is spent, so this cookie really does look dead
-			// (expired, or invalidated while stored). NOW mint a fresh one: cheap and
-			// non-interactive right after an interactive login, because the IdP
-			// browser session is still cached, so the re-auth completes in ~1s with
-			// no clicks. The loop top re-emits Authenticating/Connecting (never
+			// The re-mint is quiet and non-interactive right after an interactive
+			// login: the IdP browser session is still cached, so it completes in ~1s
+			// with no clicks. The loop top re-emits Authenticating/Connecting (never
 			// Reconnecting), so the tray stays calm instead of flashing
 			// "Reconnecting — cookie rejected". Bounded by maxEarlyRetries, so a
-			// gateway that refuses every fresh cookie costs at most maxEarlyRetries
-			// quiet re-auths before the loud fallback below. Once the tunnel has come
-			// up even once, everConnected is true and a later rejection takes the
-			// proven / immediate-reauth / backoff paths unchanged.
+			// gateway that refuses every fresh cookie cannot spin the browser flow.
+			// Once the tunnel has come up even once, everConnected is true and a later
+			// rejection takes the proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
 				cookie = "" // re-mint: the gateway rejects the stale cookie outright,
@@ -465,15 +425,6 @@ var connectedRe = regexp.MustCompile(`(?:Configured|Connected) as ([0-9a-fA-F.:]
 // the log per attempt (see the scan loop in RunOpenconnect). A handshake is a
 // dozen lines; the cap only matters for a gateway that never finishes one.
 const maxHandshakeLogLines = 60
-
-// dtlsFailedRe matches openconnect giving up on the DTLS tunnel, e.g.
-//
-//	Failed to connect DTLS tunnel; using HTTPS instead (state 3).
-//
-// Measured cost of that fallback on a network blocking UDP 10443: the config
-// exchange completes in 0.3s, openconnect then blocks 5s on the DTLS handshake
-// and repeats the exchange over HTTPS, reaching a usable tunnel at 6.7s.
-var dtlsFailedRe = regexp.MustCompile(`(?i)failed to connect DTLS tunnel`)
 
 // authRejectedMarkers are openconnect log fragments meaning the cookie is no
 // longer accepted by the gateway, so a fresh SAML login is required. They are
@@ -648,14 +599,6 @@ type Options struct {
 	ServerCertMode string
 	// ServerCertPin is the fingerprint passed to --servercert when pinning.
 	ServerCertPin string
-	// OnDTLSFailed, when non-nil, is called if openconnect reports that it could
-	// not establish the DTLS tunnel and fell back to HTTPS. That fallback is
-	// expensive — openconnect blocks ~5s waiting for a DTLS handshake that a
-	// network blocking UDP will never answer, then repeats the config exchange —
-	// so the caller uses this to stop asking for DTLS on gateways where it has
-	// been shown not to work. It runs on the scanner goroutine, so the callback
-	// must be cheap and must not block.
-	OnDTLSFailed func()
 
 	// SplitDNS lists the domains whose lookups must go to the VPN-pushed DNS via
 	// macOS per-domain scoped resolvers (Profile.SplitDNS). When non-empty on the
@@ -1085,9 +1028,6 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 				handshakeLines = maxHandshakeLogLines // stop mirroring: the rest is traffic
 				connected(m[1])
 				continue
-			}
-			if opts.OnDTLSFailed != nil && dtlsFailedRe.MatchString(line) {
-				opts.OnDTLSFailed()
 			}
 			if handshakeLines < maxHandshakeLogLines {
 				handshakeLines++

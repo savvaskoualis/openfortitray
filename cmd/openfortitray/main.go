@@ -28,7 +28,6 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
-	"github.com/savvaskoualis/openfortitray/internal/dtlsstate"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
@@ -117,11 +116,6 @@ type app struct {
 	cookieSet    func(key, value string) error
 	cookieDelete func(key string) error
 	samlAuth     func(ctx context.Context, prof config.Profile) (string, error)
-
-	// dtls remembers which gateways refused a DTLS tunnel so later connects skip
-	// the ~5s handshake wait those gateways impose. nil in tests, where the
-	// wiring that consults it null-checks it.
-	dtls *dtlsstate.Store
 
 	// notify posts a desktop notification. It is the fyne app's
 	// SendNotification in production and a recorder in tests; nil means "no
@@ -251,6 +245,18 @@ func (a *app) authenticate(ctx context.Context) (string, error) {
 		} else if cookie != "" {
 			log.Print("auth: reusing stored session cookie (no browser)")
 			return cookie, nil
+		}
+	}
+
+	// Reaching the SAML flow after the stored cookie was already offered this
+	// Connect means the gateway rejected it. Such a cookie is dead for good — a
+	// FortiGate SVPNCOOKIE is bound to its server-side session, so it cannot start
+	// working later — and keeping it only buys a guaranteed-failed openconnect
+	// attempt on every future Connect. Drop it so the next Connect goes straight to
+	// SAML. Best-effort: failing to delete must not fail the login.
+	if gw != "" && a.storedCookieTried.Load() {
+		if err := a.cookieDelete(key); err != nil {
+			log.Printf("auth: could not drop the rejected stored session cookie: %v", err)
 		}
 	}
 
@@ -1004,7 +1010,6 @@ func main() {
 		cookieSet:    credstore.Set,
 		cookieDelete: credstore.Delete,
 		samlAuth:     defaultSAMLAuth,
-		dtls:         dtlsstate.New(cfgDir),
 	}
 
 	// The auth/run funcs read a.snapshot() rather than a value captured at
@@ -1030,28 +1035,6 @@ func main() {
 		if runtime.GOOS != "darwin" {
 			splitDNS = nil
 		}
-		// DTLS is worth having when it works and expensive when it cannot: on a
-		// network blocking the gateway's UDP port, openconnect blocks ~5s on a DTLS
-		// handshake nothing answers and then repeats the config exchange over HTTPS,
-		// turning a ~1s connect into ~7s. Skip it on gateways already shown to
-		// refuse it, and record the refusal the first time it happens. The record
-		// expires (dtlsstate.RetryAfter), so a network that starts permitting UDP
-		// recovers DTLS with no user action.
-		gwKey := fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port)
-		wantDTLS := tp.prof.DTLS
-		// NOT applied automatically. Skipping DTLS demonstrably saves ~5s per
-		// connect, but during testing a run of connect failures overlapped the
-		// window in which --no-dtls was being passed, and it could not be separated
-		// from a second cause present at the same time (a leaked server-side session
-		// that the gateway refused new cookies for until it timed out). Passing a
-		// flag that MIGHT stop a VPN connecting, silently and by default, is not a
-		// trade worth making for 5s — so this only advises, and the user's explicit
-		// `dtls` profile toggle remains the single thing that turns DTLS off.
-		if wantDTLS && a.dtls != nil && a.dtls.Blocked(gwKey, time.Now()) {
-			log.Printf("tunnel: %s refused DTLS before; turning DTLS off for this profile in "+
-				"Settings would cut ~5s from each connect (not applied automatically — "+
-				"it is not yet proven safe on this gateway)", gwKey)
-		}
 		run := tunnel.RunOpenconnect(tunnel.Options{
 			Gateway:         fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port),
 			OpenconnectPath: tp.openconnectPath,
@@ -1063,20 +1046,10 @@ func main() {
 			// privileged helper path, which validates each flag against an exact
 			// allowlist before openconnect sees it (Task 24; see tunnel.Options
 			// and scripts/openfortitray-tunnel).
-			DTLS:           wantDTLS,
+			DTLS:           tp.prof.DTLS,
 			DualStack:      tp.prof.DualStack,
 			ServerCertMode: string(tp.prof.ServerCert.Mode),
 			ServerCertPin:  tp.prof.ServerCert.Pin,
-			OnDTLSFailed: func() {
-				if a.dtls == nil {
-					return
-				}
-				if err := a.dtls.MarkFailed(gwKey, time.Now()); err != nil {
-					log.Printf("tunnel: could not record the DTLS failure for %s: %v", gwKey, err)
-					return
-				}
-				log.Printf("tunnel: %s refused DTLS; later connects will skip it (~5s faster)", gwKey)
-			},
 		})
 		return run(ctx, cookie, connected)
 	})

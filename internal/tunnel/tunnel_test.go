@@ -211,7 +211,6 @@ func TestAuthRejectedTriggersReauth(t *testing.T) {
 	// startup graces: the resend budget (which retries the SAME cookie first) and
 	// the re-mint budget. Those are covered by TestResend* / TestQuietEarlyRetry*.
 	s.maxEarlyRetries = 0
-	s.maxSameCookieRetries = 0
 	s.Connect()
 	c.waitFor(t, Connected, 3*time.Second)
 	if n := authCalls.Load(); n < 2 {
@@ -278,7 +277,6 @@ func TestSessionTakenAfterHealthyStops(t *testing.T) {
 	s := New(auth, run, events)
 	s.backoffBase, s.backoffMax, s.minHealthy = 5*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond
 	s.maxEarlyRetries = 0
-	s.maxSameCookieRetries = 0
 	s.Connect()
 	e := c.waitForDetail(t, Error, "session ended", 3*time.Second)
 	if !strings.Contains(e.Detail, "Connect") {
@@ -365,7 +363,6 @@ func TestFreshCookieRejectedBacksOff(t *testing.T) {
 	// fresh cookie goes straight to the backoff wait, as this test asserts. The
 	// grace itself (retry same cookie first) is covered by TestQuietEarlyRetry*.
 	s.maxEarlyRetries = 0
-	s.maxSameCookieRetries = 0
 	s.Connect()
 	c.waitFor(t, Reconnecting, 2*time.Second)
 	time.Sleep(50 * time.Millisecond)
@@ -406,8 +403,7 @@ func TestQuietEarlyRetryRemintsCookieAndStaysConnecting(t *testing.T) {
 	}
 	s := New(auth, run, events)
 	s.earlyRetryDelay = 10 * time.Millisecond
-	s.maxSameCookieRetries = 0 // isolate the re-mint: no resend budget ahead of it
-	s.backoffBase = time.Hour  // the quiet re-mint, NOT the backoff, must be what recovers
+	s.backoffBase = time.Hour // the quiet re-mint, NOT the backoff, must be what recovers
 	s.Connect()
 	c.waitFor(t, Connected, 2*time.Second)
 
@@ -460,8 +456,7 @@ func TestQuietEarlyRetryRemintsFreshCookieEachRetry(t *testing.T) {
 	s := New(auth, run, events)
 	s.earlyRetryDelay = 5 * time.Millisecond
 	s.maxEarlyRetries = 2
-	s.maxSameCookieRetries = 0 // isolate the re-mints: no resend budget ahead of them
-	s.backoffBase = time.Hour  // the quiet re-mints, NOT the backoff, must be what recovers
+	s.backoffBase = time.Hour // the quiet re-mints, NOT the backoff, must be what recovers
 	s.Connect()
 	c.waitFor(t, Connected, 2*time.Second)
 
@@ -518,7 +513,6 @@ func TestQuietEarlyRetryExhaustsThenReauthsAndBacksOff(t *testing.T) {
 	s := New(auth, run, events)
 	s.earlyRetryDelay = 5 * time.Millisecond
 	s.maxEarlyRetries = 2
-	s.maxSameCookieRetries = 0 // isolate the re-mints: no resend budget ahead of them
 	s.backoffBase = 10 * time.Millisecond
 	s.Connect()
 
@@ -1595,155 +1589,4 @@ func TestWaitHonoursContextDeadline(t *testing.T) {
 	}
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
-}
-
-// A rejected cookie must be RE-SENT unchanged before the supervisor spends a
-// re-mint. Real logs of the target gateway show it refusing several
-// freshly-minted cookies in a row and then accepting one produced identically:
-// what it objects to is the lingering server-side session (one SSL-VPN session
-// per user), not the cookie. Re-minting cannot reap that session — it only costs
-// the user a browser tab per attempt, which is what "the browser opens several
-// times before it connects" was. So: one auth call, the same cookie re-sent,
-// Connecting… throughout.
-func TestRejectedCookieIsResentBeforeRemint(t *testing.T) {
-	events := make(chan Event, 64)
-	c := collect(events)
-	defer c.close()
-
-	var authCalls atomic.Int32
-	auth := func(ctx context.Context) (string, error) {
-		return fmt.Sprintf("C%d", authCalls.Add(1)), nil
-	}
-	var mu sync.Mutex
-	var cookiesSeen []string
-	var runs atomic.Int32
-	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		mu.Lock()
-		cookiesSeen = append(cookiesSeen, cookie)
-		mu.Unlock()
-		// The gateway refuses while it reaps the previous session, then accepts
-		// the very same cookie.
-		if runs.Add(1) <= 3 {
-			return ErrAuthRejected
-		}
-		connected("10.0.0.5")
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	s := New(auth, run, events)
-	s.sameCookieDelay = 5 * time.Millisecond
-	s.maxSameCookieRetries = 4
-	s.earlyRetryDelay = time.Hour // a re-mint must NOT be what recovers here
-	s.backoffBase = time.Hour     // nor the backoff
-	s.Connect()
-	c.waitFor(t, Connected, 2*time.Second)
-
-	if n := authCalls.Load(); n != 1 {
-		t.Errorf("auth calls = %d, want exactly 1 — resending must not open a browser", n)
-	}
-	mu.Lock()
-	seen := append([]string(nil), cookiesSeen...)
-	mu.Unlock()
-	if len(seen) < 4 {
-		t.Fatalf("want at least 4 attempts, got %v", seen)
-	}
-	for i, got := range seen {
-		if got != "C1" {
-			t.Errorf("attempt %d used cookie %q, want the original C1 re-sent", i+1, got)
-		}
-	}
-	for _, e := range c.snapshot() {
-		if e.State == Reconnecting || e.State == Error {
-			t.Errorf("resend emitted %v; the tray must stay on Connecting…", e.State)
-		}
-	}
-	s.Disconnect()
-	c.waitFor(t, Disconnected, 2*time.Second)
-}
-
-// The resend budget is bounded and belongs to the whole Connect, not to each
-// cookie: once it is spent, a cookie that is genuinely dead (a stored one that
-// expired) still gets replaced by a fresh SAML mint rather than being re-sent
-// forever.
-func TestResendBudgetExhaustedThenRemints(t *testing.T) {
-	events := make(chan Event, 64)
-	c := collect(events)
-	defer c.close()
-
-	var authCalls atomic.Int32
-	auth := func(ctx context.Context) (string, error) {
-		return fmt.Sprintf("C%d", authCalls.Add(1)), nil
-	}
-	var mu sync.Mutex
-	var cookiesSeen []string
-	run := func(ctx context.Context, cookie string, connected func(string)) error {
-		mu.Lock()
-		cookiesSeen = append(cookiesSeen, cookie)
-		n := len(cookiesSeen)
-		mu.Unlock()
-		if cookie == "C1" || n < 3 {
-			return ErrAuthRejected // C1 is dead no matter how often it is re-sent
-		}
-		connected("10.0.0.5")
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	s := New(auth, run, events)
-	s.sameCookieDelay = 2 * time.Millisecond
-	s.maxSameCookieRetries = 2
-	s.earlyRetryDelay = 2 * time.Millisecond
-	s.backoffBase = time.Hour // the re-mint, not the backoff, must recover
-	s.Connect()
-	c.waitFor(t, Connected, 2*time.Second)
-
-	mu.Lock()
-	seen := append([]string(nil), cookiesSeen...)
-	mu.Unlock()
-	// 1 initial + maxSameCookieRetries resends of C1, then a fresh cookie.
-	if len(seen) < 4 {
-		t.Fatalf("want the resend budget spent then a re-mint, got %v", seen)
-	}
-	for i := 0; i < 3; i++ {
-		if seen[i] != "C1" {
-			t.Errorf("attempt %d = %q, want C1 (resend budget spent first)", i+1, seen[i])
-		}
-	}
-	if seen[3] == "C1" {
-		t.Errorf("attempt 4 = %q, want a freshly minted cookie once the budget was spent", seen[3])
-	}
-	if n := authCalls.Load(); n < 2 {
-		t.Errorf("auth calls = %d, want >= 2 (a dead cookie must still be re-minted)", n)
-	}
-	s.Disconnect()
-	c.waitFor(t, Disconnected, 2*time.Second)
-}
-
-// openconnect's DTLS fallback line must reach OnDTLSFailed. That line is the only
-// signal that a connect paid ~5s for a DTLS handshake nothing answered, so the
-// caller can stop asking for DTLS on this gateway; a typo in the pattern would
-// silently keep every connect slow.
-func TestDTLSFailureIsReported(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell stub: POSIX only")
-	}
-	dir := t.TempDir()
-	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
-echo "Connected to 10.0.0.1:10443"
-echo "Failed to connect DTLS tunnel; using HTTPS instead (state 3)."
-echo "Configured as 10.0.0.5, with SSL connected"
-exit 0
-`)
-	var mu sync.Mutex
-	calls := 0
-	run := RunOpenconnect(Options{
-		OpenconnectPath: fake,
-		Gateway:         "gw.example.com:10443",
-		OnDTLSFailed:    func() { mu.Lock(); calls++; mu.Unlock() },
-	})
-	_ = run(context.Background(), "COOKIE", func(string) {})
-	mu.Lock()
-	defer mu.Unlock()
-	if calls != 1 {
-		t.Errorf("OnDTLSFailed called %d times, want 1", calls)
-	}
 }

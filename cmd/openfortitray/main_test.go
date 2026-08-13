@@ -490,3 +490,52 @@ func TestAwaitShutdownAfterQuitDoesNotRerun(t *testing.T) {
 		t.Errorf("Disconnect called %d times, want exactly 1 (awaitShutdown must not re-tear-down)", disconnects)
 	}
 }
+
+// A stored cookie the gateway rejected must be dropped, not kept for the next
+// Connect to fail on again. Measured against a real gateway, a reused SVPNCOOKIE
+// was refused on all 30 attempts — it is bound to its server-side session, so it
+// cannot start working later.
+func TestRejectedStoredCookieIsDropped(t *testing.T) {
+	mem := credstore.NewMemory()
+	if err := mem.Set(cookieKey("gw.example.com"), "DEAD"); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{
+		cfg: &config.Config{
+			ActiveProfile: "Default",
+			Profiles: []config.Profile{{
+				Name: "Default", Gateway: "gw.example.com", Port: 10443,
+				RememberSession: true,
+			}},
+		},
+		cookieGet:    mem.Get,
+		cookieSet:    mem.Set,
+		cookieDelete: mem.Delete,
+		samlAuth: func(ctx context.Context, p config.Profile) (string, error) {
+			return "FRESH", nil
+		},
+	}
+	a.setSnapshot(tunnelParams{prof: *a.cfg.Active()})
+
+	// First auth of this Connect: the stored cookie is offered, no browser.
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "DEAD" {
+		t.Fatalf("first auth = %q, want the stored cookie DEAD", got)
+	}
+
+	// The gateway rejected it, so the supervisor asks again: SAML runs, and the
+	// dead cookie must be gone — replaced by the fresh one, not left to be retried.
+	got, err = a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "FRESH" {
+		t.Fatalf("second auth = %q, want a fresh SAML cookie", got)
+	}
+	if v, _ := mem.Get(cookieKey("gw.example.com")); v != "FRESH" {
+		t.Errorf("stored cookie = %q, want the rejected one replaced by FRESH", v)
+	}
+}
