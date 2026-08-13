@@ -8,6 +8,45 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.20] — 2026-08-13
+
+Stability and noise release: fewer logins, calmer status, notifications when it
+matters.
+
+### Added
+- **Session reuse — no browser on every connect.** The SVPNCOOKIE is stored in
+  platform-native, user-scoped secret storage (macOS login keychain, Windows
+  DPAPI-encrypted file, `0600` file on Linux) and reused on reconnect and across
+  restarts; SAML runs only when the gateway rejects the stored cookie. Toggle
+  under Settings → Advanced ("Reuse session to avoid re-login", on by default);
+  turning it off, or changing a profile's gateway or auth method, deletes the
+  stored cookie. The value is never written to `config.json` or the log.
+- **Desktop notifications** on the transitions worth interrupting for: connected
+  (with the assigned IP), an established tunnel dropping, and a terminal
+  failure. Fires on state changes only, so a reconnect does not toast once per
+  retry, and a user-requested disconnect stays silent.
+
+### Changed
+- **Status text is human again.** The tray and settings strip no longer show
+  openconnect's multi-line stderr, its route-teardown output, or the helper's
+  "not owned by root" warning — those stay in the log. You get
+  "Reconnecting…", "connection lost — reconnecting", or a one-line install hint.
+- **No more scary red flashes during a normal connect.** The first-cookie
+  rejection dance this gateway does stays yellow (Connecting/Reconnecting); red
+  is reserved for a genuinely terminal failure.
+- **Stops instead of spinning when the session was taken.** On gateways that
+  allow one SSL-VPN session per user, another device logging in kills this
+  session. After a run of post-connect cookie rejections the app now stops with
+  "VPN session ended — click Connect to sign in" rather than re-running SAML
+  unattended (which, overnight, just times out on an untouched browser tab).
+- A failed sign-in reports "sign-in didn't complete — click Connect" instead of
+  the raw SAML error.
+
+### Fixed
+- The Linux/other session store now re-asserts `0600` on every write:
+  `os.WriteFile` applies its mode only when creating a file, so a store file
+  that already existed with wider permissions kept them.
+
 ## [0.1.19] — 2026-08-12
 
 ### Added
