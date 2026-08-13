@@ -8,6 +8,16 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.28] — 2026-08-13
+
+### Fixed
+- **One browser tab per connect instead of three.** The connect-time retries each
+  re-ran the SAML login — three logins in eleven seconds when the gateway was slow
+  to release a previous session. Those extra logins never helped: a gateway that is
+  refusing because it still holds a session refuses brand-new cookies just as
+  readily. The retries now reuse the cookie silently, and cover a wider window
+  (~20s) before anything louder happens.
+
 ## [0.1.27] — 2026-08-13
 
 ### Fixed
