@@ -120,7 +120,8 @@ For reference, `config.json` (schema v2, multi-profile) and `openfortitray.log` 
 Key profile fields: `gateway` (host, no scheme/port — no default), `port` (`10443`),
 `saml_port` (`8020`), `auth.method` (`saml`), `realm`, `dtls` (`true`; off →
 `--no-dtls`), `dual_stack` (`false`; off → `--disable-ipv6`), `server_cert.mode`
-(`warn`/`trust`/`pin`, with a sha256 `pin`), `split_dns`. A minimal config:
+(`warn`/`trust`/`pin`, with a sha256 `pin`), `split_dns`, `remember_session`
+(`true`). A minimal config:
 
 ```json
 {
@@ -133,6 +134,18 @@ Key profile fields: `gateway` (host, no scheme/port — no default), `port` (`10
   "autostart": true
 }
 ```
+
+### Session reuse
+
+With `remember_session` on (the default, "Reuse session to avoid re-login" under
+Settings → Advanced), the SSL-VPN session cookie is kept in platform-native,
+user-scoped secret storage — the macOS login keychain, a DPAPI-encrypted file on
+Windows, a `0600` file on Linux — and reused on reconnect and after a restart, so
+the SAML browser flow runs only once per session lifetime instead of on every
+connect. The cookie never goes into `config.json` or the log. Turning the toggle
+off, or changing a profile's gateway or auth method, deletes the stored cookie.
+On Linux the cookie is protected by file permissions alone (there is no
+libsecret dependency).
 
 Split-DNS domains are captured and validated but not yet installed as a scoped resolver —
 running alongside Tailscale/another VPN may need a manual `/etc/resolver` entry until that
