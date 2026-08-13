@@ -24,7 +24,11 @@ import (
 
 	"fyne.io/fyne/v2"
 	fyneapp "fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -592,22 +596,65 @@ func (a *app) promptUpdate(rel *update.Release) {
 	// the window, and destroying the last window makes fyne quit the app.
 	w := a.fyneApp.NewWindow("OpenFortiTray Update")
 	w.SetFixedSize(true)
-	w.Resize(fyne.NewSize(440, 170))
+	w.Resize(fyne.NewSize(460, 290))
 	w.CenterOnScreen()
 	w.SetCloseIntercept(func() { w.Hide() })
-	d := dialog.NewConfirm("Update available",
-		fmt.Sprintf("OpenFortiTray %s is available.\nUpdate and restart now?", rel.Tag),
-		func(ok bool) {
-			w.Hide()
-			if ok {
-				go a.applyUpdate(rel)
-			}
-		}, w)
-	d.SetConfirmText("Update & Restart")
-	d.SetDismissText("Later")
+	w.SetContent(a.updatePromptContent(rel, func(apply bool) {
+		w.Hide()
+		if apply {
+			go a.applyUpdate(rel)
+		}
+	}))
 	w.Show()
 	w.RequestFocus()
-	d.Show()
+}
+
+// updatePromptContent builds the update prompt's body: a heading, one line of
+// plain explanation, the two versions in the monospace face so they line up and
+// the difference is readable at a glance, and the actions with Update as the only
+// high-importance button.
+//
+// It replaces a dialog.NewConfirm whose whole message was a single string with an
+// embedded newline. A dialog cannot lay out a version comparison, and the two
+// numbers are the only thing the user is actually being asked about.
+func (a *app) updatePromptContent(rel *update.Release, done func(apply bool)) fyne.CanvasObject {
+	heading := canvas.NewText("Update available", theme.Color(theme.ColorNameForeground))
+	heading.TextSize = theme.Size(theme.SizeNameSubHeadingText)
+	heading.TextStyle = fyne.TextStyle{Bold: true}
+
+	body := widget.NewLabel("Installing takes a few seconds. OpenFortiTray restarts afterwards and reconnects.")
+	body.Wrapping = fyne.TextWrapWord
+	body.Importance = widget.LowImportance
+
+	versions := container.New(layout.NewFormLayout(),
+		mutedLabel("Installed"), monoLabel(version),
+		mutedLabel("Available"), monoLabel(rel.Tag),
+	)
+	bg := canvas.NewRectangle(theme.Color(theme.ColorNameHeaderBackground))
+	bg.CornerRadius = theme.Size(theme.SizeNameCardRadius)
+	bg.StrokeColor = theme.Color(theme.ColorNameSeparator)
+	bg.StrokeWidth = theme.Size(theme.SizeNameSeparatorThickness)
+	card := container.NewStack(bg, container.NewPadded(versions))
+
+	later := widget.NewButton("Later", func() { done(false) })
+	apply := widget.NewButton("Update & Restart", func() { done(true) })
+	apply.Importance = widget.HighImportance
+	actions := container.NewHBox(layout.NewSpacer(), later, apply)
+
+	return container.NewPadded(container.NewVBox(heading, body, card, actions))
+}
+
+// mutedLabel is a key label for the small two-column cards.
+func mutedLabel(text string) *widget.Label {
+	l := widget.NewLabel(text)
+	l.Importance = widget.LowImportance
+	return l
+}
+
+// monoLabel is a right-aligned monospace value, so version numbers line up
+// digit-for-digit between the two rows.
+func monoLabel(text string) *widget.Label {
+	return widget.NewLabelWithStyle(text, fyne.TextAlignTrailing, fyne.TextStyle{Monospace: true})
 }
 
 // UpdateClicked is the tray update item's action (UI goroutine). With a pending
