@@ -417,3 +417,76 @@ func TestResolveBundledOpenconnect(t *testing.T) {
 		})
 	}
 }
+
+// slowSupervisor makes the teardown take measurable time, so a test can tell
+// whether the caller actually waited for it.
+type slowSupervisor struct {
+	delay time.Duration
+	mu    sync.Mutex
+	done  bool
+}
+
+func (s *slowSupervisor) Connect()    {}
+func (s *slowSupervisor) Disconnect() {}
+func (s *slowSupervisor) Wait(ctx context.Context) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	s.done = true
+	s.mu.Unlock()
+}
+func (s *slowSupervisor) finished() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
+
+// awaitShutdown must not return until the tunnel teardown has finished.
+//
+// This is the regression test for a real leak: fyne installs its OWN
+// SIGINT/SIGTERM handler (gLDriver.catchTerm) that calls Quit immediately, and Go
+// delivers a signal to every registered channel. So a SIGTERM ended the fyne run
+// loop while our teardown was still running on its goroutine, main returned, and
+// the process died before openconnect could send its FortiGate logout — leaving a
+// server-side session that refused every new cookie for minutes.
+func TestAwaitShutdownBlocksUntilTeardownFinishes(t *testing.T) {
+	ss := &slowSupervisor{delay: 150 * time.Millisecond}
+	a := &app{sup: ss}
+
+	start := time.Now()
+	a.awaitShutdown()
+	if !ss.finished() {
+		t.Error("awaitShutdown returned while the teardown was still running; the process would exit mid-logout")
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("awaitShutdown returned after %v; it cannot have waited for the teardown", elapsed)
+	}
+}
+
+// The common path: the tray's Quit already ran the teardown, so awaitShutdown
+// just observes it and returns — it must neither hang nor re-run the teardown.
+func TestAwaitShutdownAfterQuitDoesNotRerun(t *testing.T) {
+	fs := &fakeSupervisor{}
+	a := &app{sup: fs}
+
+	quit := make(chan struct{}, 1)
+	a.shutdown(func() { quit <- struct{}{} })
+	select {
+	case <-quit:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the initial shutdown never completed")
+	}
+
+	done := make(chan struct{})
+	go func() { a.awaitShutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("awaitShutdown hung after a shutdown that had already finished")
+	}
+	if _, disconnects, _ := fs.counts(); disconnects != 1 {
+		t.Errorf("Disconnect called %d times, want exactly 1 (awaitShutdown must not re-tear-down)", disconnects)
+	}
+}

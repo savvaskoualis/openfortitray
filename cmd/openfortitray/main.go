@@ -80,6 +80,11 @@ type app struct {
 	// drains events without calling fyne.Do — so no fyne.Do is ever queued
 	// against a UI that a.fyneApp.Quit() is about to destroy.
 	quitting atomic.Bool
+	// shutdownDone is closed once the teardown goroutine has finished, so
+	// awaitShutdown can hold the process open until the tunnel is really down. It
+	// is created and closed inside shutdownOnce, which both guarantees exactly one
+	// close and publishes the assignment to whoever waits on it afterwards.
+	shutdownDone chan struct{}
 	// shutdownOnce makes the graceful teardown run exactly once, no matter how it
 	// is triggered. Both the tray's Quit item and the OS-signal handler route
 	// through app.shutdown, so a second trigger (a repeated SIGTERM, or a signal
@@ -739,8 +744,13 @@ func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
 // here.
 func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
+		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
 		go func() {
+			// Signal completion no matter how this returns, so awaitShutdown (which
+			// keeps the process alive for exactly this work) can never wait out its
+			// full timeout on a teardown that already finished or panicked.
+			defer close(a.shutdownDone)
 			a.sup.Disconnect()
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
 			defer cancel()
@@ -752,6 +762,35 @@ func (a *app) shutdown(done func()) {
 			done()
 		}()
 	})
+}
+
+// awaitShutdown blocks until the tunnel teardown has finished, starting it if
+// nothing has yet.
+//
+// It exists because fyne installs its OWN SIGINT/SIGTERM handler
+// (gLDriver.catchTerm) which calls Quit as soon as a signal arrives. Go delivers a
+// signal to every registered channel, so a SIGTERM reaches both handlers at once:
+// ours begins the graceful teardown on a goroutine, while fyne's ends the run
+// loop. main then returned and the process died mid-teardown — openconnect never
+// got to send its clean logout, so the FortiGate kept the session and refused
+// every new cookie (for minutes) until it timed the session out server-side. That
+// looked exactly like "we get logged out a lot" and like a connect that will not
+// connect. The observable symptom in the log was a "tearing down" line with no
+// matching "tunnel: exited" or "exiting" line after it.
+//
+// Called after Run returns, so the process outlives the UI by as long as the
+// teardown needs. shutdown is once-guarded, so calling it here is safe whether
+// the exit came from the tray's Quit, a signal, or fyne's own handler; the done
+// callback is a no-op because the run loop has already ended.
+func (a *app) awaitShutdown() {
+	a.shutdown(func() {})
+	select {
+	case <-a.shutdownDone:
+	case <-time.After(shutdownWait + 5*time.Second):
+		// The teardown owns its own bounded wait; this is only a backstop so a
+		// wedged helper cannot keep the process alive forever.
+		log.Printf("openfortitray: teardown did not finish in time; exiting anyway")
+	}
 }
 
 // watchSignals routes SIGINT/SIGTERM/SIGHUP to the same graceful shutdown the
@@ -1152,7 +1191,12 @@ func main() {
 	// run loop.
 	log.Print("entering fyne run loop")
 	a.fyneApp.Run()
-	log.Print("fyne run loop returned; app exiting")
+	log.Print("fyne run loop returned; waiting for the tunnel teardown")
+	// fyne quits the run loop from its own signal handler, so arriving here does
+	// NOT mean the tunnel is down. Block until it is (see awaitShutdown) —
+	// otherwise the process exits mid-teardown and leaks the server-side session.
+	a.awaitShutdown()
+	log.Print("app exiting")
 }
 
 // loggedRun wraps runFn so every backend exit lands in the log file.
