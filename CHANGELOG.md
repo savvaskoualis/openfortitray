@@ -8,6 +8,25 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.27] — 2026-08-13
+
+### Fixed
+- **Windows: the in-app update never actually ran** — the app closed and nothing
+  happened. The updater was started with `DETACHED_PROCESS`, which leaves the
+  child with no console, and `powershell.exe` can exit immediately without one
+  (the app itself has no console to inherit, being a GUI build). It now gets its
+  own hidden console, runs from a script file instead of a fragile one-line
+  command, logs every step to `update.log`, and always brings the app back — via
+  the scheduled task, or directly if that fails — so a failed update can never
+  leave you with no app running.
+- **No more endless browser tabs when a connect keeps failing.** A connect that
+  never came up retried forever and re-ran the login every round, opening a tab
+  each time. It now keeps its cookie between attempts (re-authenticating only
+  occasionally, since a gateway that is refusing because it still holds a previous
+  session refuses fresh logins too), and after several minutes stops with
+  "couldn't connect — click Connect to try again". Reconnection after a session
+  that *was* working stays unlimited.
+
 ## [0.1.26] — 2026-08-13
 
 ### Fixed
