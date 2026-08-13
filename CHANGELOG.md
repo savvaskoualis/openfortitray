@@ -8,6 +8,17 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.32] — 2026-08-13
+
+### Fixed
+- **The tray menu updates while it is open.** It used to show whatever it showed
+  when you opened it — click Connect and the row kept saying "Connecting…" until you
+  closed and reopened the menu. The rows are now updated in place rather than the
+  whole menu being rebuilt, which is what an already-open menu can pick up.
+- **Windows: openconnect's console window no longer appears.** A black
+  `openconnect.exe` window sat on top of your work for as long as the VPN was up —
+  and closing it, or pressing Ctrl-C in it, killed the tunnel.
+
 ## [0.1.31] — 2026-08-13
 
 ### Fixed
