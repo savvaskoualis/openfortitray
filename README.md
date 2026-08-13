@@ -188,7 +188,13 @@ launchctl bootout gui/$(id -u)/io.github.savvaskoualis.openfortitray 2>/dev/null
 brew uninstall --cask openfortitray 2>/dev/null || sudo rm -rf /Applications/OpenFortiTray.app
 sudo rm -f /usr/local/libexec/openfortitray-tunnel /etc/sudoers.d/openfortitray
 rm -rf ~/Library/Application\ Support/openfortitray
+# The reused session cookie lives in the login keychain, not in that directory:
+security delete-generic-password -s openfortitray 2>/dev/null
 ```
+
+(Repeat the `security delete-generic-password` line once per gateway you used —
+each gateway stores its own item under the `openfortitray` service. On Linux and
+Windows the stored session lives inside the config directory removed above.)
 
 **Linux**
 ```sh
