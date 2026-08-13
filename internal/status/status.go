@@ -68,6 +68,10 @@ type Controller struct {
 	primary     *widget.Button
 	settingsBtn *widget.Button
 	logBtn      *widget.Button
+	// buttonRow holds the three buttons. Kept so setPrimary can refresh it: a
+	// relabelled button reports a new minimum size, but only a container refresh
+	// re-runs the layout that acts on it.
+	buttonRow *fyne.Container
 
 	activity *fyne.Container
 	ring     *uistate.Ring
@@ -148,20 +152,26 @@ func (c *Controller) build() {
 
 	// Buttons. The primary is relabelled per state by Apply; it is the only
 	// high-importance control on screen.
-	c.primary = widget.NewButton("", func() {})
+	//
+	// It is created with its WIDEST label rather than an empty one: a button's
+	// minimum size comes from its text, and a container only re-runs its layout when
+	// it is refreshed — so a button built empty stayed 44px wide and "Disconnect"
+	// spilled out of it. setPrimary refreshes buttonRow for the same reason.
+	c.primary = widget.NewButton("Disconnect", func() {})
 	c.primary.Importance = widget.HighImportance
 	c.settingsBtn = widget.NewButton("Settings…", c.host.ShowSettings)
 	c.logBtn = widget.NewButton("Open log file…", c.host.OpenLog)
-	buttons := container.NewHBox(c.primary, layout.NewSpacer(), c.logBtn, c.settingsBtn)
+	c.buttonRow = container.NewHBox(c.primary, layout.NewSpacer(), c.logBtn, c.settingsBtn)
 
 	// Activity. An accordion so the history can be folded away; open by default,
 	// because a window whose interesting half is collapsed teaches nobody it is
-	// there.
-	c.activity = container.NewVBox()
+	// there. One FormLayout container holds the whole history: two columns that line
+	// up across rows, and tighter than a stack of per-row HBoxes.
+	c.activity = container.New(layout.NewFormLayout())
 	acc := widget.NewAccordion(widget.NewAccordionItem("Activity", c.activity))
 	acc.Open(0)
 
-	content := container.NewVBox(header, card, buttons, widget.NewSeparator(), acc)
+	content := container.NewVBox(header, card, c.buttonRow, widget.NewSeparator(), acc)
 
 	// A tray app's window must never quit the process: that would take the tunnel
 	// down with it. Closing hides, exactly as the settings window does.
@@ -282,6 +292,11 @@ func (c *Controller) setPrimary(v uistate.View) {
 		c.primary.OnTapped = c.host.Connect
 	}
 	c.primary.Enable()
+	// The label just changed, so the button's minimum size did too; the row has to
+	// be re-laid out or the new text renders outside the old box.
+	if c.buttonRow != nil {
+		c.buttonRow.Refresh()
+	}
 }
 
 // refreshActivity repaints the history rows. The ring is small and only changes on
@@ -293,8 +308,7 @@ func (c *Controller) refreshActivity() {
 	for _, e := range entries {
 		ts := widget.NewLabelWithStyle(e.At.Format("15:04:05"), fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
 		ts.Importance = widget.LowImportance
-		c.activity.Objects = append(c.activity.Objects,
-			container.NewHBox(ts, widget.NewLabel(e.Text)))
+		c.activity.Objects = append(c.activity.Objects, ts, widget.NewLabel(e.Text))
 	}
 	c.activity.Refresh()
 }

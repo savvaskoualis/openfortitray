@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,8 +31,10 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
+	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uitheme"
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
@@ -55,6 +59,13 @@ type app struct {
 	fyneApp  fyne.App
 	tray     *tray.Controller
 	settings *settings.Controller
+	// status is the (initially hidden) status window — the only surface that shows
+	// live state, since a tray menu cannot repaint while it is open.
+	status *status.Controller
+	// stopTick stops the 1 Hz uptime ticker that drives the status window's clock.
+	// nil until the ticker is started in OnStarted; called once during teardown so
+	// the goroutine cannot outlive the UI it posts to.
+	stopTick func()
 	// win is the (initially hidden) settings window, reused as the parent for the
 	// first-run bootstrap dialogs. Set once in main after the window is built.
 	win fyne.Window
@@ -362,6 +373,50 @@ func (a *app) ShowSettings() {
 	}
 }
 
+// ShowStatus reveals the status window (tray.App / the Status… item). Like the
+// settings window it is built once at startup and hidden.
+func (a *app) ShowStatus() {
+	if a.status != nil {
+		a.status.Show()
+	}
+}
+
+// OpenLog opens the log file in the platform's default handler (status.Host). The
+// tray has its own "View logs" row doing the same thing; the window offers it at
+// the foot of the activity list, where someone reading the history is already
+// looking for more detail.
+func (a *app) OpenLog() {
+	if err := xopen.File(a.logPath); err != nil {
+		log.Printf("open log: %v", err)
+	}
+}
+
+// GatewayLabel is the active profile's "host:port" for the status window's detail
+// card (status.Host). It returns an empty string when no gateway is configured, so
+// the card renders a dash rather than a stray colon.
+// It reads Profile.Port directly, which is the EFFECTIVE port: settings
+// normalises it through effectivePort on every commit, so a profile without a
+// custom port already holds the default rather than a zero.
+func (a *app) GatewayLabel() string {
+	p := a.cfg.Active()
+	if p == nil || p.Gateway == "" {
+		return ""
+	}
+	return net.JoinHostPort(p.Gateway, strconv.Itoa(p.Port))
+}
+
+// DTLSLabel reports the active profile's DTLS preference for the detail card
+// (status.Host). DTLS is the UDP transport openconnect prefers; when it is off the
+// tunnel runs over TLS only, which is slower but survives a firewall that drops
+// UDP 10443 — worth showing, because that difference is user-visible.
+func (a *app) DTLSLabel() string {
+	p := a.cfg.Active()
+	if p != nil && p.DTLS {
+		return "DTLS on"
+	}
+	return "DTLS off"
+}
+
 // Config returns the live configuration for the settings window to clone
 // (settings.Host). It runs on the UI goroutine.
 func (a *app) Config() *config.Config { return a.cfg }
@@ -633,6 +688,44 @@ func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
 	return setup, sums
 }
 
+// startUptimeTicker drives the status window's session clock, the one thing on
+// screen that changes without a tunnel event.
+//
+// It is started from OnStarted rather than from main because it posts through
+// fyne.Do, and it is stopped during teardown: a ticker goroutine that outlived
+// the UI would queue work against a driver Quit is destroying — the same hazard
+// the pump's quitting flag guards against, so it reads that flag too.
+//
+// status.Tick returns on a branch when no session is up, so an idle app pays for
+// a channel receive per second and nothing else.
+func (a *app) startUptimeTicker() {
+	if a.status == nil || a.stopTick != nil {
+		return
+	}
+	t := time.NewTicker(time.Second)
+	done := make(chan struct{})
+	a.stopTick = func() { close(done) }
+	go func() {
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if a.quitting.Load() {
+					return
+				}
+				fyne.Do(func() {
+					if a.quitting.Load() || a.status == nil {
+						return
+					}
+					a.status.Tick()
+				})
+			}
+		}
+	}()
+}
+
 // pump is the one goroutine that reads tunnel events and drives the UI. fyne
 // owns the main thread, so every mutation of a fyne object from here is
 // marshalled onto the UI goroutine with fyne.Do. Once quitting is set the pump
@@ -662,6 +755,12 @@ func (a *app) pump() {
 			// window's live strip. Safe whether the window is shown or hidden.
 			if a.settings != nil {
 				a.settings.Apply(e)
+			}
+			// And onto the status window, in the SAME closure as the other two, so
+			// all three surfaces render one event or none of them do. Updating a
+			// hidden window's widgets is safe and cheap.
+			if a.status != nil {
+				a.status.Apply(e)
 			}
 			// A terminal, broken-install failure (tunnel.ErrPermanent, whose
 			// Error() text carries "install is broken") means the privileged path
@@ -760,6 +859,14 @@ func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
 		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
+		// Stop the uptime ticker before the teardown begins, so it cannot queue a
+		// fyne.Do against a driver that is about to be destroyed. quitting is already
+		// set, so an in-flight tick returns without touching the UI either way; this
+		// just stops the goroutine rather than leaving it running to no purpose.
+		if a.stopTick != nil {
+			a.stopTick()
+			a.stopTick = nil
+		}
 		go func() {
 			// Signal completion no matter how this returns, so awaitShutdown (which
 			// keeps the process alive for exactly this work) can never wait out its
@@ -1113,6 +1220,10 @@ func main() {
 	// fyne preferences, so this loses nothing) so fyne sees a clean, empty store.
 	sanitizeFynePreferences("io.github.savvaskoualis.openfortitray")
 	a.fyneApp = fyneapp.NewWithID("io.github.savvaskoualis.openfortitray")
+	// The app theme, installed before any window is built so nothing is ever laid
+	// out against the default palette and then re-laid out. It tracks the OS
+	// light/dark setting: fyne resolves the variant and hands it to Color.
+	a.fyneApp.Settings().SetTheme(uitheme.New())
 	ctrl, err := tray.Setup(a.fyneApp, a)
 	if err != nil {
 		log.Fatal(err)
@@ -1146,6 +1257,7 @@ func main() {
 		// so setting the Accessory activation policy now hides the Dock icon
 		// without racing fyne. No-op on non-darwin.
 		setAccessoryActivationPolicy()
+		a.startUptimeTicker()
 	})
 	// OnStopped fires when fyne itself tears the run loop down. If this appears in
 	// the log (rather than the "run loop returned" line, or nothing), the app is
@@ -1162,6 +1274,13 @@ func main() {
 	win := a.fyneApp.NewWindow("OpenFortiTray — Settings")
 	a.win = win
 	a.settings = settings.New(a, win)
+
+	// The status window, on the same contract: built once, hidden, close-intercepted
+	// to Hide. This is the surface that shows live state — the tray menu cannot
+	// repaint while it is open (see the KNOWN LIMITATION in internal/tray), so a
+	// state change is only visible here.
+	a.status = status.New(a, a.fyneApp.NewWindow("OpenFortiTray"))
+
 	// Route a refused Connect (invalid active profile) to the settings window,
 	// which opens on the offending field with a banner naming the fix.
 	a.onConnectIssue = func(i *settings.Issue) {

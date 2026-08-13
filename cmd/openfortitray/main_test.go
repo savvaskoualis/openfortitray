@@ -539,3 +539,55 @@ func TestRejectedStoredCookieIsDropped(t *testing.T) {
 		t.Errorf("stored cookie = %q, want the rejected one replaced by FRESH", v)
 	}
 }
+
+// The status window's detail card reads these two, so they must be right for the
+// shapes a saved config actually takes — including the empty gateway a first run
+// has, where a naive JoinHostPort would render a stray ":10443".
+func TestGatewayLabelAndDTLSLabel(t *testing.T) {
+	cases := []struct {
+		name        string
+		prof        config.Profile
+		wantGateway string
+		wantDTLS    string
+	}{
+		{
+			name:        "default port",
+			prof:        config.Profile{Name: "p", Gateway: "vpn.example.com", Port: 10443, DTLS: true},
+			wantGateway: "vpn.example.com:10443",
+			wantDTLS:    "DTLS on",
+		},
+		{
+			name:        "custom port, DTLS off",
+			prof:        config.Profile{Name: "p", Gateway: "vpn.example.com", Port: 8443},
+			wantGateway: "vpn.example.com:8443",
+			wantDTLS:    "DTLS off",
+		},
+		{
+			// A first run has no gateway. An empty label makes the card render a
+			// dash; building "…:10443" from nothing would look like a real value.
+			name:        "unconfigured gateway yields an empty label",
+			prof:        config.Profile{Name: "p", Port: 10443},
+			wantGateway: "",
+			wantDTLS:    "DTLS off",
+		},
+		{
+			// An IPv6 literal has to come back bracketed, or the string is
+			// ambiguous and unusable.
+			name:        "IPv6 literal is bracketed",
+			prof:        config.Profile{Name: "p", Gateway: "2001:db8::1", Port: 10443},
+			wantGateway: "[2001:db8::1]:10443",
+			wantDTLS:    "DTLS off",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &app{cfg: &config.Config{ActiveProfile: "p", Profiles: []config.Profile{tc.prof}}}
+			if got := a.GatewayLabel(); got != tc.wantGateway {
+				t.Errorf("GatewayLabel() = %q, want %q", got, tc.wantGateway)
+			}
+			if got := a.DTLSLabel(); got != tc.wantDTLS {
+				t.Errorf("DTLSLabel() = %q, want %q", got, tc.wantDTLS)
+			}
+		})
+	}
+}

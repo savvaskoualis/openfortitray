@@ -35,20 +35,18 @@ func sameColor(a, b color.Color) bool {
 
 // activityRows flattens the history rows to "<timestamp> <text>" strings, so the
 // assertions are about what is on screen rather than about the widget tree.
+// The history is one FormLayout container holding alternating timestamp/text
+// labels, so the two columns line up across rows; this pairs them back up.
 func activityRows(c *Controller) []string {
-	out := make([]string, 0, len(c.activity.Objects))
-	for _, o := range c.activity.Objects {
-		row, ok := o.(*fyne.Container)
-		if !ok {
+	objs := c.activity.Objects
+	out := make([]string, 0, len(objs)/2)
+	for i := 0; i+1 < len(objs); i += 2 {
+		ts, ok1 := objs[i].(*widget.Label)
+		txt, ok2 := objs[i+1].(*widget.Label)
+		if !ok1 || !ok2 {
 			continue
 		}
-		var parts []string
-		for _, child := range row.Objects {
-			if l, ok := child.(*widget.Label); ok {
-				parts = append(parts, l.Text)
-			}
-		}
-		out = append(out, strings.Join(parts, " "))
+		out = append(out, ts.Text+" "+txt.Text)
 	}
 	return out
 }
