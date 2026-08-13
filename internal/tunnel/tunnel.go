@@ -272,8 +272,9 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
 	earlyRetries := 0 // quiet same-cookie retries used before the first bring-up
-	// postHealthyRejects counts consecutive auth-rejections AFTER the tunnel has
-	// been healthy this Connect. This gateway allows one SSL-VPN session per user,
+	// postHealthyRejects counts auth-rejections AFTER the tunnel has been healthy
+	// this Connect (any healthy bring-up clears the tally; a non-auth failure in
+	// between does not). This gateway allows one SSL-VPN session per user,
 	// so when another device logs in it kills ours and our cookie starts getting
 	// rejected. A one-off is a benign expiry; a run of them means the session was
 	// taken elsewhere — surface that calmly and back off hard instead of fighting.

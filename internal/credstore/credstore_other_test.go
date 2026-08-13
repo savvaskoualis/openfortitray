@@ -54,3 +54,38 @@ func TestFileStoreRoundTrip(t *testing.T) {
 		t.Fatalf("Delete of missing key errored: %v", err)
 	}
 }
+
+// os.WriteFile's perm argument applies only when it creates the file, so a store
+// file that already exists with wider permissions would keep them and leave the
+// cookie readable by everyone. save must re-assert 0600 (and 0700 on its dir) on
+// every write, since on this platform permissions are the ONLY protection.
+func TestFileStoreTightensExistingPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sub")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "session")
+	if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &fileStore{path: path}
+	if err := f.Set("openfortitray:g", "COOKIE"); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("pre-existing 0644 store file left at mode %o, want 600", perm)
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := di.Mode().Perm(); perm != 0o700 {
+		t.Errorf("pre-existing 0755 store dir left at mode %o, want 700", perm)
+	}
+}

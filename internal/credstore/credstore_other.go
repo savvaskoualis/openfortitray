@@ -55,14 +55,30 @@ func (f *fileStore) load() (map[string]string, error) {
 
 // save writes the map as 0600 in a 0700 directory, replacing the file.
 func (f *fileStore) save(m map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
+	dir := filepath.Dir(f.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(f.path, data, 0o600)
+	if err := os.WriteFile(f.path, data, 0o600); err != nil {
+		return err
+	}
+	// WriteFile's perm argument applies only when it CREATES the file: writing over
+	// an existing file leaves that file's mode alone. Since file permissions are
+	// the only thing protecting this secret, assert 0600 (and 0700 on the dir)
+	// every time rather than trusting whatever mode a pre-existing file — or a
+	// pre-existing config dir — happens to carry.
+	if err := os.Chmod(f.path, 0o600); err != nil {
+		return err
+	}
+	// The directory is ours alone (<config>/openfortitray), so tightening it is
+	// always safe; best-effort because a filesystem that cannot chmod should not
+	// fail an otherwise-good write.
+	_ = os.Chmod(dir, 0o700)
+	return nil
 }
 
 func (f *fileStore) Get(key string) (string, error) {
