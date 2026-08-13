@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.33] — 2026-08-13
+
+### Changed
+- **In-place tray menu updates (0.1.32) are now opt-in** via
+  `OPENFORTITRAY_LIVE_MENU=1`. The mechanism is right, but it cannot be exercised
+  without a real desktop tray, and a takeover that failed silently would freeze the
+  menu on a stale state — worse than the staleness it was fixing. The log now records
+  which path is in use.
+
 ## [0.1.32] — 2026-08-13
 
 ### Fixed
