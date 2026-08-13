@@ -4,6 +4,8 @@ package tray
 import (
 	"bytes"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -286,7 +288,20 @@ func (c *Controller) ReassertTray() {
 	// (see native.go for why they are worth building). Replace fyne's rows with our
 	// own and adopt whatever state has already been rendered, so taking over cannot
 	// reset a connected tray to "Disconnected".
+	//
+	// OPT-IN, and deliberately so. The takeover is the only way to update a menu the
+	// user is holding open, but it cannot be exercised without a real tray — every
+	// systray call panics otherwise — so it is not covered by the tests, and a
+	// takeover that silently failed would leave the menu frozen on a stale state,
+	// which is worse than the staleness it fixes. Until it has been confirmed on a
+	// real desktop, fyne's rebuild-the-menu path stays the default.
+	if os.Getenv(liveMenuEnv) != "1" {
+		log.Printf("tray: menu updates via fyne (rebuild); set %s=1 for in-place updates "+
+			"that also refresh a menu held open", liveMenuEnv)
+		return
+	}
 	if nm := buildNativeMenu(c.app, c.setAutostartFromNative); nm != nil {
+		log.Print("tray: in-place menu updates active")
 		c.native = nm
 		if c.lastView.title != "" {
 			nm.apply(c.lastView)
@@ -294,8 +309,13 @@ func (c *Controller) ReassertTray() {
 		if c.updateAvailable {
 			nm.setUpdateLabel(c.updateItem.Label)
 		}
+		return
 	}
+	log.Printf("tray: %s=1 but the in-place menu could not be built; using fyne's refresh", liveMenuEnv)
 }
+
+// liveMenuEnv opts into the in-place (systray-level) menu updates. See ReassertTray.
+const liveMenuEnv = "OPENFORTITRAY_LIVE_MENU"
 
 // setAutostartFromNative is the native checkbox's action. It routes to the same
 // persist-then-tick path the fyne item uses.
