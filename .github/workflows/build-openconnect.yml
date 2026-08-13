@@ -135,7 +135,7 @@ jobs:
           tarball="openconnect-${OC_VER}.tar.gz"
           url="https://www.infradead.org/openconnect/download/${tarball}"
           echo "Downloading ${url}"
-          curl -fSL --retry 3 -o "${tarball}" "${url}"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -o "${tarball}" "${url}"
           ls -l "${tarball}"
           echo "== sha256 of fetched tarball (PIN THIS) =="
           actual="$(sha256sum "${tarball}" | awk '{print $1}')"
@@ -186,7 +186,7 @@ jobs:
           # which resolves from the including file's own directory, so copying the
           # wintun header into the source root is the most robust fix (no -I / path
           # translation to get wrong).
-          curl -fSL --retry 3 -o wintun-hdr.zip "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -o wintun-hdr.zip "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
           echo "${WINTUN_SHA}  wintun-hdr.zip" | sha256sum -c -
           unzip -o wintun-hdr.zip 'wintun/include/*' -d _wtinc
           cp -v _wtinc/wintun/include/*.h .
@@ -244,7 +244,7 @@ jobs:
           # exe at CONNECT time (run via cscript) to set up routes + DNS. Without it
           # the tunnel comes up but nothing is routed. Fetch the pinned,
           # sha256-verified copy.
-          curl -fSL --retry 3 -o staging/openconnect/vpnc-script-win.js \
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -o staging/openconnect/vpnc-script-win.js \
             "https://gitlab.com/openconnect/vpnc-scripts/-/raw/master/vpnc-script-win.js"
           echo "e196fdf0cc8b325180154535f843034dc0ae9eb43ead9980adfcfc57c58069b2  staging/openconnect/vpnc-script-win.js" | sha256sum -c -
           ls -l staging/openconnect/vpnc-script-win.js
@@ -293,7 +293,7 @@ jobs:
           set -euxo pipefail
           url="https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip"
           echo "Downloading ${url}"
-          curl -fSL --retry 3 -o wintun.zip "${url}"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 -o wintun.zip "${url}"
           echo "== sha256 of wintun zip (PIN THIS) =="
           wsha="$(sha256sum wintun.zip | awk '{print $1}')"
           echo "WINTUN_ZIP_SHA256=${wsha}"

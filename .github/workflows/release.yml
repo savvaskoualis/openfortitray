@@ -264,7 +264,10 @@ jobs:
           set -euo pipefail
           url="https://github.com/pal1000/mesa-dist-win/releases/download/${MESA_VERSION}/${MESA_ARCHIVE}"
           echo "Downloading pinned Mesa ${MESA_VERSION}: ${url}"
-          curl -fsSL -o "${MESA_ARCHIVE}" "${url}"
+          # Retry transient CDN failures (see the openconnect bundle step below):
+          # this download had no retry at all, so one bad response failed a release.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 -o "${MESA_ARCHIVE}" "${url}"
           echo "${MESA_SHA256}  ${MESA_ARCHIVE}" | sha256sum -c -
           # -e extracts the two DLLs flat (no x64/ prefix) into dist/, next to
           # the exe. 7z fails the step if either member is missing.
@@ -291,7 +294,12 @@ jobs:
           OC_BUNDLE_SHA256: '147008a42e68dcfcf7a311340e1aabc71f5affe026c7996c25948fea5cb2c595'
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o oc-bundle.zip "$OC_BUNDLE_URL"
+          # --retry alone only retries timeouts and 5xx, so a bare "curl: (52)
+          # Empty reply from server" from the releases CDN failed the whole
+          # release (seen on v0.1.20). --retry-all-errors covers 52 and friends;
+          # the sha256 check below is what actually decides the bytes are right.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 -o oc-bundle.zip "$OC_BUNDLE_URL"
           echo "${OC_BUNDLE_SHA256}  oc-bundle.zip" | sha256sum -c -
           mkdir -p dist
           # The zip contains a top-level openconnect/ dir, so it extracts to
