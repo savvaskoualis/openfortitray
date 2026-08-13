@@ -8,6 +8,22 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.29] — 2026-08-13
+
+### Changed
+- **A slow connect now says why, and polls instead of backing off.** This gateway
+  allows one SSL-VPN session per user and refuses everything until it releases the
+  previous one — a median of 25s after a disconnect, longer while another machine
+  signed in as the same user still holds it. The app now retries every 5s for the
+  first ~100s (an escalating backoff made it miss the moment the session became
+  free) and shows "gateway busy — the VPN allows one session per user" rather than
+  a bare "Connecting…" that reads as stuck.
+
+### Fixed
+- The app no longer logs "session ended on the gateway" when the gateway did not
+  accept the logout. It answers an unauthenticated logout with a redirect to the
+  identity provider, which was being counted as success.
+
 ## [0.1.28] — 2026-08-13
 
 ### Fixed
