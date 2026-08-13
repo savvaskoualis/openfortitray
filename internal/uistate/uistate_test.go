@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
@@ -182,6 +183,90 @@ func TestTruncationIsRuneSafe(t *testing.T) {
 		if r == '�' {
 			t.Fatalf("truncation split a multi-byte rune: %q", v.Detail)
 		}
+	}
+}
+
+// A state the supervisor does not currently emit must still render something
+// safe rather than a blank status row.
+func TestUnknownStateFallsBackToDisconnected(t *testing.T) {
+	v := ViewFor(tunnel.Event{State: tunnel.State(99)})
+	if v.Title != "Disconnected" || v.Kind != KindIdle || !v.CanConnect {
+		t.Errorf("unknown state = %+v, want a safe Disconnected view", v)
+	}
+	if v.MenuLabel != "Disconnected" {
+		t.Errorf("MenuLabel = %q, want %q", v.MenuLabel, "Disconnected")
+	}
+}
+
+// Ported from internal/tray, which owned `short` before two surfaces needed it.
+// The cases are unchanged: this is the detail-shortening contract the tray has
+// always had, and moving it must not alter a single outcome.
+func TestShortDetail(t *testing.T) {
+	tests := []struct {
+		name   string
+		detail string
+		want   string
+	}{{
+		name:   "empty stays empty, so the caller can tell there is nothing to append",
+		detail: "",
+		want:   "",
+	}, {
+		name:   "a short single line is passed through untouched",
+		detail: "10.0.0.5",
+		want:   "10.0.0.5",
+	}, {
+		name:   "surrounding whitespace is dropped",
+		detail: "  10.0.0.5\t",
+		want:   "10.0.0.5",
+	}, {
+		// The interesting case: a wrapped openconnect error is many lines, and
+		// only the first says what happened.
+		name:   "only the first line survives",
+		detail: "openconnect exited: exit status 1\nFailed to connect to host vpn.example.com\nmore",
+		want:   "openconnect exited: exit status 1",
+	}, {
+		name:   "carriage returns end a line too",
+		detail: "first\r\nsecond",
+		want:   "first",
+	}, {
+		name:   "a line of exactly the cap is not truncated",
+		detail: strings.Repeat("a", MaxDetail),
+		want:   strings.Repeat("a", MaxDetail),
+	}, {
+		name:   "one rune over the cap is truncated and marked",
+		detail: strings.Repeat("a", MaxDetail+1),
+		want:   strings.Repeat("a", MaxDetail) + "…",
+	}, {
+		// maxDetail runes of a 3-byte character is well past maxDetail bytes, so a
+		// byte-level slice would cut a rune in half here.
+		name:   "truncation counts runes, not bytes",
+		detail: strings.Repeat("パ", MaxDetail+5),
+		want:   strings.Repeat("パ", MaxDetail) + "…",
+	}, {
+		name:   "whitespace exposed by truncation is trimmed before the ellipsis",
+		detail: strings.Repeat("a", MaxDetail-1) + "   tail",
+		want:   strings.Repeat("a", MaxDetail-1) + "…",
+	}, {
+		name:   "a leading newline yields nothing rather than the second line",
+		detail: "\nsomething",
+		want:   "",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := short(tc.detail)
+			if got != tc.want {
+				t.Errorf("short(%q) = %q, want %q", tc.detail, got, tc.want)
+			}
+			if n := len([]rune(got)); n > MaxDetail+1 { // +1 for the ellipsis
+				t.Errorf("short(%q) returned %d runes, want at most %d", tc.detail, n, MaxDetail+1)
+			}
+			if strings.ContainsAny(got, "\r\n") {
+				t.Errorf("short(%q) = %q, want a single line", tc.detail, got)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("short(%q) = %q, which is not valid UTF-8", tc.detail, got)
+			}
+		})
 	}
 }
 

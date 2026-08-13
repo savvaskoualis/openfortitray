@@ -4,13 +4,13 @@ package tray
 import (
 	"bytes"
 	"fmt"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/systray"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uistate"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
 
@@ -26,6 +26,11 @@ type App interface {
 	// ShowSettings reveals (and focuses) the settings window. The window is built
 	// once at startup and hidden; this only shows the existing one.
 	ShowSettings()
+	// ShowStatus reveals (and focuses) the status window, on the same
+	// built-once-then-hidden contract as ShowSettings. It is the only surface that
+	// shows live state: this menu cannot repaint while it is open (see the KNOWN
+	// LIMITATION below), so the window is where a state change is actually visible.
+	ShowStatus()
 	// Quit begins teardown (tunnel down) and then quits the fyne app. The tray's
 	// Quit item drives this rather than fyne's built-in quit so the VPN is always
 	// torn down before the process leaves.
@@ -69,7 +74,7 @@ type Controller struct {
 
 	// lastView is the view most recently applied. Kept so a future re-assert can
 	// re-render the current state rather than the defaults.
-	lastView view
+	lastView uistate.View
 }
 
 // Setup builds the tray menu on the given fyne app and installs it. It must run
@@ -148,6 +153,10 @@ func newController(app App) *Controller {
 	c.autoItem = fyne.NewMenuItem("Auto-connect at login", c.toggleAutostart)
 	c.autoItem.Checked = app.AutostartEnabled()
 
+	// Status… sits at the top of the actionable rows because it is the surface that
+	// actually shows live state; this menu is a snapshot from the moment it opened.
+	statusWindowItem := fyne.NewMenuItem("Status…", func() { app.ShowStatus() })
+
 	settingsItem := fyne.NewMenuItem("Settings…", func() { app.ShowSettings() })
 
 	logsItem := fyne.NewMenuItem("View logs", func() { _ = xopen.File(app.LogPath()) })
@@ -173,6 +182,7 @@ func newController(app App) *Controller {
 		c.connectItem,
 		c.disconnectItem,
 		fyne.NewMenuItemSeparator(),
+		statusWindowItem,
 		settingsItem,
 		c.autoItem,
 		logsItem,
@@ -208,22 +218,47 @@ func (c *Controller) setAutostart(want bool) {
 // on the UI goroutine (the event pump marshals it through fyne.Do); fyne has no
 // per-item setter, so the supported route is field mutation + (*Menu).Refresh.
 func (c *Controller) Apply(e tunnel.Event) {
-	v := viewFor(e)
-	c.currentIcon = v.icon
+	v := uistate.ViewFor(e)
+	icon := iconFor(v.Kind)
+	c.currentIcon = icon
 	c.lastView = v
 	// Guarded like ReassertTray and SetUpdateAvailable: desk is nil before Setup and
 	// in the tests that exercise the menu without a desktop driver.
 	if c.desk != nil {
-		c.desk.SetSystemTrayIcon(c.resourceFor(v.icon))
+		c.desk.SetSystemTrayIcon(c.resourceFor(icon))
 	}
-	// Keep the fyne items in step even when the native menu is live: they are the
-	// fallback if the takeover is ever unavailable, and they are what the tests
-	// inspect.
-	c.statusItem.Label = v.title
-	// canConnect and its opposite are always exact opposites (see view).
-	c.connectItem.Disabled = !v.canConnect
-	c.disconnectItem.Disabled = v.canConnect
+	c.statusItem.Label = v.MenuLabel
+
+	// Connect is offered exactly when there is nothing running, and Disconnect for
+	// everything else — INCLUDING the busy states, where it is the only way to
+	// abort a connect that is hanging or a reconnect loop that will not settle.
+	//
+	// This deliberately does NOT use v.CanDisconnect, which is false while a
+	// browser login is in flight because there is no tunnel yet. The status window
+	// reads that field and offers "Cancel" instead; a menu row cannot relabel
+	// itself while open, so here the row stays "Disconnect" and stays clickable.
+	// Wiring it to CanDisconnect would take away the user's only way out of a stuck
+	// connect, which is a state they hit for real.
+	c.connectItem.Disabled = !v.CanConnect
+	c.disconnectItem.Disabled = v.CanConnect
 	c.menu.Refresh()
+}
+
+// iconFor maps a view's severity to the tray glyph. The icons stay raw PNG bytes
+// (rather than fyne resources) so this mapping is comparable in a test without a
+// status bar: on macOS SetSystemTrayIcon goes straight into Cocoa with no no-op
+// path for a tray that was never started.
+func iconFor(k uistate.Kind) []byte {
+	switch k {
+	case uistate.KindOK:
+		return iconGreen
+	case uistate.KindBusy:
+		return iconYellow
+	case uistate.KindBad:
+		return iconRed
+	default:
+		return iconGray
+	}
 }
 
 // SetUpdateAvailable relabels the update row to offer a one-click update to
@@ -287,10 +322,6 @@ func (c *Controller) ReassertTray() {
 // Until one of those is done, the menu is correct whenever it is opened and stale
 // only while held open through a state change.
 
-// setAutostartFromNative is the native checkbox's action. It routes to the same
-// persist-then-tick path the fyne item uses.
-func (c *Controller) setAutostartFromNative(want bool) { c.setAutostart(want) }
-
 func (c *Controller) resourceFor(icon []byte) fyne.Resource {
 	switch {
 	case bytes.Equal(icon, iconGreen):
@@ -314,60 +345,4 @@ func (c *Controller) resourceFor(icon []byte) fyne.Resource {
 		}
 		return c.resGray
 	}
-}
-
-// maxDetail caps the detail text shown in the status item; process output can
-// run to many lines, and the full text is already in the log file.
-const maxDetail = 60
-
-// view is everything one event changes about the menu. It exists so the
-// state→appearance mapping can be tested without a live status bar: on macOS
-// SetSystemTrayIcon goes straight into Cocoa with no no-op path for a tray that
-// was never started, so a test that called Apply would be exercising AppKit
-// rather than this package.
-type view struct {
-	icon  []byte
-	title string
-	// canConnect enables Connect and disables Disconnect; false is the reverse.
-	// The two are always opposites — there is no state where both make sense.
-	canConnect bool
-}
-
-func viewFor(e tunnel.Event) view {
-	switch e.State {
-	case tunnel.Connected:
-		title := "Connected"
-		if ip := short(e.Detail); ip != "" {
-			title += " — " + ip
-		}
-		return view{icon: iconGreen, title: title}
-	case tunnel.Authenticating, tunnel.Connecting, tunnel.Reconnecting:
-		title := e.State.String() + "…"
-		if d := short(e.Detail); d != "" {
-			title = e.State.String() + " — " + d
-		}
-		return view{icon: iconYellow, title: title}
-	case tunnel.Error:
-		// Error is terminal for a run: no Disconnected follows it, so the menu
-		// has to offer Connect again from here.
-		title := "Error"
-		if d := short(e.Detail); d != "" {
-			title = "Error: " + d
-		}
-		return view{icon: iconRed, title: title, canConnect: true}
-	default:
-		return view{icon: iconGray, title: "Disconnected", canConnect: true}
-	}
-}
-
-// short reduces event detail to a single short line fit for a menu item.
-func short(detail string) string {
-	if i := strings.IndexAny(detail, "\r\n"); i >= 0 {
-		detail = detail[:i]
-	}
-	detail = strings.TrimSpace(detail)
-	if r := []rune(detail); len(r) > maxDetail {
-		return strings.TrimSpace(string(r[:maxDetail])) + "…"
-	}
-	return detail
 }
