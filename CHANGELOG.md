@@ -6,7 +6,49 @@ tags. Dates are the release date.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Status window** (`Status…` in the tray menu). Shows the connection state with a
+  colour-coded indicator, the assigned IP, gateway, protocol and DTLS setting, a
+  session clock, and a timestamped history of the last dozen state changes. Closing
+  it hides it; the app still only exits via **Quit**.
+
+  It is also the fix for a defect that cannot be fixed in the tray menu. A tray
+  menu is a native OS menu, and fyne can only change one by tearing it down and
+  rebuilding it — which the OS ignores while the menu is open, so a menu held open
+  through a state change shows a snapshot. That is why a menu could sit on
+  "Reconnecting" after the tunnel came up. Working around it at the menu level was
+  tried in 0.1.32 and froze the menu on both macOS and Windows. A window has no such
+  limit: it repaints as the state changes.
+- **A designed theme**, applied to every window. Light and dark palettes that follow
+  the OS setting, a tightened type scale, softer corner radii, and one accent used
+  only for primary actions, focus and selection. Connection state keeps its own
+  semantic colours so "the tunnel is up" never competes with the accent.
+
+### Changed
+- **Settings is grouped.** The same fields in the same order, under section captions
+  (Connection / Authentication / Startup; Tunnel / Session / Server certificate /
+  DNS / Paths) instead of one flat column, with a right-aligned footer where Save is
+  the only high-importance button. No field, default or validator changed.
+- Rows that do not apply now disappear completely. The "Username" and "Certificate"
+  captions used to sit beside empty space under SAML — which is every real install —
+  and "Fingerprint" did the same whenever the certificate was not pinned.
+- The status strip and the inline banner take their colours from the theme instead of
+  hardcoded hex, so they follow light/dark instead of being mixed for one of them.
+- **The update prompt** shows the installed and available versions as a lined-up
+  comparison rather than a single sentence, and is tall enough for its own buttons.
+
+### Fixed
+- Three copies of "what does this tunnel state say" collapsed into one
+  (`internal/uistate`). They had already drifted: the settings strip cut a
+  multi-line error to its first line but never applied the length cap, so a long
+  openconnect error stretched that strip while the tray truncated the same text.
+
+### Not included
+- **Traffic counters.** The status window has no sent/received figures: openconnect
+  does not report them on the progress stream the app reads, so they would need
+  per-OS interface statistics plus tunnel-device identification the app does not
+  track. A permanently-zero counter would read as broken, so the row shows
+  "Connected since" instead.
 
 ## [0.1.33] — 2026-08-13
 

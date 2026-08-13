@@ -12,9 +12,13 @@ OpenFortiTray is the convenience layer around a FortiGate SSL-VPN, not a reimple
 OpenFortiTray drives the SAML handshake, supervises the process, and gives it a UI.
 
 - tray icon with tunnel state + Connect / Disconnect
+- **Status** window with live state, the assigned IP, a session clock and a history of
+  the last dozen state changes — the tray menu is a native OS menu and cannot repaint
+  while it is open, so this is where a state change is visible as it happens
 - auto-connect at login and auto-reconnect (backoff 15 s → 2 min)
 - SAML login in your system browser — silent while your IdP session is alive
 - native **Settings** window: multiple profiles, Basic/Advanced fields, no JSON editing
+- light and dark themes that follow your OS setting
 - one binary per platform; the only runtime dependency is `openconnect` (≥ 8.10, 9.x
   recommended), which every installer pulls in for you
 
