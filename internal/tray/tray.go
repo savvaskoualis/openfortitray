@@ -66,6 +66,17 @@ type Controller struct {
 	// SetUpdateAvailable can re-apply the CURRENT state's icon with the badge. It
 	// starts as the gray/disconnected icon Setup installs.
 	currentIcon []byte
+
+	// native, once ReassertTray has installed it, is the menu built directly on
+	// fyne.io/systray. Runtime updates go to it because they then land on the
+	// EXISTING native rows, which an open menu picks up — fyne's own refresh
+	// rebuilds the whole menu and is invisible until the menu is reopened (see
+	// native.go). nil means that takeover is unavailable (not started yet, headless,
+	// or unsupported), and everything falls back to the fyne menu.
+	native *nativeMenu
+	// lastView is the view most recently applied, so the native takeover can adopt
+	// the current state instead of starting from the "Disconnected" defaults.
+	lastView view
 }
 
 // Setup builds the tray menu on the given fyne app and installs it. It must run
@@ -184,11 +195,22 @@ func newController(app App) *Controller {
 // refreshes the menu directly. SetAutostart already logs and rolls the OS state
 // back on failure, so a failure here simply leaves the checkbox unchanged.
 func (c *Controller) toggleAutostart() {
-	want := !c.autoItem.Checked
+	c.setAutostart(!c.autoItem.Checked)
+}
+
+// setAutostart persists the login-item state and, only on success, ticks the row.
+// It is the one path for both menus: the fyne item is kept in step either way (it
+// is the fallback and what the tests inspect), and the tick is applied natively
+// when the takeover is live so an open menu shows it immediately.
+func (c *Controller) setAutostart(want bool) {
 	if err := c.app.SetAutostart(want); err != nil {
 		return
 	}
 	c.autoItem.Checked = want
+	if c.native != nil {
+		c.native.setAutoChecked(want)
+		return
+	}
 	c.menu.Refresh()
 }
 
@@ -199,11 +221,25 @@ func (c *Controller) toggleAutostart() {
 func (c *Controller) Apply(e tunnel.Event) {
 	v := viewFor(e)
 	c.currentIcon = v.icon
-	c.desk.SetSystemTrayIcon(c.resourceFor(v.icon))
+	c.lastView = v
+	// Guarded like ReassertTray and SetUpdateAvailable: desk is nil before Setup and
+	// in the tests that exercise the menu without a desktop driver.
+	if c.desk != nil {
+		c.desk.SetSystemTrayIcon(c.resourceFor(v.icon))
+	}
+	// Keep the fyne items in step even when the native menu is live: they are the
+	// fallback if the takeover is ever unavailable, and they are what the tests
+	// inspect.
 	c.statusItem.Label = v.title
 	// canConnect and its opposite are always exact opposites (see view).
 	c.connectItem.Disabled = !v.canConnect
 	c.disconnectItem.Disabled = v.canConnect
+	if c.native != nil {
+		// In place, so a menu the user is holding open updates as the state changes
+		// rather than showing whatever it showed when it opened.
+		c.native.apply(v)
+		return
+	}
 	c.menu.Refresh()
 }
 
@@ -215,10 +251,15 @@ func (c *Controller) Apply(e tunnel.Event) {
 // the item and refreshes the menu. desk is nil before Setup and in the wiring
 // tests, so the icon re-apply is guarded.
 func (c *Controller) SetUpdateAvailable(version string) {
-	c.updateItem.Label = "Update to " + version + " & Restart"
+	label := "Update to " + version + " & Restart"
+	c.updateItem.Label = label
 	c.updateAvailable = true
 	if c.desk != nil {
 		c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
+	}
+	if c.native != nil {
+		c.native.setUpdateLabel(label)
+		return
 	}
 	c.menu.Refresh()
 }
@@ -240,7 +281,25 @@ func (c *Controller) ReassertTray() {
 	}
 	c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
 	c.desk.SetSystemTrayMenu(c.menu)
+
+	// The tray is live now, which is the first moment the native rows can be built
+	// (see native.go for why they are worth building). Replace fyne's rows with our
+	// own and adopt whatever state has already been rendered, so taking over cannot
+	// reset a connected tray to "Disconnected".
+	if nm := buildNativeMenu(c.app, c.setAutostartFromNative); nm != nil {
+		c.native = nm
+		if c.lastView.title != "" {
+			nm.apply(c.lastView)
+		}
+		if c.updateAvailable {
+			nm.setUpdateLabel(c.updateItem.Label)
+		}
+	}
 }
+
+// setAutostartFromNative is the native checkbox's action. It routes to the same
+// persist-then-tick path the fyne item uses.
+func (c *Controller) setAutostartFromNative(want bool) { c.setAutostart(want) }
 
 func (c *Controller) resourceFor(icon []byte) fyne.Resource {
 	switch {

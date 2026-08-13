@@ -2,6 +2,7 @@ package tray
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -427,5 +428,46 @@ func TestViewFor(t *testing.T) {
 				t.Errorf("title is %d runes (%q); the status item is not that wide", n, got.title)
 			}
 		})
+	}
+}
+
+// Apply must keep the fyne items in step even though the native menu is what the
+// user sees once the takeover is live: the fyne items are the fallback when the
+// takeover is unavailable (headless, unsupported, or before the tray starts), and
+// a drifted fallback would render the wrong state.
+func TestApplyUpdatesFyneItemsAsFallback(t *testing.T) {
+	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
+	c := newController(&fakeApp{})
+
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.5"})
+	if !strings.Contains(c.statusItem.Label, "Connected") {
+		t.Errorf("status label = %q, want it to mention Connected", c.statusItem.Label)
+	}
+	if !c.connectItem.Disabled || c.disconnectItem.Disabled {
+		t.Error("Connected must disable Connect and enable Disconnect")
+	}
+
+	c.Apply(tunnel.Event{State: tunnel.Disconnected})
+	if c.connectItem.Disabled || !c.disconnectItem.Disabled {
+		t.Error("Disconnected must enable Connect and disable Disconnect")
+	}
+	// And the view is remembered, so a later takeover adopts the current state
+	// instead of resetting the tray to the defaults.
+	if c.lastView.title == "" {
+		t.Error("Apply must record the view it rendered for the native takeover to adopt")
+	}
+}
+
+// The autostart toggle must not tick the row when persisting the login item fails
+// — the menu would then claim a state the OS does not have.
+func TestAutostartToggleLeavesRowUnchangedOnFailure(t *testing.T) {
+	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
+	app := &fakeApp{setAutostartE: errors.New("nope")}
+	c := newController(app)
+
+	before := c.autoItem.Checked
+	c.toggleAutostart()
+	if c.autoItem.Checked != before {
+		t.Errorf("checkmark = %v after a failed SetAutostart, want it unchanged (%v)", c.autoItem.Checked, before)
 	}
 }
