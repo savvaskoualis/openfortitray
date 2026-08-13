@@ -8,6 +8,26 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.30] — 2026-08-13
+
+### Fixed
+- **"Cookie was rejected by server" — the real cause.** openconnect reads the
+  cookie passed on its standard input into a 1024-byte buffer and silently
+  truncates anything longer. This gateway's login cookies are routinely longer
+  (1288 bytes seen) and vary in length from login to login, so connects failed
+  seemingly at random and succeeded whenever a login happened to produce a short
+  enough cookie — which is what "it connects after three browser tabs" was. Proven
+  side by side: the same cookie was refused when passed on stdin and accepted when
+  not. The privileged helper now hands it over in a root-only file (never the
+  command line, where it would be visible in `ps` for the life of the tunnel).
+  On first connect after updating, macOS/Linux will ask for your administrator
+  password once to install the corrected helper.
+
+### Note
+- Earlier releases today attributed these failures to the gateway holding a
+  previous session, and 0.1.26–0.1.29 were shaped around that. The reconnect delays
+  behind that theory were mostly this bug.
+
 ## [0.1.29] — 2026-08-13
 
 ### Changed
