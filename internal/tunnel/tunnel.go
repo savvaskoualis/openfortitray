@@ -128,13 +128,12 @@ func New(authFn func(ctx context.Context) (string, error),
 		// then the WaitDelay backstop = 2*10s+12s = 32s), with margin, and no more:
 		// past that point the previous backend is wedged, not slow.
 		prevWait: 45 * time.Second,
-		// A stale server-side FortiGate session from a previous run can make the
-		// gateway reject the first cookie outright (one-session-per-user). Re-mint
-		// a fresh cookie a couple of times, a short delay apart — the re-auth is
-		// seamless because the IdP session is still cached — before doing anything
-		// the user would see as an error.
+		// A FortiGate that still holds a previous session refuses cookies until it
+		// releases it, which takes seconds to a few minutes. Retry quietly over that
+		// window — same cookie, no browser, tray still on Connecting… — before doing
+		// anything the user would see as an error.
 		earlyRetryDelay: 4 * time.Second,
-		maxEarlyRetries: 2,
+		maxEarlyRetries: 5,
 		// ~8 rounds of a 15s..2min backoff spans several minutes, which covers the
 		// worst observed wait for this gateway to release a session, and then stops
 		// instead of retrying (and re-authenticating) forever.
@@ -385,8 +384,14 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// rejection takes the proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
-				cookie = "" // re-mint: the gateway rejects the stale cookie outright,
-				// it does not merely defer it, so only a fresh SAML assertion recovers
+				// KEEP the cookie. These early retries used to re-mint, which meant a
+				// SAML login — and a browser tab — every 4 seconds: three tabs before a
+				// connect succeeded, which is what users saw. Re-minting cannot help
+				// here anyway: when the gateway refuses because it still holds a previous
+				// session it refuses freshly minted cookies just as readily (measured:
+				// five distinct cookies refused across 3.5 minutes). Only time helps, so
+				// retry the cookie we have, silently. A cookie that really is dead is
+				// covered by the periodic re-mint on the backoff rounds below.
 				select {
 				case <-time.After(s.earlyRetryDelay):
 				case <-ctx.Done():
