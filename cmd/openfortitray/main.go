@@ -454,6 +454,21 @@ func (a *app) checkForUpdate(ctx context.Context) {
 	if rel == nil {
 		return
 	}
+	// On the Homebrew path the check and the apply read different sources: this
+	// release exists on GitHub, but `brew upgrade --cask` can only install what the
+	// tap's cask points at. Offering an update the cask has not caught up to yet
+	// produces brew's "the latest version is already installed" and no upgrade —
+	// which is indistinguishable, from the user's side, from a broken updater. So
+	// stay quiet until the cask is ready (the tap bumps itself within the hour of a
+	// release); the next 6-hourly check picks it up. Fails open on a read error, so
+	// an unreachable tap cannot suppress a real update.
+	if update.InstallMethod() == update.MethodHomebrew {
+		cc := update.CaskChecker{HTTPClient: &http.Client{Timeout: 30 * time.Second}}
+		if !update.CaskHasTag(ctx, cc, rel.Tag) {
+			log.Printf("update: %s is published but the Homebrew cask is not bumped yet; waiting", rel.Tag)
+			return
+		}
+	}
 	a.updateMu.Lock()
 	a.updateRel = rel
 	a.updateMu.Unlock()

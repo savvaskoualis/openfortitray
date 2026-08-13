@@ -95,6 +95,12 @@ type Supervisor struct {
 	earlyRetryDelay time.Duration
 	maxEarlyRetries int
 
+	// sameCookieDelay / maxSameCookieRetries shape the RESEND that now comes
+	// first: a rejected cookie is re-sent unchanged, maxSameCookieRetries times,
+	// sameCookieDelay apart, before any re-mint. See loop(). Exposed for tests.
+	sameCookieDelay      time.Duration
+	maxSameCookieRetries int
+
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
@@ -122,6 +128,11 @@ func New(authFn func(ctx context.Context) (string, error),
 		// the user would see as an error.
 		earlyRetryDelay: 4 * time.Second,
 		maxEarlyRetries: 2,
+		// Resend budget, spent BEFORE any re-mint. Sized from real logs of this
+		// gateway: after a session teardown it refuses cookies for ~10-20s, so
+		// 4 tries 3s apart covers the usual window without a single browser tab.
+		sameCookieDelay:      3 * time.Second,
+		maxSameCookieRetries: 4,
 	}
 }
 
@@ -271,7 +282,15 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	proven := false        // this cookie carried a healthy connection at some point
 	everConnected := false // the tunnel came up at least once since this Connect
 	immediateReauths := 0
-	earlyRetries := 0 // quiet same-cookie retries used before the first bring-up
+	earlyRetries := 0 // quiet re-mints used before the first bring-up
+	// sameCookieRetries is the resend budget for this whole Connect, NOT per
+	// cookie: it bounds the total delay we add before falling back to a re-mint
+	// (maxSameCookieRetries * sameCookieDelay), instead of paying that wait again
+	// for every cookie we try. A first cookie that is genuinely dead (a stored one
+	// that expired overnight) therefore costs this wait once before SAML runs —
+	// still less than the time the gateway itself makes us wait when the cookie
+	// was fine all along, and it buys the common case zero browser tabs.
+	sameCookieRetries := 0
 	// postHealthyRejects counts auth-rejections AFTER the tunnel has been healthy
 	// this Connect (any healthy bring-up clears the tally; a non-auth failure in
 	// between does not). This gateway allows one SSL-VPN session per user,
@@ -341,21 +360,46 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 		}
 
 		if errors.Is(err, ErrAuthRejected) {
-			// Quiet early retry, gated on the tunnel never having come up this
-			// Connect (everConnected). A cookie refused at startup is refused
-			// outright — the gateway rejects the stale SAML assertion, it does not
-			// merely defer a valid one — so only a fresh assertion recovers, not a
-			// re-send. Clear the cookie so the loop top re-runs SAML and mints a
-			// FRESH one on each retry. This is cheap and non-interactive right after
-			// the interactive login: the IdP browser session is still cached, so the
-			// re-auth completes in ~1s with no clicks. The loop top re-emits
-			// Authenticating/Connecting (never Reconnecting), so the tray stays calm
-			// instead of flashing "Reconnecting — cookie rejected". Bounded by
-			// maxEarlyRetries, so a gateway that refuses every fresh cookie costs at
-			// most maxEarlyRetries quiet re-auths before the loud fallback below.
-			// Once the tunnel has come up even once, everConnected is true and a
-			// later rejection takes the proven / immediate-reauth / backoff paths
-			// unchanged.
+			// RESEND FIRST — the same cookie, unchanged.
+			//
+			// This used to re-mint on every rejection, on the assumption that a
+			// refused cookie is refused outright and only a fresh SAML assertion can
+			// recover. Real logs of this gateway falsify that: four *freshly minted*
+			// cookies were rejected in a row and a fifth, produced identically, was
+			// accepted ~30s after the previous session's teardown. What the gateway
+			// objects to is the lingering server-side session (it allows one SSL-VPN
+			// session per user), not the cookie — so the cookie we hold is very
+			// probably fine and simply early. Re-minting cannot fix a session that
+			// has not been reaped yet; it only costs the user a browser tab per try,
+			// which is exactly what "the browser opens several times before it
+			// connects" was.
+			//
+			// So spend the cheap, invisible remedy first: re-send this cookie up to
+			// maxSameCookieRetries times, sameCookieDelay apart, while the gateway
+			// finishes reaping. Gated on !everConnected, matching the re-mint path
+			// below; the tray stays on Connecting… throughout (no Reconnecting flash),
+			// and a still-valid stored cookie survives instead of being thrown away.
+			if !everConnected && sameCookieRetries < s.maxSameCookieRetries {
+				sameCookieRetries++
+				select {
+				case <-time.After(s.sameCookieDelay):
+				case <-ctx.Done():
+					return
+				}
+				continue // cookie deliberately kept
+			}
+
+			// The resend budget is spent, so this cookie really does look dead
+			// (expired, or invalidated while stored). NOW mint a fresh one: cheap and
+			// non-interactive right after an interactive login, because the IdP
+			// browser session is still cached, so the re-auth completes in ~1s with
+			// no clicks. The loop top re-emits Authenticating/Connecting (never
+			// Reconnecting), so the tray stays calm instead of flashing
+			// "Reconnecting — cookie rejected". Bounded by maxEarlyRetries, so a
+			// gateway that refuses every fresh cookie costs at most maxEarlyRetries
+			// quiet re-auths before the loud fallback below. Once the tunnel has come
+			// up even once, everConnected is true and a later rejection takes the
+			// proven / immediate-reauth / backoff paths unchanged.
 			if !everConnected && earlyRetries < s.maxEarlyRetries {
 				earlyRetries++
 				cookie = "" // re-mint: the gateway rejects the stale cookie outright,
