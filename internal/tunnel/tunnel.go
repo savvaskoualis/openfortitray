@@ -466,6 +466,15 @@ var connectedRe = regexp.MustCompile(`(?:Configured|Connected) as ([0-9a-fA-F.:]
 // dozen lines; the cap only matters for a gateway that never finishes one.
 const maxHandshakeLogLines = 60
 
+// dtlsFailedRe matches openconnect giving up on the DTLS tunnel, e.g.
+//
+//	Failed to connect DTLS tunnel; using HTTPS instead (state 3).
+//
+// Measured cost of that fallback on a network blocking UDP 10443: the config
+// exchange completes in 0.3s, openconnect then blocks 5s on the DTLS handshake
+// and repeats the exchange over HTTPS, reaching a usable tunnel at 6.7s.
+var dtlsFailedRe = regexp.MustCompile(`(?i)failed to connect DTLS tunnel`)
+
 // authRejectedMarkers are openconnect log fragments meaning the cookie is no
 // longer accepted by the gateway, so a fresh SAML login is required. They are
 // matched case-insensitively and must therefore be written in lower case
@@ -639,6 +648,14 @@ type Options struct {
 	ServerCertMode string
 	// ServerCertPin is the fingerprint passed to --servercert when pinning.
 	ServerCertPin string
+	// OnDTLSFailed, when non-nil, is called if openconnect reports that it could
+	// not establish the DTLS tunnel and fell back to HTTPS. That fallback is
+	// expensive — openconnect blocks ~5s waiting for a DTLS handshake that a
+	// network blocking UDP will never answer, then repeats the config exchange —
+	// so the caller uses this to stop asking for DTLS on gateways where it has
+	// been shown not to work. It runs on the scanner goroutine, so the callback
+	// must be cheap and must not block.
+	OnDTLSFailed func()
 
 	// SplitDNS lists the domains whose lookups must go to the VPN-pushed DNS via
 	// macOS per-domain scoped resolvers (Profile.SplitDNS). When non-empty on the
@@ -1068,6 +1085,9 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 				handshakeLines = maxHandshakeLogLines // stop mirroring: the rest is traffic
 				connected(m[1])
 				continue
+			}
+			if opts.OnDTLSFailed != nil && dtlsFailedRe.MatchString(line) {
+				opts.OnDTLSFailed()
 			}
 			if handshakeLines < maxHandshakeLogLines {
 				handshakeLines++

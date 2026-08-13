@@ -1717,3 +1717,33 @@ func TestResendBudgetExhaustedThenRemints(t *testing.T) {
 	s.Disconnect()
 	c.waitFor(t, Disconnected, 2*time.Second)
 }
+
+// openconnect's DTLS fallback line must reach OnDTLSFailed. That line is the only
+// signal that a connect paid ~5s for a DTLS handshake nothing answered, so the
+// caller can stop asking for DTLS on this gateway; a typo in the pattern would
+// silently keep every connect slow.
+func TestDTLSFailureIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub: POSIX only")
+	}
+	dir := t.TempDir()
+	fake := writeScript(t, dir, "openconnect", `#!/bin/sh
+echo "Connected to 10.0.0.1:10443"
+echo "Failed to connect DTLS tunnel; using HTTPS instead (state 3)."
+echo "Configured as 10.0.0.5, with SSL connected"
+exit 0
+`)
+	var mu sync.Mutex
+	calls := 0
+	run := RunOpenconnect(Options{
+		OpenconnectPath: fake,
+		Gateway:         "gw.example.com:10443",
+		OnDTLSFailed:    func() { mu.Lock(); calls++; mu.Unlock() },
+	})
+	_ = run(context.Background(), "COOKIE", func(string) {})
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Errorf("OnDTLSFailed called %d times, want 1", calls)
+	}
+}
