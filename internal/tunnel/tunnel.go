@@ -461,6 +461,11 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 // address and must not be mistaken for ours.
 var connectedRe = regexp.MustCompile(`(?:Configured|Connected) as ([0-9a-fA-F.:]+)`)
 
+// maxHandshakeLogLines caps how many openconnect progress lines are mirrored into
+// the log per attempt (see the scan loop in RunOpenconnect). A handshake is a
+// dozen lines; the cap only matters for a gateway that never finishes one.
+const maxHandshakeLogLines = 60
+
 // authRejectedMarkers are openconnect log fragments meaning the cookie is no
 // longer accepted by the gateway, so a fresh SAML login is required. They are
 // matched case-insensitively and must therefore be written in lower case
@@ -1043,6 +1048,15 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 
 		var lastLines []string
 		sc := bufio.NewScanner(pr)
+		// Handshake timing. openconnect's own progress lines are the only visibility
+		// into where a connect spends its time, but logging the whole stream is not
+		// an option: once the tunnel is up the same stream carries per-route
+		// teardown chatter that floods the log. So mirror the lines only until the
+		// tunnel comes up — exactly the window we want to measure — each prefixed
+		// with the elapsed time since exec, and bounded in case a gateway is chatty.
+		// After that, the ring buffer above still captures the tail for errors.
+		started := time.Now()
+		handshakeLines := 0
 		for sc.Scan() {
 			line := sc.Text()
 			lastLines = append(lastLines, line)
@@ -1050,7 +1064,14 @@ func RunOpenconnect(opts Options) func(ctx context.Context, cookie string, conne
 				lastLines = lastLines[1:]
 			}
 			if m := connectedRe.FindStringSubmatch(line); m != nil {
+				log.Printf("openconnect: [%6.2fs] tunnel up as %s", time.Since(started).Seconds(), m[1])
+				handshakeLines = maxHandshakeLogLines // stop mirroring: the rest is traffic
 				connected(m[1])
+				continue
+			}
+			if handshakeLines < maxHandshakeLogLines {
+				handshakeLines++
+				log.Printf("openconnect: [%6.2fs] %s", time.Since(started).Seconds(), line)
 			}
 		}
 		scanErr := sc.Err()
