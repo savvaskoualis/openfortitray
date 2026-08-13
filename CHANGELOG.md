@@ -8,6 +8,27 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.24] — 2026-08-13
+
+### Fixed
+- **The app no longer leaks its VPN session when it exits on a signal**
+  (`launchctl bootout`, logout, restart, `kill -TERM`). fyne installs its own
+  SIGINT/SIGTERM handler that ends the run loop immediately, and Go delivers a
+  signal to every handler, so the process could exit while the tunnel teardown was
+  still running — openconnect never sent its logout, and the gateway kept the
+  session and refused every new cookie until it timed out server-side, sometimes
+  for many minutes. This is the "we get logged out a lot" and "it just won't
+  connect" behaviour. The process now waits for the teardown before leaving.
+
+### Changed
+- **Skipping DTLS is no longer automatic.** 0.1.23 started passing `--no-dtls` to
+  gateways that had refused a DTLS tunnel, to avoid a measured ~5s handshake wait.
+  In testing, a run of connection failures overlapped that change and could not be
+  separated from a second cause active at the same time (a leaked session, fixed
+  above). Rather than leave a flag that might prevent connecting enabled by
+  default, the app now only notes the opportunity in the log; turning DTLS off is
+  the explicit `dtls` profile toggle, as before.
+
 ## [0.1.23] — 2026-08-13
 
 ### Fixed

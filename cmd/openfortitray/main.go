@@ -1039,9 +1039,18 @@ func main() {
 		// recovers DTLS with no user action.
 		gwKey := fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port)
 		wantDTLS := tp.prof.DTLS
+		// NOT applied automatically. Skipping DTLS demonstrably saves ~5s per
+		// connect, but during testing a run of connect failures overlapped the
+		// window in which --no-dtls was being passed, and it could not be separated
+		// from a second cause present at the same time (a leaked server-side session
+		// that the gateway refused new cookies for until it timed out). Passing a
+		// flag that MIGHT stop a VPN connecting, silently and by default, is not a
+		// trade worth making for 5s — so this only advises, and the user's explicit
+		// `dtls` profile toggle remains the single thing that turns DTLS off.
 		if wantDTLS && a.dtls != nil && a.dtls.Blocked(gwKey, time.Now()) {
-			wantDTLS = false
-			log.Printf("tunnel: skipping DTLS for %s (it refused DTLS recently; saves ~5s per connect)", gwKey)
+			log.Printf("tunnel: %s refused DTLS before; turning DTLS off for this profile in "+
+				"Settings would cut ~5s from each connect (not applied automatically — "+
+				"it is not yet proven safe on this gateway)", gwKey)
 		}
 		run := tunnel.RunOpenconnect(tunnel.Options{
 			Gateway:         fmt.Sprintf("%s:%d", tp.prof.Gateway, tp.prof.Port),
