@@ -95,6 +95,19 @@ type Supervisor struct {
 	earlyRetryDelay time.Duration
 	maxEarlyRetries int
 
+	// maxConnectRounds bounds how many backoff rounds a Connect that has NEVER come
+	// up may take before giving up with a terminal Error. Without a bound the loop
+	// retried forever, and because each round re-minted the cookie, it opened a
+	// browser tab per round — indefinitely. Exposed for tests.
+	maxConnectRounds int
+	// remintEveryRounds is how many refused backoff rounds pass before the cookie
+	// is thrown away and SAML re-run. Re-minting is the only thing that opens a
+	// browser, and when a gateway refuses because it still holds a previous session
+	// it refuses FRESH cookies too (measured: five distinct cookies refused over
+	// 3.5 minutes), so a new cookie every round buys nothing but tabs. Retrying the
+	// cookie we have is silent and costs one ~0.3s attempt. Exposed for tests.
+	remintEveryRounds int
+
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
@@ -122,6 +135,11 @@ func New(authFn func(ctx context.Context) (string, error),
 		// the user would see as an error.
 		earlyRetryDelay: 4 * time.Second,
 		maxEarlyRetries: 2,
+		// ~8 rounds of a 15s..2min backoff spans several minutes, which covers the
+		// worst observed wait for this gateway to release a session, and then stops
+		// instead of retrying (and re-authenticating) forever.
+		maxConnectRounds:  8,
+		remintEveryRounds: 4,
 	}
 }
 
@@ -279,6 +297,11 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 	// rejected. A one-off is a benign expiry; a run of them means the session was
 	// taken elsewhere — surface that calmly and back off hard instead of fighting.
 	postHealthyRejects := 0
+	// rejectRounds counts refused rounds since the last mint (gates the periodic
+	// re-mint); connectRounds counts backoff rounds taken without ever coming up
+	// (gates the terminal give-up).
+	rejectRounds := 0
+	connectRounds := 0
 	backoff := s.backoffBase
 	for {
 		if ctx.Err() != nil {
@@ -371,8 +394,22 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 				}
 				continue
 			}
-			cookie = ""
-			if everConnected {
+			if !everConnected {
+				// Never came up yet: KEEP the cookie between backoff rounds unless a
+				// re-mint is due. A gateway refusing because it still holds a previous
+				// session refuses fresh cookies just as readily, so minting one per round
+				// only opens a browser tab per round — what users saw as "tabs keep
+				// opening". Retrying the cookie we have is silent and costs one ~0.3s
+				// attempt; the periodic re-mint still covers a cookie that really expired.
+				rejectRounds++
+				if rejectRounds%s.remintEveryRounds == 0 {
+					cookie = ""
+				}
+			} else {
+				// After a healthy session a rejection means the session was killed
+				// server-side, so the cookie is genuinely dead and a fresh one is the only
+				// way back: re-mint at once, as before.
+				cookie = ""
 				postHealthyRejects++
 				if postHealthyRejects >= sessionEndedThreshold {
 					// A run of rejections after a healthy session: this one-per-user
@@ -395,6 +432,19 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 			// that refuses fresh cookies cannot spin the SAML browser flow.
 		}
 
+		// A Connect that has never come up cannot retry forever: bound it, then say
+		// so and stop. Unbounded retrying kept the tray in "Reconnecting…" and, when
+		// each round re-minted, opened a browser tab every round for as long as the
+		// app was running. Once the tunnel HAS come up, this does not apply — a real
+		// session deserves indefinite reconnection attempts.
+		if !everConnected {
+			connectRounds++
+			if connectRounds >= s.maxConnectRounds {
+				emittedError = true
+				s.emit(gen, Error, "couldn't connect — click Connect to try again")
+				return
+			}
+		}
 		s.emit(gen, Reconnecting, friendlyDetail(err))
 		select {
 		case <-time.After(backoff):
