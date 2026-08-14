@@ -8,6 +8,67 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.35] — 2026-08-14
+
+### Changed
+- **One window.** Status and Settings were two separate windows; they are now one,
+  with a navigation rail: **Status**, **Connection**, **Advanced**. Settings' old
+  Basic/Advanced tabs are lifted to that same level — the app previously had a
+  window containing a rail containing tabs, three levels of navigation for six
+  settings.
+- The profile **list** became a **selector** at the top of the settings sections. A
+  permanent rail was a lot of furniture for a one-of-N choice, and the selector sits
+  beside the fields it governs.
+- The tray's `Status…` row is now **`Open`** — it opens the window, and naming a row
+  after a section made sense only while that section *was* the window.
+- **The tray menu lost its dead rows.** Connect and Disconnect were two rows of
+  which one was always greyed out; they are one row that relabels (Connect /
+  Disconnect / **Cancel** while a sign-in or retry is in flight, because there is no
+  connection yet to disconnect). Identity and version share one header row.
+- **macOS: the app has a Dock icon again**, and clicking it opens the window. fyne
+  implements no reopen delegate, so the icon would otherwise have been inert; the
+  app observes activation instead.
+- The status panel is a portrait layout with one hero and one primary action, and
+  Settings is grouped under captions with a footer where Save is the only
+  high-importance button. Connect and Disconnect no longer appear in Settings:
+  driving the tunnel is the tray's job and the status panel's.
+
+### Removed
+- **Three modals.** "Settings saved." (a modal for success), and the validation and
+  save-failure dialogs, which now raise the inline banner that already existed for
+  refused Connects — it sits above the fields the message is about and does not have
+  to be dismissed before you can act. "Cannot delete the last profile" is gone too:
+  Delete is simply disabled when one profile remains.
+- **Four settings that did nothing.** *Realm* was captured, validated and stored, and
+  reached neither openconnect nor the auth flow. *Username* and *Certificate* were
+  permanently disabled and only ever appeared to show a greyed box beside a "not
+  supported" warning. *Use custom port* was two controls for one value — the port is
+  simply editable now.
+
+### Fixed
+- **Windows: "View logs" did nothing.** The app runs elevated, and an elevated
+  process cannot open an MSIX-packaged handler — which is what Notepad is on Windows
+  11 — so the shell call failed silently. It now goes through Explorer, which hands
+  the file to the unelevated desktop shell. Both launchers also stop flashing a
+  console window.
+- **The Windows updater was fighting itself for its own log.** The launcher opened
+  `update.log` and passed the handle to PowerShell as stdout while the script wrote
+  the same path with `Out-File`, which will not share a file with another writer —
+  so every line failed and updates were undiagnosable. Two files now. The updater
+  also no longer relaunches the app twice.
+- **The activity history was unreachable**, not merely short: a full history wanted
+  1061px inside a 560px window with no scroller. It is now bounded and scrolls,
+  opening it grows the window to fit, it keeps 50 entries rather than 12, the
+  toggle shows the entry count, and entries from another day carry their date.
+- **Retries now notify.** A reconnect that never had a healthy session used to be
+  silent; it says "VPN reconnecting" — not "dropped", because nothing was dropped —
+  once per retry episode rather than once per round.
+- The split-DNS note claimed the feature arrived "in a later release". It already
+  ships; what is true is that it needs the privileged helper, so it is macOS and
+  Linux only.
+- Notification attempts are logged, so a missing toast is no longer
+  indistinguishable from one the app never tried to post.
+
 ## [0.1.34] — 2026-08-13
 
 ### Added
