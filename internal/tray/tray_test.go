@@ -146,7 +146,6 @@ func TestMenuActionsWireToApp(t *testing.T) {
 		wantErr string
 	}{
 		{label: "Connect"},
-		{label: "Disconnect"},
 		{label: "Quit"},
 	} {
 		it := itemByLabel(c.menu, tc.label)
@@ -161,9 +160,6 @@ func TestMenuActionsWireToApp(t *testing.T) {
 	if f.connects != 1 {
 		t.Errorf("Connect item fired %d connects, want 1", f.connects)
 	}
-	if f.disconnects != 1 {
-		t.Errorf("Disconnect item fired %d disconnects, want 1", f.disconnects)
-	}
 	if f.quits != 1 {
 		t.Errorf("Quit item fired %d quits, want 1 (teardown must run, not fyne's default quit)", f.quits)
 	}
@@ -174,31 +170,24 @@ func TestMenuActionsWireToApp(t *testing.T) {
 	if len(c.menu.Items) == 0 {
 		t.Fatal("menu has no items")
 	}
+	// One header row carries identity AND build: two rows said nothing the one row
+	// does not, and the version is only ever read in the same glance as the name.
 	title := c.menu.Items[0]
-	if title.Label != "OpenFortiTray" || !title.Disabled || title.Action != nil {
-		t.Errorf("first item = %+v, want a disabled, action-less \"OpenFortiTray\" title", title)
+	if title.Label != "OpenFortiTray "+f.Version() || !title.Disabled || title.Action != nil {
+		t.Errorf("first item = %+v, want a disabled, action-less \"OpenFortiTray <version>\" header", title)
 	}
-	// The build-version row sits directly under the title: a disabled,
-	// action-less label showing App.Version() verbatim, before the first
-	// separator.
-	if len(c.menu.Items) < 2 {
-		t.Fatal("menu has no version row after the title")
-	}
-	ver := c.menu.Items[1]
-	if ver.Label != f.Version() || !ver.Disabled || ver.Action != nil {
-		t.Errorf("second item = %+v, want a disabled, action-less %q version row", ver, f.Version())
-	}
-	if len(c.menu.Items) < 3 || !c.menu.Items[2].IsSeparator {
-		t.Error("title and version rows must be followed by a separator, then the status line")
+	if len(c.menu.Items) < 2 || !c.menu.Items[1].IsSeparator {
+		t.Error("the header must be followed by a separator, then the status line")
 	}
 
 	// The status item exists, is disabled, and carries no action (it is a label).
 	if s := itemByLabel(c.menu, "Disconnected"); s == nil || !s.Disabled || s.Action != nil {
 		t.Errorf("status item = %+v, want a disabled, action-less label", s)
 	}
-	// Disconnect starts disabled: nothing is connected at launch.
-	if d := itemByLabel(c.menu, "Disconnect"); d == nil || !d.Disabled {
-		t.Error("Disconnect should start disabled")
+	// There is exactly ONE connection row, and at launch it offers Connect. The old
+	// menu had a Connect and a Disconnect row of which one was always greyed out.
+	if d := itemByLabel(c.menu, "Disconnect"); d != nil {
+		t.Error("a separate Disconnect row is dead weight; the action row relabels instead")
 	}
 	// View logs is present and wired (side-effecting, so not invoked here).
 	if l := itemByLabel(c.menu, "View logs"); l == nil || l.Action == nil {
@@ -302,18 +291,45 @@ func TestIconForKind(t *testing.T) {
 // exists yet) and wiring the row to it would silently strip that escape hatch, so
 // this asserts the row's enablement against the states rather than against the
 // field.
-func TestDisconnectStaysAvailableWhileBusy(t *testing.T) {
+func TestActionRowMatchesTheState(t *testing.T) {
 	test.NewTempApp(t)
-	c := newController(&fakeApp{})
 
-	for _, st := range []tunnel.State{tunnel.Authenticating, tunnel.Connecting, tunnel.Reconnecting} {
-		c.Apply(tunnel.Event{State: st})
-		if c.disconnectItem.Disabled {
-			t.Errorf("%v: Disconnect is disabled, leaving no way to abort", st)
-		}
-		if !c.connectItem.Disabled {
-			t.Errorf("%v: Connect should be disabled while something is in flight", st)
-		}
+	cases := []struct {
+		state     tunnel.State
+		wantLabel string
+		// which host method the row must call
+		wantConnects, wantDisconnects int
+	}{
+		{tunnel.Disconnected, "Connect", 1, 0},
+		{tunnel.Error, "Connect", 1, 0},
+		{tunnel.Connected, "Disconnect", 0, 1},
+		// In flight: there is no connection yet, so the row says Cancel — but it
+		// must stay CLICKABLE, because it is the only way out of a connect that
+		// hangs or a retry loop that will not settle.
+		{tunnel.Authenticating, "Cancel", 0, 1},
+		{tunnel.Connecting, "Cancel", 0, 1},
+		{tunnel.Reconnecting, "Cancel", 0, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.state.String(), func(t *testing.T) {
+			f := &fakeApp{}
+			c := newController(f)
+			c.Apply(tunnel.Event{State: tc.state})
+			if c.actionItem.Label != tc.wantLabel {
+				t.Errorf("label = %q, want %q", c.actionItem.Label, tc.wantLabel)
+			}
+			if c.actionItem.Disabled {
+				t.Error("the action row must never be disabled; it is the only connection control")
+			}
+			if c.actionItem.Action == nil {
+				t.Fatal("the action row has no action")
+			}
+			c.actionItem.Action()
+			if f.connects != tc.wantConnects || f.disconnects != tc.wantDisconnects {
+				t.Errorf("fired %d connects / %d disconnects, want %d / %d",
+					f.connects, f.disconnects, tc.wantConnects, tc.wantDisconnects)
+			}
+		})
 	}
 }
 
@@ -345,13 +361,13 @@ func TestApplyUpdatesFyneItemsAsFallback(t *testing.T) {
 	if !strings.Contains(c.statusItem.Label, "Connected") {
 		t.Errorf("status label = %q, want it to mention Connected", c.statusItem.Label)
 	}
-	if !c.connectItem.Disabled || c.disconnectItem.Disabled {
-		t.Error("Connected must disable Connect and enable Disconnect")
+	if c.actionItem.Label != "Disconnect" {
+		t.Errorf("action row = %q, want Disconnect while connected", c.actionItem.Label)
 	}
 
 	c.Apply(tunnel.Event{State: tunnel.Disconnected})
-	if c.connectItem.Disabled || !c.disconnectItem.Disabled {
-		t.Error("Disconnected must enable Connect and disable Disconnect")
+	if c.actionItem.Label != "Connect" {
+		t.Errorf("action row = %q, want Connect while disconnected", c.actionItem.Label)
 	}
 	// And the view is remembered, so a later takeover adopts the current state
 	// instead of resetting the tray to the defaults.

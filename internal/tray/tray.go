@@ -50,11 +50,15 @@ type Controller struct {
 	desk desktop.App
 	menu *fyne.Menu
 
-	statusItem     *fyne.MenuItem
-	connectItem    *fyne.MenuItem
-	disconnectItem *fyne.MenuItem
-	autoItem       *fyne.MenuItem
-	updateItem     *fyne.MenuItem
+	statusItem *fyne.MenuItem
+	// actionItem is the ONE connection action. It was two rows — Connect and
+	// Disconnect — of which exactly one was always greyed out, so half of that pair
+	// was permanently dead weight in a menu where every row should mean something.
+	// Apply relabels it and repoints its action together, so the label and what it
+	// does can never disagree.
+	actionItem *fyne.MenuItem
+	autoItem   *fyne.MenuItem
+	updateItem *fyne.MenuItem
 
 	resGray, resGreen, resYellow, resRed fyne.Resource
 	// Badged ("update available") variants of the four state icons, composed once
@@ -129,26 +133,20 @@ func newController(app App) *Controller {
 		currentIcon: iconGray,
 	}
 
-	// A fixed, disabled header so the popover names the app. fyne's desktop tray
-	// exposes no window title, and the menu-bar icon itself carries no visible
-	// label, so this row (plus the best-effort SetTooltip below) is the app's
-	// only in-menu identity. It never changes: no Action, always disabled.
-	titleItem := fyne.NewMenuItem("OpenFortiTray", nil)
+	// One disabled header carrying both identity and build. These were two rows;
+	// the menu-bar icon has no visible label and fyne's tray exposes no window
+	// title, so the app does need to name itself here — but it does not need two
+	// rows to do it, and the version is only ever read in the same glance as the
+	// name.
+	titleItem := fyne.NewMenuItem("OpenFortiTray "+app.Version(), nil)
 	titleItem.Disabled = true
-
-	// The build version, shown as a second disabled row directly under the title.
-	// Verbatim: the string already carries the leading "v" for tagged builds, or
-	// "dev" for an unstamped local build.
-	versionItem := fyne.NewMenuItem(app.Version(), nil)
-	versionItem.Disabled = true
 
 	c.statusItem = fyne.NewMenuItem("Disconnected", nil)
 	c.statusItem.Disabled = true
 
-	c.connectItem = fyne.NewMenuItem("Connect", func() { app.Connect() })
-
-	c.disconnectItem = fyne.NewMenuItem("Disconnect", func() { app.Disconnect() })
-	c.disconnectItem.Disabled = true
+	// The single connection action. Its label and its action are set together by
+	// Apply; it starts as Connect because nothing is up at launch.
+	c.actionItem = fyne.NewMenuItem("Connect", func() { app.Connect() })
 
 	c.autoItem = fyne.NewMenuItem("Auto-connect at login", c.toggleAutostart)
 	c.autoItem.Checked = app.AutostartEnabled()
@@ -173,17 +171,25 @@ func newController(app App) *Controller {
 	// teardown runs; we do not set IsQuit ourselves and instead drive a.Quit().
 	quitItem := fyne.NewMenuItem("Quit", func() { app.Quit() })
 
+	// GROUPING — four bands, each answering a different question:
+	//
+	//   what is this        title+version
+	//   what is it doing    status, and the one thing to do about it
+	//   where do I go       the two windows
+	//   everything else     preference, diagnostics, update, quit
+	//
+	// The old menu interleaved these: the autostart checkbox sat between Settings
+	// and View logs, so a preference, a window and a diagnostic shared a band and
+	// none of them read as belonging where they were.
 	c.menu = fyne.NewMenu("OpenFortiTray",
 		titleItem,
-		versionItem,
 		fyne.NewMenuItemSeparator(),
 		c.statusItem,
-		fyne.NewMenuItemSeparator(),
-		c.connectItem,
-		c.disconnectItem,
+		c.actionItem,
 		fyne.NewMenuItemSeparator(),
 		statusWindowItem,
 		settingsItem,
+		fyne.NewMenuItemSeparator(),
 		c.autoItem,
 		logsItem,
 		c.updateItem,
@@ -228,20 +234,31 @@ func (c *Controller) Apply(e tunnel.Event) {
 		c.desk.SetSystemTrayIcon(c.resourceFor(icon))
 	}
 	c.statusItem.Label = v.MenuLabel
-
-	// Connect is offered exactly when there is nothing running, and Disconnect for
-	// everything else — INCLUDING the busy states, where it is the only way to
-	// abort a connect that is hanging or a reconnect loop that will not settle.
-	//
-	// This deliberately does NOT use v.CanDisconnect, which is false while a
-	// browser login is in flight because there is no tunnel yet. The status window
-	// reads that field and offers "Cancel" instead; a menu row cannot relabel
-	// itself while open, so here the row stays "Disconnect" and stays clickable.
-	// Wiring it to CanDisconnect would take away the user's only way out of a stuck
-	// connect, which is a state they hit for real.
-	c.connectItem.Disabled = !v.CanConnect
-	c.disconnectItem.Disabled = v.CanConnect
+	c.setAction(v)
 	c.menu.Refresh()
+}
+
+// setAction points the single connection row at the thing that makes sense now.
+//
+// Connect when nothing is running; otherwise the action that stops what is —
+// labelled "Cancel" while a sign-in or retry is in flight, because there is no
+// connection yet to "disconnect" and calling it that would be a lie. Both route to
+// Disconnect, which is what tears an attempt down.
+//
+// The label and the Action are assigned together and read from the same view, so a
+// menu that cannot repaint while open still cannot show one thing and do another.
+func (c *Controller) setAction(v uistate.View) {
+	switch {
+	case v.CanConnect:
+		c.actionItem.Label = "Connect"
+		c.actionItem.Action = c.app.Connect
+	case v.Busy():
+		c.actionItem.Label = "Cancel"
+		c.actionItem.Action = c.app.Disconnect
+	default:
+		c.actionItem.Label = "Disconnect"
+		c.actionItem.Action = c.app.Disconnect
+	}
 }
 
 // iconFor maps a view's severity to the tray glyph. The icons stay raw PNG bytes

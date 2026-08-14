@@ -60,20 +60,14 @@ type Controller struct {
 	// change can be pushed through all of them at once.
 	forms []*widget.Form
 
-	nameEntry     *widget.Entry
-	gatewayEntry  *widget.Entry
-	customPort    *widget.Check
-	portEntry     *widget.Entry
-	authSelect    *widget.Select
-	authNote      *widget.Label
-	usernameEntry *widget.Entry
-	certPathEntry *widget.Entry
+	nameEntry    *widget.Entry
+	gatewayEntry *widget.Entry
+	portEntry    *widget.Entry
+	authSelect   *widget.Select
+	authNote     *widget.Label
 	// The rows that appear and disappear with the chosen auth method, each in its
 	// own container so hiding one reclaims its space as well as its label (see row).
 	authNoteRow *fyne.Container
-	usernameRow *fyne.Container
-	certPathRow *fyne.Container
-	realmEntry  *widget.Entry
 	autoConnect *widget.Check
 	keepAlive   *widget.Check
 
@@ -266,18 +260,17 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 		}
 		if n, err := parsePort(s); err == nil {
 			c.work.Profiles[c.sel].Port = n
+			// CustomPort is no longer a control the user sees — it is derived from
+			// whether the port differs from the default. It stays in the schema
+			// because FortiClient's EnableCustomPort maps onto it, and because
+			// effectivePort still reads it, but asking someone to tick a box before
+			// they may type a port was two controls for one value.
+			c.work.Profiles[c.sel].CustomPort = n != defaultPort
 		} else {
 			c.work.Profiles[c.sel].Port = 0 // flagged invalid; Save's validator catches it
+			c.work.Profiles[c.sel].CustomPort = true
 		}
 	}
-
-	c.customPort = widget.NewCheck("Use custom port", func(on bool) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].CustomPort = on
-		c.applyCustomPortState(on)
-	})
 
 	c.authSelect = widget.NewSelect(authLabels, func(label string) {
 		if c.loading {
@@ -293,34 +286,8 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	// the roadmap is visible but kept disabled (updateAuthNote toggles them), and
 	// Save refuses to activate a non-SAML profile. They still round-trip to the
 	// config so the shape is forward-designed.
-	c.usernameEntry = widget.NewEntry()
-	c.usernameEntry.SetPlaceHolder("username (password auth — not yet supported)")
-	c.usernameEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].Auth.Username = s
-	}
-	c.certPathEntry = widget.NewEntry()
-	c.certPathEntry.SetPlaceHolder("client certificate path (not yet supported)")
-	c.certPathEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].Auth.CertPath = s
-	}
 
 	c.authNoteRow = c.row("", c.authNote)
-	c.usernameRow = c.row("Username", c.usernameEntry)
-	c.certPathRow = c.row("Certificate", c.certPathEntry)
-
-	c.realmEntry = widget.NewEntry()
-	c.realmEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].Realm = s
-	}
 
 	c.autoConnect = widget.NewCheck("Auto-connect at login", func(on bool) {
 		if c.loading {
@@ -348,17 +315,13 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 		c.section("Connection",
 			widget.NewFormItem("Profile name", c.nameEntry),
 			widget.NewFormItem("Gateway host", c.gatewayEntry),
-			widget.NewFormItem("", c.customPort),
-			widget.NewFormItem("Port", narrow(c.portEntry, 110)),
+			widget.NewFormItem("Port", narrow(c.portEntry, 150)),
 		),
 		c.group("Authentication",
 			c.row("Method", c.authSelect),
 			// The three conditional rows sit outside that form, each in its own
 			// container, so the group closes up under SAML instead of leaving a hole.
 			c.authNoteRow,
-			c.usernameRow,
-			c.certPathRow,
-			c.row("Realm", c.realmEntry),
 		),
 		c.section("Startup",
 			widget.NewFormItem("", c.autoConnect),
@@ -418,6 +381,8 @@ func (c *Controller) relayout() {
 // got the same width as a hostname — which tells the reader nothing about what
 // belongs in it, and makes a settings pane look like a generated form rather than a
 // designed one.
+// The width must leave room for the validation tick a validated Entry draws
+// INSIDE its own box: at 110px the digits and the tick collided.
 func narrow(o fyne.CanvasObject, w float32) fyne.CanvasObject {
 	return container.NewHBox(
 		container.New(layout.NewGridWrapLayout(fyne.NewSize(w, 34)), o),
@@ -620,13 +585,8 @@ func (c *Controller) loadProfile(i int) {
 	c.loading = true
 	c.nameEntry.SetText(p.Name)
 	c.gatewayEntry.SetText(p.Gateway)
-	c.customPort.SetChecked(p.CustomPort)
 	c.portEntry.SetText(itoa(effectivePort(p.CustomPort, p.Port)))
-	c.applyCustomPortState(p.CustomPort)
 	c.authSelect.SetSelected(authLabel(p.Auth.Method))
-	c.usernameEntry.SetText(p.Auth.Username)
-	c.certPathEntry.SetText(p.Auth.CertPath)
-	c.realmEntry.SetText(p.Realm)
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 	c.keepAlive.SetChecked(p.KeepAlive)
 
@@ -646,20 +606,6 @@ func (c *Controller) loadProfile(i int) {
 	c.updateAuthNote()
 }
 
-// applyCustomPortState enables the Port entry only when a custom port is in use;
-// otherwise it shows the fixed default and is disabled.
-func (c *Controller) applyCustomPortState(on bool) {
-	if on {
-		c.portEntry.Enable()
-		return
-	}
-	c.portEntry.SetText(itoa(defaultPort))
-	c.portEntry.Disable()
-	if !c.loading {
-		c.work.Profiles[c.sel].Port = defaultPort
-	}
-}
-
 // updateAuthNote shows the "(not yet supported)" note for the two methods that
 // are designed in the schema but not wired into the runtime yet, and reveals the
 // matching sub-field — always disabled, because none of them are functional.
@@ -667,27 +613,18 @@ func (c *Controller) applyCustomPortState(on bool) {
 // real gate; this is only the visual affordance.
 func (c *Controller) updateAuthNote() {
 	method := c.work.Profiles[c.sel].Auth.Method
-	// Sub-fields are never editable today: only SAML is implemented.
-	c.usernameEntry.Disable()
-	c.certPathEntry.Disable()
 	switch method {
 	case config.AuthPassword:
 		c.authNote.SetText("(username/password auth not yet supported — use SAML/SSO)")
 		show(c.authNoteRow, true)
-		show(c.usernameRow, true)
-		show(c.certPathRow, false)
 	case config.AuthCert:
 		c.authNote.SetText("(client-certificate auth not yet supported — use SAML/SSO)")
 		show(c.authNoteRow, true)
-		show(c.usernameRow, false)
-		show(c.certPathRow, true)
 	default:
 		// SAML: no sub-field and no note, so the note row goes too rather than
 		// leaving an empty gap under the Method select.
 		c.authNote.SetText("")
 		show(c.authNoteRow, false)
-		show(c.usernameRow, false)
-		show(c.certPathRow, false)
 	}
 	c.relayout()
 }
@@ -746,7 +683,12 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 	// TODO(task11): SplitDNS is only captured + validated here. The scoped
 	// /etc/resolver install/remove that makes these domains resolve through the
 	// tunnel is a separate task; nothing installs a resolver yet.
-	splitDNSNote := widget.NewLabel("Domains routed through the VPN's DNS (scoped resolver — installed in a later release).")
+	// The old note said this was "installed in a later release". It is not: the
+	// tunnel installs scoped resolvers through the privileged helper (see
+	// tunnel.splitDNSEnabled). What IS true is that the helper path is macOS and
+	// Linux only, so on Windows these domains are stored and not applied — which is
+	// the thing a user actually needs told.
+	splitDNSNote := widget.NewLabel("Looked up through the VPN's DNS. macOS and Linux only; stored but not applied on Windows.")
 	splitDNSNote.Wrapping = fyne.TextWrapWord
 
 	c.samlPortEntry = widget.NewEntry()
@@ -807,7 +749,7 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 			widget.NewFormItem("", splitDNSNote),
 		),
 		c.section("Paths",
-			widget.NewFormItem("SAML redirect port", narrow(c.samlPortEntry, 110)),
+			widget.NewFormItem("SAML redirect port", narrow(c.samlPortEntry, 150)),
 			widget.NewFormItem("openconnect binary", c.openconnectPath),
 			widget.NewFormItem("", openconnectNote),
 			widget.NewFormItem("Privileged helper", c.helperPath),
