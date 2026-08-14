@@ -1,0 +1,11 @@
+dist/
+*.log
+/openfortitray
+
+# Windows resource objects compiled from cmd/openfortitray/openfortitray.manifest
+# at build time (Makefile `winres` target / CI). Never commit a binary .syso —
+# regenerate it from the checked-in manifest with the pinned rsrc tool.
+*.syso
+
+# internal SDD process artifacts — never publish
+.superpowers/
