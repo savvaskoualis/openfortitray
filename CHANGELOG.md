@@ -8,6 +8,34 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.36] — 2026-08-14
+
+### Added
+- **Dev builds are offered updates.** Version comparison used to reject anything
+  with a suffix, so a locally built `0.1.35-dev` never saw a release — which also
+  meant the update path went unexercised until a real user hit it. The two sides are
+  deliberately asymmetric: the **installed** version may carry a suffix, so
+  `0.1.35-dev` is offered `0.1.35` and a git-describe build is offered the next
+  release; the **available** version must be clean, because pushing a release
+  candidate at someone who asked for stable is a surprise, not an update. A bare
+  `dev` or a short SHA still never nags — running from source should not be told to
+  overwrite itself.
+- **`Check for Updates…` now answers.** It ran a check and said nothing when there
+  was nothing, which is indistinguishable from a menu item that does nothing. It
+  now reports that you are up to date, that the check failed, or that a release is
+  out but the Homebrew cask has not caught up yet. Background checks stay silent.
+
+### Changed
+- **The app no longer just disappears when you update.** The updater has to replace
+  the app's own files, so it runs detached and waits for the process to exit —
+  which meant the download *and* the install happened with the app dead, and nothing
+  could report progress. Only the final swap actually needs the app gone, so the
+  download now runs while the app is alive, with a progress indicator and the VPN
+  still connected.
+- **The restart is a separate question**, asked only once the update is downloaded,
+  and it says what it costs: the app closes and the VPN disconnects, both returning
+  on their own.
+
 ## [0.1.35] — 2026-08-14
 
 ### Changed
