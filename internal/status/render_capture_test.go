@@ -45,9 +45,12 @@ func TestCaptureWindowRenders(t *testing.T) {
 	}
 
 	events := map[string]tunnel.Event{
-		"connected":    {State: tunnel.Connected, Detail: "10.0.0.88"},
-		"reconnecting": {State: tunnel.Reconnecting, Detail: "gateway refused the session — signing in again"},
-		"disconnected": {State: tunnel.Disconnected},
+		"connected":      {State: tunnel.Connected, Detail: "10.0.0.88"},
+		"reconnecting":   {State: tunnel.Reconnecting, Detail: "gateway refused the session — signing in again"},
+		"disconnected":   {State: tunnel.Disconnected},
+		"authenticating": {State: tunnel.Authenticating, Detail: "finish signing in in your browser"},
+		"connecting":     {State: tunnel.Connecting},
+		"error":          {State: tunnel.Error, Detail: "couldn't connect — click Connect to try again"},
 	}
 	variants := map[string]fyne.ThemeVariant{"light": 1, "dark": 0}
 
@@ -70,7 +73,7 @@ func TestCaptureWindowRenders(t *testing.T) {
 				c.Tick()
 			}
 
-			w.Resize(fyne.NewSize(680, 520))
+			w.Resize(fyne.NewSize(400, 560))
 			img := w.Canvas().Capture()
 			f, err := os.Create(dir + "/status-" + ename + "-" + vname + ".png")
 			if err != nil {

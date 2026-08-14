@@ -16,6 +16,7 @@ package status
 
 import (
 	"fmt"
+	"image/color"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -56,14 +57,21 @@ type Controller struct {
 	host Host
 	win  fyne.Window
 
+	// stateRing is the outline of the state badge; dot is the solid centre. Both
+	// take the state colour, which is the only saturated colour in the window.
+	stateRing *canvas.Circle
 	dot       *canvas.Circle
 	stateText *canvas.Text
 	subText   *canvas.Text
+	// timerText is the session clock, on its own line in the monospace face so a
+	// ticking second does not shift the gateway name above it.
+	timerText *canvas.Text
+	// accordion holds the activity history, collapsed by default.
+	accordion *widget.Accordion
 
-	ipValue      *widget.Label
-	gatewayValue *widget.Label
-	protoValue   *widget.Label
-	sinceValue   *widget.Label
+	ipValue    *widget.Label
+	protoValue *widget.Label
+	sinceValue *widget.Label
 
 	primary     *widget.Button
 	settingsBtn *widget.Button
@@ -109,77 +117,125 @@ func New(host Host, win fyne.Window) *Controller {
 }
 
 func (c *Controller) build() {
-	// Header. canvas.Text rather than widget.Label: these two need explicit sizes
-	// and colours from the theme, and Label offers neither.
+	// LAYOUT INTENT — a portrait connection panel, not a dashboard.
+	//
+	// The previous layout was 680x520 landscape and spent roughly the bottom
+	// two-fifths on nothing: a VBox of five widgets in a window far taller than they
+	// needed, which is the single loudest "unfinished" signal a window can send.
+	// Everything also carried the same visual weight, so nothing read as the answer
+	// to the only question the window exists to answer.
+	//
+	// So: one hero (am I connected?), one primary action, and everything else
+	// deliberately quieter beneath it. Portrait, sized to its content, centred —
+	// the shape every comparable client uses, because the content is a single
+	// vertical thought rather than a table.
+
+	// The state badge: a ring in the state colour with a solid dot at its centre.
+	// Two canvas circles rather than an image, so it recolours from the theme and
+	// costs nothing to redraw on llvmpipe.
+	c.stateRing = canvas.NewCircle(color.Transparent)
+	c.stateRing.StrokeWidth = 3
 	c.dot = canvas.NewCircle(theme.Color(theme.ColorNameDisabled))
-	// GridWrap is the layout that gives a canvas object a FIXED cell size; a raw
-	// Resize is overwritten the first time the parent lays out, and an unsized
-	// circle stretches to fill whatever box it lands in.
-	dotBox := container.New(layout.NewGridWrapLayout(fyne.NewSize(11, 11)), c.dot)
-
-	c.stateText = canvas.NewText("", theme.Color(theme.ColorNameForeground))
-	c.stateText.TextSize = theme.Size(theme.SizeNameSubHeadingText)
-	c.stateText.TextStyle = fyne.TextStyle{Bold: true}
-
-	c.subText = canvas.NewText("", theme.Color(theme.ColorNamePlaceHolder))
-	c.subText.TextSize = theme.Size(theme.SizeNameCaptionText)
-
-	header := container.NewHBox(
-		container.NewCenter(dotBox),
-		container.NewVBox(c.stateText, c.subText),
+	badge := container.NewStack(
+		container.New(layout.NewGridWrapLayout(fyne.NewSize(84, 84)), c.stateRing),
+		container.NewCenter(container.New(layout.NewGridWrapLayout(fyne.NewSize(18, 18)), c.dot)),
 	)
 
-	// Detail card. One FormLayout container holds every key/value pair so the two
-	// columns line up across rows — a per-row container would size each row's key
-	// column independently and the values would stagger.
+	// The state is the largest thing on screen; the gateway and the clock sit under
+	// it in the muted foreground. canvas.Text throughout, because these need an
+	// explicit size, colour and alignment and widget.Label offers none of the three.
+	c.stateText = centredText(theme.Size(theme.SizeNameHeadingText), true, theme.ColorNameForeground)
+	c.subText = centredText(theme.Size(theme.SizeNameText), false, theme.ColorNamePlaceHolder)
+	c.timerText = centredText(theme.Size(theme.SizeNameText), false, theme.ColorNamePlaceHolder)
+	c.timerText.TextStyle = fyne.TextStyle{Monospace: true}
+
+	hero := container.NewVBox(
+		container.NewCenter(badge),
+		spacer(10),
+		c.stateText,
+		spacer(2),
+		c.subText,
+		c.timerText,
+	)
+
+	// One primary action, fixed-width and centred so it reads as THE thing to press
+	// and does not resize as its label changes between Connect/Disconnect/Cancel.
+	// Built with its widest label for the same min-size reason as before.
+	c.primary = widget.NewButton("Disconnect", func() {})
+	c.primary.Importance = widget.HighImportance
+	primaryRow := container.NewCenter(
+		container.New(layout.NewGridWrapLayout(fyne.NewSize(210, 38)), c.primary))
+
+	// Details, deliberately quiet: no border, no card background competing with the
+	// hero — just a muted two-column grid under a rule. One FormLayout container so
+	// the columns line up across rows.
 	c.ipValue = cardValue(true)
-	c.gatewayValue = cardValue(true)
 	c.protoValue = cardValue(false)
 	c.sinceValue = cardValue(true)
-
-	rows := container.New(layout.NewFormLayout(),
+	// No Gateway row: the hero already names the gateway directly under the state,
+	// and printing it twice in one 400px column is the kind of duplication that makes
+	// a window feel padded out rather than composed. It also cost exactly the height
+	// the activity section needed to be reachable.
+	details := container.New(layout.NewFormLayout(),
 		cardKey("Assigned IP"), c.ipValue,
-		cardKey("Gateway"), c.gatewayValue,
 		cardKey("Protocol"), c.protoValue,
 		cardKey("Connected since"), c.sinceValue,
 	)
 
-	bg := canvas.NewRectangle(theme.Color(theme.ColorNameHeaderBackground))
-	bg.CornerRadius = theme.Size(theme.SizeNameCardRadius)
-	bg.StrokeColor = theme.Color(theme.ColorNameSeparator)
-	bg.StrokeWidth = theme.Size(theme.SizeNameSeparatorThickness)
-	card := container.NewStack(bg, container.NewPadded(rows))
-
-	// Buttons. The primary is relabelled per state by Apply; it is the only
-	// high-importance control on screen.
-	//
-	// It is created with its WIDEST label rather than an empty one: a button's
-	// minimum size comes from its text, and a container only re-runs its layout when
-	// it is refreshed — so a button built empty stayed 44px wide and "Disconnect"
-	// spilled out of it. setPrimary refreshes buttonRow for the same reason.
-	c.primary = widget.NewButton("Disconnect", func() {})
-	c.primary.Importance = widget.HighImportance
+	// Secondary actions are low-importance and sit at the foot, where they cannot be
+	// mistaken for the primary action. Settings is the more common of the two, so it
+	// leads.
 	c.settingsBtn = widget.NewButton("Settings…", c.host.ShowSettings)
+	c.settingsBtn.Importance = widget.LowImportance
 	c.logBtn = widget.NewButton("Open log file…", c.host.OpenLog)
-	c.buttonRow = container.NewHBox(c.primary, layout.NewSpacer(), c.logBtn, c.settingsBtn)
+	c.logBtn.Importance = widget.LowImportance
+	c.buttonRow = container.NewCenter(container.NewHBox(c.settingsBtn, c.logBtn))
 
-	// Activity. An accordion so the history can be folded away; open by default,
-	// because a window whose interesting half is collapsed teaches nobody it is
-	// there. One FormLayout container holds the whole history: two columns that line
-	// up across rows, and tighter than a stack of per-row HBoxes.
+	// Activity, collapsed by default. It is the third thing anyone wants and keeping
+	// it open forced the window tall enough to strand the rest in whitespace; folded
+	// away, the window is the size of its content and expands only when asked.
 	c.activity = container.New(layout.NewFormLayout())
-	acc := widget.NewAccordion(widget.NewAccordionItem("Activity", c.activity))
-	acc.Open(0)
+	c.accordion = widget.NewAccordion(widget.NewAccordionItem("Activity", c.activity))
 
-	content := container.NewVBox(header, card, c.buttonRow, widget.NewSeparator(), acc)
+	content := container.NewVBox(
+		spacer(18),
+		hero,
+		spacer(18),
+		primaryRow,
+		spacer(16),
+		widget.NewSeparator(),
+		details,
+		widget.NewSeparator(),
+		spacer(4),
+		c.buttonRow,
+		c.accordion,
+		spacer(4),
+	)
 
 	// A tray app's window must never quit the process: that would take the tunnel
 	// down with it. Closing hides, exactly as the settings window does.
 	c.closeRequested = c.win.Hide
 	c.win.SetCloseIntercept(func() { c.closeRequested() })
 	c.win.SetContent(container.NewPadded(content))
-	c.win.Resize(fyne.NewSize(680, 520))
+	c.win.Resize(fyne.NewSize(400, 560))
 	c.win.SetFixedSize(false)
+}
+
+// centredText builds one of the hero's text lines.
+func centredText(size float32, bold bool, name fyne.ThemeColorName) *canvas.Text {
+	t := canvas.NewText("", theme.Color(name))
+	t.TextSize = size
+	t.TextStyle = fyne.TextStyle{Bold: bold}
+	t.Alignment = fyne.TextAlignCenter
+	return t
+}
+
+// spacer is a fixed vertical gap. The layout needs explicit rhythm: a VBox's own
+// padding is one value everywhere, and "everything evenly spaced" is precisely what
+// made the old window read as a list of widgets rather than a composed screen.
+func spacer(h float32) fyne.CanvasObject {
+	return container.New(layout.NewGridWrapLayout(fyne.NewSize(1, h)),
+		canvas.NewRectangle(color.Transparent))
 }
 
 // cardKey is a muted left-column label.
@@ -228,8 +284,13 @@ func (c *Controller) render(v uistate.View) {
 		c.connectedAt = time.Time{}
 	}
 
-	c.dot.FillColor = theme.Color(dotColor(v.Kind))
+	col := theme.Color(dotColor(v.Kind))
+	c.dot.FillColor = col
 	c.dot.Refresh()
+	// The ring is the same hue at low alpha: present enough to read as a badge,
+	// quiet enough not to compete with the state word inside it.
+	c.stateRing.StrokeColor = withAlpha(col, 0x66)
+	c.stateRing.Refresh()
 
 	c.stateText.Text = v.Title
 	c.stateText.Color = theme.Color(theme.ColorNameForeground)
@@ -238,7 +299,6 @@ func (c *Controller) render(v uistate.View) {
 	c.setSubText(v)
 
 	c.ipValue.SetText(orDash(v.AssignedIP))
-	c.gatewayValue.SetText(orDash(c.host.GatewayLabel()))
 	c.protoValue.SetText("Fortinet · " + c.host.DTLSLabel())
 	if c.connectedAt.IsZero() {
 		c.sinceValue.SetText(emDash)
@@ -264,13 +324,31 @@ func (c *Controller) Tick() {
 // is up, the state's own short detail otherwise.
 func (c *Controller) setSubText(v uistate.View) {
 	if !c.connectedAt.IsZero() {
-		host := c.host.GatewayLabel()
-		c.subText.Text = host + " · " + uptime(c.now().Sub(c.connectedAt))
+		// Connected: the gateway on one line, the clock on its own beneath it. They
+		// used to share a line, which meant the gateway shifted sideways every second
+		// as the digits changed width — the kind of jitter that reads as cheap.
+		c.subText.Text = c.host.GatewayLabel()
+		c.timerText.Text = uptime(c.now().Sub(c.connectedAt))
+	} else if v.State == tunnel.Disconnected {
+		// Idle: name the gateway this would connect TO. uistate offers "not connected"
+		// as a filler, which under a heading that already says "Disconnected" is a
+		// tautology occupying the one line that could carry something useful.
+		c.subText.Text = orText(c.host.GatewayLabel(), "no gateway configured")
+		c.timerText.Text = ""
 	} else {
 		c.subText.Text = v.Detail
+		c.timerText.Text = ""
 	}
 	c.subText.Color = theme.Color(theme.ColorNamePlaceHolder)
+	c.timerText.Color = theme.Color(theme.ColorNamePlaceHolder)
 	c.subText.Refresh()
+	c.timerText.Refresh()
+}
+
+// withAlpha returns c at the given alpha, for the ring's translucent outline.
+func withAlpha(c color.Color, a uint8) color.Color {
+	r, g, b, _ := c.RGBA()
+	return color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: a}
 }
 
 // setPrimary relabels and rewires the one high-importance button.
@@ -327,6 +405,14 @@ func dotColor(k uistate.Kind) fyne.ThemeColorName {
 	default:
 		return theme.ColorNameDisabled
 	}
+}
+
+// orText returns s, or alt when s is empty.
+func orText(s, alt string) string {
+	if s == "" {
+		return alt
+	}
+	return s
 }
 
 func orDash(s string) string {

@@ -89,10 +89,12 @@ func TestApplyRendersEachState(t *testing.T) {
 		wantIP      string
 	}{
 		{
-			name:        "disconnected",
+			// Idle names the gateway it WOULD connect to. "not connected" under a
+			// heading reading "Disconnected" says nothing.
+			name:        "disconnected names the gateway",
 			event:       tunnel.Event{State: tunnel.Disconnected},
 			wantState:   "Disconnected",
-			wantSubHas:  "not connected",
+			wantSubHas:  "vpn.example.com:10443",
 			wantColor:   theme.ColorNameDisabled,
 			wantPrimary: "Connect",
 			wantIP:      "—",
@@ -116,7 +118,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			wantIP:      "—",
 		},
 		{
-			name:        "connected shows the gateway and the uptime",
+			name:        "connected shows the gateway",
 			event:       tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"},
 			wantState:   "Connected",
 			wantSubHas:  "vpn.example.com",
@@ -155,11 +157,9 @@ func TestApplyRendersEachState(t *testing.T) {
 			if c.ipValue.Text != tc.wantIP {
 				t.Errorf("assigned IP = %q, want %q", c.ipValue.Text, tc.wantIP)
 			}
-			// The gateway and protocol rows come from config, so they read the same
-			// in every state — a blank row would look like a bug.
-			if c.gatewayValue.Text != "vpn.example.com:10443" {
-				t.Errorf("gateway = %q", c.gatewayValue.Text)
-			}
+			// The protocol row comes from config, so it reads the same in every state
+			// — a blank row would look like a bug. The gateway is deliberately NOT
+			// repeated here: the hero sub-line carries it (asserted above).
 			if !strings.Contains(c.protoValue.Text, "Fortinet") || !strings.Contains(c.protoValue.Text, "DTLS off") {
 				t.Errorf("protocol = %q, want it to name Fortinet and the DTLS setting", c.protoValue.Text)
 			}
@@ -227,15 +227,18 @@ func TestSettingsAndLogButtonsDriveTheHost(t *testing.T) {
 func TestUptimeTicksWhileConnected(t *testing.T) {
 	c, _, clock := newTestController(t)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	first := c.subText.Text
-	if !strings.Contains(first, "00:00:00") {
-		t.Fatalf("sub-line at connect = %q, want a zeroed clock", first)
+	if got := c.timerText.Text; got != "00:00:00" {
+		t.Fatalf("clock at connect = %q, want 00:00:00", got)
+	}
+	// The gateway sits on its OWN line now, so a ticking clock cannot shift it.
+	if !strings.Contains(c.subText.Text, "vpn.example.com") {
+		t.Errorf("sub-line = %q, want the gateway", c.subText.Text)
 	}
 
 	*clock = clock.Add(94 * time.Second)
 	c.Tick()
-	if got := c.subText.Text; !strings.Contains(got, "00:01:34") {
-		t.Errorf("sub-line after 94s = %q, want 00:01:34", got)
+	if got := c.timerText.Text; got != "00:01:34" {
+		t.Errorf("clock after 94s = %q, want 00:01:34", got)
 	}
 	if c.sinceValue.Text != "14:22" {
 		t.Errorf("connected-since = %q, want the wall-clock time of the connect", c.sinceValue.Text)
@@ -253,6 +256,10 @@ func TestTickIsANoopWhenNotConnected(t *testing.T) {
 	if c.subText.Text != before {
 		t.Errorf("sub-line changed on a disconnected tick: %q -> %q", before, c.subText.Text)
 	}
+	// And no clock is invented for a state that has no session.
+	if c.timerText.Text != "" {
+		t.Errorf("clock = %q, want empty when nothing is connected", c.timerText.Text)
+	}
 	if c.sinceValue.Text != "—" {
 		t.Errorf("connected-since = %q, want an em dash", c.sinceValue.Text)
 	}
@@ -268,8 +275,8 @@ func TestUptimeResetsAcrossADrop(t *testing.T) {
 	*clock = clock.Add(30 * time.Second)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
 
-	if got := c.subText.Text; !strings.Contains(got, "00:00:00") {
-		t.Errorf("sub-line after a reconnect = %q, want the clock restarted", got)
+	if got := c.timerText.Text; got != "00:00:00" {
+		t.Errorf("clock after a reconnect = %q, want it restarted", got)
 	}
 	if c.sinceValue.Text != "14:32" {
 		t.Errorf("connected-since = %q, want the SECOND connect's time", c.sinceValue.Text)
@@ -284,8 +291,8 @@ func TestRepeatedConnectedDoesNotRestartTheClock(t *testing.T) {
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
 	*clock = clock.Add(5 * time.Minute)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if got := c.subText.Text; !strings.Contains(got, "00:05:00") {
-		t.Errorf("sub-line = %q, want the original connect time preserved", got)
+	if got := c.timerText.Text; got != "00:05:00" {
+		t.Errorf("clock = %q, want the original connect time preserved", got)
 	}
 }
 
