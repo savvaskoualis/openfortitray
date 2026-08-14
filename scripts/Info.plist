@@ -20,10 +20,12 @@
 	<string>6.0</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
-	<!-- Menu-bar only: no Dock icon, no app-switcher entry. A fyne status-item
-	     app renders reliably on macOS only when LSUIElement makes it an agent. -->
-	<key>LSUIElement</key>
-	<true/>
+	<!-- LSUIElement is deliberately ABSENT, so the app is a normal Dock-visible
+	     application with a menu-bar status item as well. It was previously an
+	     agent (LSUIElement=1, no Dock icon), which is the usual shape for a
+	     status-item app; the Dock icon is a product decision, not a technical
+	     one. The activation policy is also asserted at runtime — see
+	     dockpolicy_darwin.go — because fyne/glfw sets its own while starting. -->
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>

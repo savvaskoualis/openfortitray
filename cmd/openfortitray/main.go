@@ -1346,12 +1346,28 @@ func main() {
 		a.tray.ReassertTray()
 		log.Print("tray: re-asserted icon+menu after OnStarted")
 		tray.SetTooltip("OpenFortiTray")
-		// fyne/glfw promotes the process to a Regular (Dock-visible) app when it
-		// initializes NSApp during Run, overriding Info.plist LSUIElement=1. Undo
-		// that here: OnStarted fires on the UI/main goroutine after NSApp exists,
-		// so setting the Accessory activation policy now hides the Dock icon
-		// without racing fyne. No-op on non-darwin.
-		setAccessoryActivationPolicy()
+		// Assert the Dock-visible (Regular) activation policy. fyne/glfw sets its
+		// own policy while initializing NSApp during Run, so the policy the app
+		// wants has to be set AFTER that — OnStarted fires on the UI/main goroutine
+		// once NSApp exists, which is both late enough and on the right thread.
+		// No-op off darwin.
+		setDockActivationPolicy()
+		// Give the Dock icon an effect. fyne does not implement AppKit's reopen
+		// delegate method, so without this the icon is inert: clicking it does
+		// nothing at all, which is worse than having no icon.
+		//
+		// The FIRST activation is ignored on purpose. Launching the app activates it,
+		// and a window appearing unasked at every login is exactly the behaviour a
+		// tray app should not have. Every activation after that is a deliberate
+		// "bring this up" — a Dock click or a Cmd-Tab — and shows the window.
+		firstActivation := true
+		watchDockActivation(func() {
+			if firstActivation {
+				firstActivation = false
+				return
+			}
+			a.ShowStatus()
+		})
 		a.startUptimeTicker()
 	})
 	// OnStopped fires when fyne itself tears the run loop down. If this appears in

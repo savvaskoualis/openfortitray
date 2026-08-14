@@ -5,28 +5,41 @@ package main
 /*
 #cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework Cocoa
-#import <Cocoa/Cocoa.h>
-
-// setAccessoryPolicy flips the shared application to the Accessory activation
-// policy: no Dock icon and no app menu, which is what a menu-bar (status item)
-// app wants. fyne/glfw promotes the process to Regular when it initializes
-// NSApp at Run(), overriding Info.plist LSUIElement=1, so this must run AFTER
-// that (see the OnStarted call site). It is a no-op if NSApp has not been
-// created yet. AppKit requires this on the main thread; the caller guarantees
-// that (fyne's OnStarted fires on the UI/main goroutine).
-static void setAccessoryPolicy(void) {
-	if (NSApp == nil) {
-		return;
-	}
-	[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-}
+#include "dock_darwin.h"
 */
 import "C"
 
-// setAccessoryActivationPolicy hides the macOS Dock icon by setting the Cocoa
-// activation policy to Accessory. It must be called after fyne/glfw has started
-// (NSApp exists) and on the main/UI thread — fyne's Lifecycle OnStarted hook
-// satisfies both.
-func setAccessoryActivationPolicy() {
-	C.setAccessoryPolicy()
+// onDockActivate is what a Dock click (or any app activation) runs. Set by
+// watchDockActivation before the observer is installed; nil means "do nothing",
+// so an activation before wiring cannot panic.
+var onDockActivate func()
+
+// oftDockActivated is called from Objective-C on the main queue every time the
+// app becomes active. It is deliberately thin: the decision about what to show
+// lives in the app, not here.
+//
+//export oftDockActivated
+func oftDockActivated() {
+	if onDockActivate != nil {
+		onDockActivate()
+	}
+}
+
+// setDockActivationPolicy gives the app a macOS Dock icon by setting the Cocoa
+// activation policy to Regular.
+//
+// It has to be asserted at runtime rather than left to Info.plist because
+// fyne/glfw sets its own policy while initializing NSApp at Run(). It must
+// therefore run after that and on the main/UI thread — fyne's Lifecycle
+// OnStarted hook satisfies both.
+func setDockActivationPolicy() {
+	C.oft_set_regular_policy()
+}
+
+// watchDockActivation makes fn run whenever the app is activated, which is the
+// only way to give a Dock icon any effect: fyne does not implement the reopen
+// delegate method, so without this the icon is inert.
+func watchDockActivation(fn func()) {
+	onDockActivate = fn
+	C.oft_watch_activation()
 }
