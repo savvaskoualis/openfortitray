@@ -94,10 +94,13 @@ func buildWindowsScript(pid int, installerPath string) (string, error) {
 	// how far it got. $ErrorActionPreference stays at Continue so one failed step
 	// cannot skip the relaunch below.
 	//
-	// The relaunch is deliberately belt-and-braces: schtasks runs the elevated logon
-	// task, and if that is missing or fails the app is started directly, because the
-	// worst outcome here is the user left with no app at all — which is what
-	// "the app closes and that's it" was.
+	// The relaunch checks whether the app is actually RUNNING rather than trusting
+	// schtasks' exit code, then starts it directly only if it is not. Trusting the
+	// exit code launched the app twice on a real machine — two startup banners in the
+	// same second, one of them immediately losing the single-instance mutex and
+	// exiting. Harmless, but it is indistinguishable from a crash-and-restart in the
+	// log, which is exactly the confusion an updater must not add. The worst outcome
+	// is still the one guarded against: the user left with no app at all.
 	return fmt.Sprintf(`$log = '%s'
 function Say($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $log -Append -Encoding utf8 }
 Say "updater: waiting for pid %d to exit"
@@ -110,13 +113,15 @@ try {
   Say "updater: installer failed to start: $_"
 }
 Say "updater: relaunching via scheduled task"
-$ok = $false
 try {
   schtasks /Run /TN %s 2>&1 | ForEach-Object { Say "updater: schtasks: $_" }
-  if ($LASTEXITCODE -eq 0) { $ok = $true }
 } catch { Say "updater: schtasks threw: $_" }
-if (-not $ok) {
-  Say "updater: scheduled task did not start the app; starting it directly"
+Start-Sleep -Seconds 3
+$running = @(Get-Process openfortitray -ErrorAction SilentlyContinue)
+if ($running.Count -gt 0) {
+  Say "updater: app is running (pid $($running.Id -join ','))"
+} else {
+  Say "updater: app not running after the task; starting it directly"
   try { Start-Process -FilePath '%s' } catch { Say "updater: direct start failed: $_" }
 }
 Say "updater: done"
@@ -179,13 +184,35 @@ func validateInstallerPath(p string) (string, error) {
 	return clean, nil
 }
 
-// updateLogPath returns the file the detached updater's stdout/stderr are
-// redirected to, so a failed upgrade is diagnosable. Best-effort: an empty
-// return means "do not redirect".
+// updateLogPath returns the file the updater SCRIPT writes its own progress to
+// (via Say). Best-effort: an empty return means the script does not self-log.
+//
+// The launcher must not also open this file — see updateConsoleLogPath.
 func updateLogPath() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
 	return filepath.Join(dir, "openfortitray", "update.log")
+}
+
+// updateConsoleLogPath returns a SEPARATE file for the updater process's raw
+// stdout/stderr.
+//
+// It is separate because the two writers cannot share one file. The launcher
+// opened update.log and passed the handle to PowerShell as stdout/stderr, while
+// the script wrote the same path with Out-File — which does not share with another
+// writer. Every single Say() failed with "The process cannot access the file
+// because it is being used by another process", so the updater's entire self-log
+// was empty on a real machine and a Windows update could not be diagnosed at all.
+//
+// Splitting them keeps both channels: structured progress in update.log, and
+// anything PowerShell emits before or outside the script (a parse error, an
+// execution-policy refusal) in update-console.log.
+func updateConsoleLogPath() string {
+	lp := updateLogPath()
+	if lp == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(lp), "update-console.log")
 }

@@ -158,3 +158,52 @@ func TestBuildWindowsScriptLogsAndAlwaysRelaunches(t *testing.T) {
 		t.Errorf("pid should appear in both the log line and Wait-Process: %q", s)
 	}
 }
+
+// The updater script and the launcher must not write the SAME file.
+//
+// They did, and it broke the updater's entire diagnostic channel: the launcher
+// opened update.log and handed the handle to PowerShell as stdout/stderr, while
+// the script wrote the same path with Out-File — which does not share a file with
+// another writer. Every Say() failed with "The process cannot access the file
+// because it is being used by another process", so a Windows update left an
+// update.log full of nothing but those errors and no record of what it had done.
+func TestUpdaterScriptAndConsoleLogsAreDifferentFiles(t *testing.T) {
+	script := updateLogPath()
+	console := updateConsoleLogPath()
+	if script == "" || console == "" {
+		t.Skip("no user config dir on this host")
+	}
+	if script == console {
+		t.Fatalf("both logs are %q; Out-File cannot share a file with the redirected stdout", script)
+	}
+	if filepath.Dir(script) != filepath.Dir(console) {
+		t.Errorf("logs live in different directories (%q vs %q); they should sit together",
+			filepath.Dir(script), filepath.Dir(console))
+	}
+}
+
+// The relaunch must decide from whether the app is RUNNING, not from schtasks'
+// exit code. Trusting the exit code started the app twice on a real machine — two
+// startup banners in the same second, one losing the single-instance mutex — which
+// reads in the log exactly like a crash and restart.
+func TestWindowsScriptRelaunchChecksProcessNotExitCode(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "Setup*.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	script, err := buildWindowsScript(4242, f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "Get-Process openfortitray") {
+		t.Error("script must check whether the app is running before starting it directly")
+	}
+	if strings.Contains(script, "$LASTEXITCODE") {
+		t.Error("script still branches on schtasks' exit code, which double-launched the app")
+	}
+	// The direct start must still exist: the worst outcome is no app at all.
+	if !strings.Contains(script, "starting it directly") {
+		t.Error("the direct-start fallback was lost")
+	}
+}

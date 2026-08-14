@@ -67,14 +67,16 @@ func applyHomebrew(pid int) error {
 }
 
 // spawnDetached starts name+args in its own process group with a hidden console,
-// so it survives the app exiting, with stdout/stderr appended to the update log
-// (best effort). It never waits — the updater must outlive us.
+// so it survives the app exiting, with stdout/stderr appended to the updater's
+// CONSOLE log — deliberately a different file from the one the script writes with
+// Out-File, which refuses to share a file with another writer. It never waits: the
+// updater must outlive us.
 func spawnDetached(name string, args []string) error {
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: createNoWindow | syscall.CREATE_NEW_PROCESS_GROUP,
 	}
-	if lp := updateLogPath(); lp != "" {
+	if lp := updateConsoleLogPath(); lp != "" {
 		_ = os.MkdirAll(filepath.Dir(lp), 0o700)
 		if f, err := os.OpenFile(lp, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 			cmd.Stdout = f
