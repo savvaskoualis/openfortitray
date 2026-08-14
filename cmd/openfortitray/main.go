@@ -522,7 +522,7 @@ func (a *app) startUpdateChecker(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		a.checkForUpdate(ctx)
+		a.checkForUpdate(ctx, false)
 		timer.Reset(6 * time.Hour)
 	}
 }
@@ -532,13 +532,23 @@ func (a *app) startUpdateChecker(ctx context.Context) {
 // distinct version — pops the update dialog. The badge/menu update on every check
 // (cheap, idempotent); the dialog shows once per new tag so the 6-hourly re-check
 // does not nag. All UI runs on the UI goroutine and honours the quitting gate.
-func (a *app) checkForUpdate(ctx context.Context) {
+func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 	rel, err := updateChecker().Available(ctx, version)
 	if err != nil {
 		log.Printf("update: check failed: %v", err)
+		// A background check that fails stays quiet — the next one is in six hours and
+		// a transient network error is not news. A check the user ASKED for must answer,
+		// or the menu item looks broken.
+		if manual {
+			a.reportCheckResult("Could not check for updates", err.Error())
+		}
 		return
 	}
 	if rel == nil {
+		if manual {
+			a.reportCheckResult("You are up to date",
+				"OpenFortiTray "+version+" is the latest version.")
+		}
 		return
 	}
 	// On the Homebrew path the check and the apply read different sources: this
@@ -553,6 +563,12 @@ func (a *app) checkForUpdate(ctx context.Context) {
 		cc := update.CaskChecker{HTTPClient: &http.Client{Timeout: 30 * time.Second}}
 		if !update.CaskHasTag(ctx, cc, rel.Tag) {
 			log.Printf("update: %s is published but the Homebrew cask is not bumped yet; waiting", rel.Tag)
+			if manual {
+				a.reportCheckResult("Update not ready yet",
+					"OpenFortiTray "+rel.Tag+" has been released, but the Homebrew cask has not "+
+						"caught up. It usually does within the hour, and the app will offer the "+
+						"update then.")
+			}
 			return
 		}
 	}
@@ -562,7 +578,7 @@ func (a *app) checkForUpdate(ctx context.Context) {
 	if a.quitting.Load() {
 		return
 	}
-	prompt := a.shouldPromptUpdate(rel.Tag)
+	prompt := manual || a.shouldPromptUpdate(rel.Tag)
 	fyne.Do(func() {
 		if a.quitting.Load() {
 			return
@@ -592,80 +608,49 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 	return true
 }
 
-// promptUpdate shows the "Update available" confirm dialog on the UI goroutine,
-// parented on the hidden settings window (brought forward so the modal has a
-// visible parent, mirroring the first-run bootstrap dialogs). "Update & Restart"
-// runs the SAME applyUpdate path as the tray item; "Later" just dismisses, so the
-// badge + menu item remain for the user to act on. It is a thin wrapper: the
-// once-per-version decision lives in shouldPromptUpdate. Nil-checks a.win.
+// promptUpdate opens the update flow: the offer, then the download, then the
+// request to restart. See updateflow.go.
 func (a *app) promptUpdate(rel *update.Release) {
 	if a.fyneApp == nil {
 		return
 	}
-	// A dedicated window hosts the update dialog, so it no longer surfaces the
-	// Settings window. Hide (never Close) on any dismissal: closing would destroy
-	// the window, and destroying the last window makes fyne quit the app.
-	w := a.fyneApp.NewWindow("OpenFortiTray Update")
-	w.SetFixedSize(true)
-	w.Resize(fyne.NewSize(460, 290))
-	w.CenterOnScreen()
-	w.SetCloseIntercept(func() { w.Hide() })
-	w.SetContent(a.updatePromptContent(rel, func(apply bool) {
-		w.Hide()
-		if apply {
-			go a.applyUpdate(rel)
+	newUpdateFlow(a, rel).start()
+}
+
+// reportCheckResult answers a MANUAL check for updates. A click has to produce a
+// visible result whatever the answer — "no update" reported as silence is
+// indistinguishable from a menu item that does nothing, which is precisely how this
+// one read.
+func (a *app) reportCheckResult(heading, body string) {
+	if a.fyneApp == nil {
+		return
+	}
+	fyne.Do(func() {
+		if a.quitting.Load() {
+			return
 		}
-	}))
-	w.Show()
-	w.RequestFocus()
-}
+		w := a.fyneApp.NewWindow("OpenFortiTray Update")
+		w.SetFixedSize(true)
+		w.Resize(fyne.NewSize(420, 200))
+		w.CenterOnScreen()
+		w.SetCloseIntercept(w.Hide)
 
-// updatePromptContent builds the update prompt's body: a heading, one line of
-// plain explanation, the two versions in the monospace face so they line up and
-// the difference is readable at a glance, and the actions with Update as the only
-// high-importance button.
-//
-// It replaces a dialog.NewConfirm whose whole message was a single string with an
-// embedded newline. A dialog cannot lay out a version comparison, and the two
-// numbers are the only thing the user is actually being asked about.
-func (a *app) updatePromptContent(rel *update.Release, done func(apply bool)) fyne.CanvasObject {
-	heading := canvas.NewText("Update available", theme.Color(theme.ColorNameForeground))
-	heading.TextSize = theme.Size(theme.SizeNameSubHeadingText)
-	heading.TextStyle = fyne.TextStyle{Bold: true}
+		h := canvas.NewText(heading, theme.Color(theme.ColorNameForeground))
+		h.TextSize = theme.Size(theme.SizeNameSubHeadingText)
+		h.TextStyle = fyne.TextStyle{Bold: true}
+		msg := widget.NewLabel(body)
+		msg.Wrapping = fyne.TextWrapWord
+		msg.Importance = widget.LowImportance
+		ok := widget.NewButton("OK", func() { w.Hide() })
+		ok.Importance = widget.HighImportance
 
-	body := widget.NewLabel("Installing takes a few seconds. OpenFortiTray restarts afterwards and reconnects.")
-	body.Wrapping = fyne.TextWrapWord
-	body.Importance = widget.LowImportance
-
-	versions := container.New(layout.NewFormLayout(),
-		mutedLabel("Installed"), monoLabel(version),
-		mutedLabel("Available"), monoLabel(rel.Tag),
-	)
-	bg := canvas.NewRectangle(theme.Color(theme.ColorNameHeaderBackground))
-	bg.CornerRadius = theme.Size(theme.SizeNameCardRadius)
-	bg.StrokeColor = theme.Color(theme.ColorNameSeparator)
-	bg.StrokeWidth = theme.Size(theme.SizeNameSeparatorThickness)
-	card := container.NewStack(bg, container.NewPadded(versions))
-
-	later := widget.NewButton("Later", func() { done(false) })
-	apply := widget.NewButton("Update & Restart", func() { done(true) })
-	apply.Importance = widget.HighImportance
-	actions := container.NewHBox(layout.NewSpacer(), later, apply)
-
-	return container.NewPadded(container.NewVBox(heading, body, card, actions))
-}
-
-// mutedLabel is a key label for the small two-column cards.
-func mutedLabel(text string) *widget.Label {
-	l := widget.NewLabel(text)
-	l.Importance = widget.LowImportance
-	return l
-}
-
-// monoLabel is a right-aligned monospace value, so version numbers line up
-// digit-for-digit between the two rows.
-func monoLabel(text string) *widget.Label {
-	return widget.NewLabelWithStyle(text, fyne.TextAlignTrailing, fyne.TextStyle{Monospace: true})
+		w.SetContent(container.NewPadded(container.NewVBox(
+			h, msg, layout.NewSpacer(),
+			container.NewHBox(layout.NewSpacer(), ok),
+		)))
+		w.Show()
+		w.RequestFocus()
+	})
 }
 
 // UpdateClicked is the tray update item's action (UI goroutine). With a pending
@@ -675,60 +660,10 @@ func (a *app) UpdateClicked() {
 	rel := a.updateRel
 	a.updateMu.Unlock()
 	if rel == nil {
-		go a.checkForUpdate(context.Background())
+		go a.checkForUpdate(context.Background(), true)
 		return
 	}
-	go a.applyUpdate(rel)
-}
-
-// applyUpdate performs the channel-appropriate update OFF the UI goroutine
-// (DownloadAndVerify blocks on the network), then quits so the detached updater
-// can replace the app and relaunch. Any failure falls back to opening the
-// releases page so the user can update by hand — the app keeps running.
-func (a *app) applyUpdate(rel *update.Release) {
-	method := update.InstallMethod()
-	// Log the attempt, not just the failures. When the Windows updater silently
-	// did nothing, the app log held no trace that an update had even been tried,
-	// which made a spawn that died on startup indistinguishable from a click that
-	// never arrived. The updater writes its own steps to update.log; these lines
-	// are what tie the two together.
-	log.Printf("update: applying %s via %s", rel.Tag, method)
-	switch method {
-	case update.MethodHomebrew:
-		if err := update.Apply(method, "", os.Getpid()); err != nil {
-			log.Printf("update: homebrew apply failed: %v; opening releases page", err)
-			_ = xopen.URL(releasesPageURL)
-			return
-		}
-	case update.MethodWindowsInstaller:
-		setup, sums := windowsUpdateAssets(rel)
-		if setup == nil || sums == nil {
-			log.Printf("update: release %s has no Setup.exe/SHA256SUMS; opening releases page", rel.Tag)
-			_ = xopen.URL(releasesPageURL)
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		log.Printf("update: downloading %s (%d bytes)", setup.Name, setup.Size)
-		path, err := updateChecker().DownloadAndVerify(ctx, *setup, *sums)
-		if err != nil {
-			log.Printf("update: download/verify failed: %v; opening releases page", err)
-			_ = xopen.URL(releasesPageURL)
-			return
-		}
-		log.Printf("update: verified installer at %s; launching the updater (see update.log)", path)
-		if err := update.Apply(method, path, os.Getpid()); err != nil {
-			log.Printf("update: windows apply failed: %v; opening releases page", err)
-			_ = xopen.URL(releasesPageURL)
-			return
-		}
-	default: // MethodManual and anything unrecognised
-		_ = xopen.URL(releasesPageURL)
-		return
-	}
-	// The detached updater is now waiting for this process to exit — quit
-	// gracefully so the tunnel is torn down before the upgrade replaces the app.
-	fyne.Do(a.Quit)
+	a.promptUpdate(rel)
 }
 
 // windowsUpdateAssets picks the Setup.exe and SHA256SUMS assets from a release,

@@ -23,9 +23,27 @@ func TestNewer(t *testing.T) {
 		{"downgrade", "v0.2.0", "v0.1.9", false},
 		{"leading-v mixed", "0.1.7", "v0.1.8", true},
 		{"malformed latest", "v0.1.7", "banana", false},
-		{"git-describe current", "v0.1.7-3-gabc123", "v0.1.8", false},
+		// A dev build DOES get offered updates now. A build that can never see an
+		// update is a build whose update path is never exercised until a user hits
+		// it — and "0.1.7 plus three commits" is genuinely older than 0.1.8.
+		{"git-describe current is offered the next release", "v0.1.7-3-gabc123", "v0.1.8", true},
+		{"-dev is offered the next release", "0.1.35-dev", "v0.1.36", true},
+		// The clean release supersedes a prerelease of the SAME version: this is how
+		// a hand-installed 0.1.35-dev moves onto the real 0.1.35.
+		{"-dev is offered its own release", "0.1.35-dev", "v0.1.35", true},
+		{"release does not supersede itself", "0.1.35", "v0.1.35", false},
+		// A dev build of a LATER version is not behind.
+		{"-dev ahead of the release", "0.2.0-dev", "v0.1.36", false},
+		// Build metadata takes no part in precedence.
+		{"build metadata ignored", "0.1.35+abc", "v0.1.35", false},
 		{"bare sha current", "abc123", "v0.1.8", false},
-		{"prerelease suffix latest fails closed", "v0.1.7", "v0.1.8-rc1", false},
+		// latest must be CLEAN. Pushing a release candidate at someone who asked for
+		// stable is not an update, it is a surprise — however high its version.
+		{"prerelease latest is never offered", "v0.1.7", "v0.1.8-rc1", false},
+		{"prerelease latest not offered to a dev build either", "0.1.7-dev", "v0.1.8-rc1", false},
+		// A bare "dev" or a SHA has no comparable core, so running from source still
+		// never nags.
+		{"bare dev still never nags", "dev", "v9.9.9", false},
 		{"too few components", "v0.1", "v0.2", false},
 		{"too many components", "v0.1.7.1", "v0.1.8", false},
 		{"empty current", "", "v0.1.8", false},

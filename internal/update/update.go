@@ -118,18 +118,31 @@ func (c Checker) Available(ctx context.Context, current string) (*Release, error
 	return rel, nil
 }
 
-// Newer reports whether tag latest is a strictly higher semantic version than
-// current. Both may carry a leading "v". If current is not a clean vX.Y.Z
-// (e.g. "dev" or a git-describe SHA from a local build), Newer returns false — an
-// unversioned local build must never nag about updates. If latest is malformed,
-// returns false too (fail closed).
+// Newer reports whether tag latest is a strictly higher version than current.
+// Both may carry a leading "v".
+//
+// The two sides are deliberately NOT treated alike:
+//
+//   - current MAY carry a prerelease suffix, and a clean release of the same
+//     version supersedes it. So a hand-built "0.1.35-dev" is offered the real
+//     0.1.35, and a git-describe build "v0.1.7-3-gabc123" is offered v0.1.8. This
+//     is the point of the asymmetry: a dev build that can never see an update is a
+//     dev build whose update path is never exercised until a user hits it.
+//   - latest MUST be clean. A prerelease tag is never offered to anyone, however
+//     high its version — pushing a release candidate at someone who asked for
+//     stable is not an update, it is a surprise.
+//
+// A version with no numeric MAJOR.MINOR.PATCH core at all — a bare "dev", or the
+// short SHA the Makefile stamps by default — still returns false. Running from
+// source should not nag, and there is nothing to compare against anyway. If latest
+// is malformed, this fails closed for the same reason it always did.
 func Newer(current, latest string) bool {
-	cur, ok := parseSemver(current)
+	cur, curPre, ok := parseVersion(current)
 	if !ok {
 		return false
 	}
-	lat, ok := parseSemver(latest)
-	if !ok {
+	lat, latPre, ok := parseVersion(latest)
+	if !ok || latPre != "" {
 		return false
 	}
 	for i := 0; i < 3; i++ {
@@ -137,26 +150,39 @@ func Newer(current, latest string) bool {
 			return lat[i] > cur[i]
 		}
 	}
-	return false
+	// Same core. The release supersedes a prerelease or dev build of itself, and
+	// never supersedes an identical clean version.
+	return curPre != ""
 }
 
-// parseSemver strips an optional leading "v" and splits into exactly three
-// non-negative integer components (MAJOR.MINOR.PATCH). Any build/prerelease
-// suffix or extra/missing component makes the version "not clean" → ok=false.
-func parseSemver(s string) (v [3]int, ok bool) {
+// parseVersion splits a version into its numeric MAJOR.MINOR.PATCH core and its
+// prerelease suffix, if any.
+//
+// Build metadata after "+" is discarded: semver says it takes no part in
+// precedence. The prerelease is everything after the FIRST "-", so
+// "0.1.7-3-gabc123" is core 0.1.7 with prerelease "3-gabc123" rather than being
+// rejected outright as it used to be.
+//
+// ok is false only when the core is not three non-negative integers, which is what
+// makes "dev" and a bare SHA incomparable rather than merely suffixed.
+func parseVersion(s string) (core [3]int, pre string, ok bool) {
 	s = strings.TrimPrefix(s, "v")
+	if i := strings.IndexByte(s, '+'); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		s, pre = s[:i], s[i+1:]
+	}
 	parts := strings.Split(s, ".")
 	if len(parts) != 3 {
-		return v, false
+		return core, "", false
 	}
 	for i, p := range parts {
-		// strconv.Atoi rejects any non-digit content, so suffixes like
-		// "-3-gabc123" or "8-rc1" fail cleanly here.
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 0 {
-			return v, false
+			return core, "", false
 		}
-		v[i] = n
+		core[i] = n
 	}
-	return v, true
+	return core, pre, true
 }

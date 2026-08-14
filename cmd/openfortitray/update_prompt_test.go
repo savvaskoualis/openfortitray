@@ -4,6 +4,7 @@ import (
 	"image/color"
 	"image/png"
 	"os"
+	"strings"
 	"testing"
 
 	"fyne.io/fyne/v2"
@@ -31,9 +32,14 @@ func buttonsIn(o fyne.CanvasObject) []*widget.Button {
 	}
 }
 
-// The prompt asks one question, so it offers exactly two answers and only the
+// The OFFER asks one question, so it offers exactly two answers and only the
 // affirmative one is high-importance. Both must reach the callback with the right
-// verdict: a Later that reported true would install an update the user declined.
+// verdict: a Later that reported true would download an update the user declined.
+//
+// The affirmative is "Download update", not "Update & Restart". The restart is a
+// SEPARATE question, asked once the download has finished — the app used to quit the
+// moment this was clicked, which meant the download and install happened with the
+// process dead and nothing able to report progress.
 func TestUpdatePromptButtons(t *testing.T) {
 	test.NewApp()
 	a := &app{}
@@ -52,18 +58,18 @@ func TestUpdatePromptButtons(t *testing.T) {
 		switch b.Text {
 		case "Later":
 			later = b
-		case "Update & Restart":
+		case "Download update":
 			apply = b
 		}
 	}
 	if later == nil || apply == nil {
-		t.Fatalf("buttons are %q and %q, want Later and Update & Restart", btns[0].Text, btns[1].Text)
+		t.Fatalf("buttons are %q and %q, want Later and Download update", btns[0].Text, btns[1].Text)
 	}
 	if apply.Importance != widget.HighImportance {
-		t.Error("Update & Restart must be the high-importance action")
+		t.Error("Download update must be the high-importance action")
 	}
 	if later.Importance == widget.HighImportance {
-		t.Error("Later must not compete with Update & Restart")
+		t.Error("Later must not compete with Download update")
 	}
 
 	test.Tap(later)
@@ -141,5 +147,87 @@ func TestCaptureUpdatePrompt(t *testing.T) {
 		}
 		f.Close()
 		w.Close()
+	}
+}
+
+// The RESTART is a separate question, asked only once something is downloaded. Its
+// affirmative must be the high-importance one, and Later must not trigger the
+// install — an update applied against a declined restart takes the VPN down without
+// consent.
+func TestReadyStateAsksForTheRestart(t *testing.T) {
+	test.NewApp()
+	a := &app{}
+	f := &updateFlow{app: a, rel: &update.Release{Tag: "v0.1.36"}, win: test.NewWindow(nil)}
+	defer f.win.Close()
+
+	btns := buttonsIn(f.readyContent(update.MethodHomebrew, update.Prepared{}))
+	if len(btns) != 2 {
+		t.Fatalf("ready state has %d buttons, want 2", len(btns))
+	}
+	var later, restart *widget.Button
+	for _, b := range btns {
+		switch b.Text {
+		case "Later":
+			later = b
+		case "Restart now":
+			restart = b
+		}
+	}
+	if later == nil || restart == nil {
+		t.Fatalf("buttons are %q and %q, want Later and Restart now", btns[0].Text, btns[1].Text)
+	}
+	if restart.Importance != widget.HighImportance {
+		t.Error("Restart now must be the high-importance action")
+	}
+	// The body has to say what a restart costs: the app closes and the VPN drops.
+	// A window vanishing unannounced is what this whole flow exists to stop.
+	var text string
+	var walk func(fyne.CanvasObject)
+	walk = func(o fyne.CanvasObject) {
+		switch v := o.(type) {
+		case *widget.Label:
+			text += v.Text + " "
+		case *fyne.Container:
+			for _, c := range v.Objects {
+				walk(c)
+			}
+		}
+	}
+	walk(f.readyContent(update.MethodHomebrew, update.Prepared{}))
+	// The body must name both costs. "restart" itself is on the button; what the
+	// prose has to add is what the restart DOES.
+	for _, want := range []string{"closes", "disconnect"} {
+		if !strings.Contains(strings.ToLower(text), want) {
+			t.Errorf("the ready state does not warn that the app %q: %q", want, text)
+		}
+	}
+}
+
+// The download state must show it is working and must NOT offer a restart: there is
+// nothing installed to restart into yet.
+func TestPreparingStateShowsProgressAndNoRestart(t *testing.T) {
+	test.NewApp()
+	f := &updateFlow{app: &app{}, rel: &update.Release{Tag: "v0.1.36"}, win: test.NewWindow(nil)}
+	defer f.win.Close()
+
+	content := f.preparingContent()
+	if len(buttonsIn(content)) != 0 {
+		t.Error("the download state must offer no actions; nothing is installable yet")
+	}
+	var found bool
+	var walk func(fyne.CanvasObject)
+	walk = func(o fyne.CanvasObject) {
+		if _, ok := o.(*widget.ProgressBarInfinite); ok {
+			found = true
+		}
+		if c, ok := o.(*fyne.Container); ok {
+			for _, ch := range c.Objects {
+				walk(ch)
+			}
+		}
+	}
+	walk(content)
+	if !found {
+		t.Error("the download state has no progress indicator")
 	}
 }
