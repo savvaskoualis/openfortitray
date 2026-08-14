@@ -44,9 +44,25 @@ type Host interface {
 	DTLSLabel() string
 }
 
-// activityRows is the depth of the visible history. Deeper than this and the
-// window has to scroll to reach the buttons, which are the reason it is open.
-const activityDepth = 12
+// activityDepth is how much history is kept. It was 12 — chosen only because the
+// list had no scroller and anything longer pushed the window past the screen. Now
+// that it scrolls, the number can be what is actually useful: a flapping tunnel
+// burns through a dozen transitions in a minute or two, which is exactly when
+// someone opens this.
+const activityDepth = 50
+
+// activityHeight bounds the expanded list. Without a bound the content demanded
+// 1061px inside a 560px window — measured, not guessed — so most of the history was
+// simply unreachable, with no scrollbar to suggest otherwise.
+const activityHeight = 190
+
+// The window's two heights: closed, and grown by exactly the disclosure it opened.
+// Growing it is the point — a fixed height either wastes space while the history is
+// folded away or hides the history when it is not.
+const (
+	windowWidth  = 400
+	windowHeight = 560
+)
 
 // emDash is what an unknown value reads as. An empty cell in a two-column card
 // looks like a rendering bug; a dash reads as "nothing to report".
@@ -66,8 +82,16 @@ type Controller struct {
 	// timerText is the session clock, on its own line in the monospace face so a
 	// ticking second does not shift the gateway name above it.
 	timerText *canvas.Text
-	// accordion holds the activity history, collapsed by default.
-	accordion *widget.Accordion
+	// The activity disclosure. This is a hand-rolled toggle rather than a
+	// widget.Accordion because the accordion cannot report WHEN it was opened, and
+	// opening it has to grow the window: at the default height the expanded list
+	// began below the last pixel, so the one thing the user had just asked to see was
+	// the one thing not on screen. The count rides on the toggle's own label, because
+	// a collapsed section otherwise gives no clue whether it holds fourteen lines or
+	// none.
+	activityToggle *widget.Button
+	activityScroll *container.Scroll
+	activityOpen   bool
 
 	ipValue    *widget.Label
 	protoValue *widget.Label
@@ -195,7 +219,12 @@ func (c *Controller) build() {
 	// it open forced the window tall enough to strand the rest in whitespace; folded
 	// away, the window is the size of its content and expands only when asked.
 	c.activity = container.New(layout.NewFormLayout())
-	c.accordion = widget.NewAccordion(widget.NewAccordionItem("Activity", c.activity))
+	c.activityScroll = container.NewVScroll(c.activity)
+	c.activityScroll.SetMinSize(fyne.NewSize(0, activityHeight))
+	c.activityScroll.Hide()
+	c.activityToggle = widget.NewButtonWithIcon("Activity", theme.MenuExpandIcon(), c.toggleActivity)
+	c.activityToggle.Importance = widget.LowImportance
+	c.activityToggle.Alignment = widget.ButtonAlignLeading
 
 	content := container.NewVBox(
 		spacer(18),
@@ -208,7 +237,8 @@ func (c *Controller) build() {
 		widget.NewSeparator(),
 		spacer(4),
 		c.buttonRow,
-		c.accordion,
+		c.activityToggle,
+		c.activityScroll,
 		spacer(4),
 	)
 
@@ -216,8 +246,11 @@ func (c *Controller) build() {
 	// down with it. Closing hides, exactly as the settings window does.
 	c.closeRequested = c.win.Hide
 	c.win.SetCloseIntercept(func() { c.closeRequested() })
-	c.win.SetContent(container.NewPadded(content))
-	c.win.Resize(fyne.NewSize(400, 560))
+	// An outer scroller as the backstop: expanding a section, a long error line or a
+	// small display must never put a control out of reach with no way to get at it.
+	outer := container.NewVScroll(container.NewPadded(content))
+	c.win.SetContent(outer)
+	c.win.Resize(fyne.NewSize(windowWidth, windowHeight))
 	c.win.SetFixedSize(false)
 }
 
@@ -383,12 +416,52 @@ func (c *Controller) setPrimary(v uistate.View) {
 func (c *Controller) refreshActivity() {
 	entries := c.ring.Entries()
 	c.activity.Objects = c.activity.Objects[:0]
+	now := c.now()
 	for _, e := range entries {
-		ts := widget.NewLabelWithStyle(e.At.Format("15:04:05"), fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+		// A bare clock is ambiguous once the app has been up overnight, so anything
+		// not from today carries its date. Same-day entries stay uncluttered.
+		stamp := e.At.Format("15:04:05")
+		if e.At.YearDay() != now.YearDay() || e.At.Year() != now.Year() {
+			stamp = e.At.Format("2 Jan 15:04")
+		}
+		ts := widget.NewLabelWithStyle(stamp, fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
 		ts.Importance = widget.LowImportance
 		c.activity.Objects = append(c.activity.Objects, ts, widget.NewLabel(e.Text))
 	}
 	c.activity.Refresh()
+	c.setActivityTitle(len(entries))
+}
+
+// setActivityTitle puts the entry count on the collapsed toggle, so it advertises
+// whether there is anything inside. "Activity" alone said nothing either way.
+func (c *Controller) setActivityTitle(n int) {
+	if c.activityToggle == nil {
+		return
+	}
+	title := "Activity"
+	if n > 0 {
+		title = fmt.Sprintf("Activity (%d)", n)
+	}
+	if c.activityToggle.Text != title {
+		c.activityToggle.SetText(title)
+	}
+}
+
+// toggleActivity shows or hides the history AND resizes the window by the same
+// amount, so the list appears in space that was made for it rather than below the
+// bottom edge.
+func (c *Controller) toggleActivity() {
+	c.activityOpen = !c.activityOpen
+	h := windowHeight
+	if c.activityOpen {
+		c.activityScroll.Show()
+		c.activityToggle.SetIcon(theme.MenuDropDownIcon())
+		h += activityHeight
+	} else {
+		c.activityScroll.Hide()
+		c.activityToggle.SetIcon(theme.MenuExpandIcon())
+	}
+	c.win.Resize(fyne.NewSize(windowWidth, float32(h)))
 }
 
 // dotColor maps a view's severity onto the semantic tokens. These are the ONLY

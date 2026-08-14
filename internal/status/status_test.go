@@ -337,3 +337,79 @@ func TestCloseHidesRatherThanQuitting(t *testing.T) {
 		t.Error("closing the status window must not quit the app")
 	}
 }
+
+// Opening the history must put it ON SCREEN. It is a hand-rolled disclosure rather
+// than a widget.Accordion precisely because the accordion cannot report when it was
+// opened: at the closed window height the expanded list started below the last
+// pixel, so the one thing the user had just asked to see was the one thing not
+// visible. Measured before the fix: 1061px of content in a 560px window.
+func TestActivityToggleGrowsTheWindow(t *testing.T) {
+	c, _, _ := newTestController(t)
+
+	if c.activityScroll.Visible() {
+		t.Error("the history should start folded away")
+	}
+	c.toggleActivity()
+	if !c.activityScroll.Visible() {
+		t.Fatal("toggling did not reveal the history")
+	}
+	if !c.activityOpen {
+		t.Error("activityOpen not recorded")
+	}
+	// The list is bounded, so a long history scrolls instead of demanding an
+	// unreachable window height.
+	if h := c.activityScroll.MinSize().Height; h != activityHeight {
+		t.Errorf("list height = %v, want the bounded %v", h, activityHeight)
+	}
+
+	c.toggleActivity()
+	if c.activityScroll.Visible() {
+		t.Error("toggling again did not fold the history away")
+	}
+}
+
+// The count is the only clue a folded section gives about whether it holds
+// anything.
+func TestActivityToggleShowsTheCount(t *testing.T) {
+	c, _, clock := newTestController(t)
+	if got := c.activityToggle.Text; got != "Activity" {
+		t.Errorf("empty history label = %q, want a bare %q", got, "Activity")
+	}
+	c.Apply(tunnel.Event{State: tunnel.Connecting})
+	*clock = clock.Add(time.Second)
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+	if got := c.activityToggle.Text; got != "Activity (2)" {
+		t.Errorf("label = %q, want %q", got, "Activity (2)")
+	}
+}
+
+// A bare clock is ambiguous once the app has been up overnight, which for a VPN
+// client that starts at login is the normal case.
+func TestOlderEntriesCarryTheirDate(t *testing.T) {
+	c, _, clock := newTestController(t)
+	// Yesterday, then today.
+	*clock = clock.Add(-26 * time.Hour)
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.1"})
+	*clock = clock.Add(26 * time.Hour)
+	c.Apply(tunnel.Event{State: tunnel.Reconnecting, Detail: "dropped"})
+
+	rows := activityRows(c)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %v, want 2", rows)
+	}
+	// Newest first: today's entry is a bare clock, yesterday's carries a date.
+	if strings.Contains(rows[0], "Aug") {
+		t.Errorf("today's row %q should not carry a date", rows[0])
+	}
+	if !strings.Contains(rows[1], "Aug") {
+		t.Errorf("yesterday's row %q should carry its date", rows[1])
+	}
+}
+
+// Capacity is what makes the history useful during a flap; it was capped at 12 only
+// because the list had no scroller.
+func TestHistoryKeepsEnoughToBeUseful(t *testing.T) {
+	if activityDepth < 50 {
+		t.Errorf("activityDepth = %d; a flapping tunnel burns through a dozen transitions in minutes", activityDepth)
+	}
+}
