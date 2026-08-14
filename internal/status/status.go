@@ -97,9 +97,8 @@ type Controller struct {
 	protoValue *widget.Label
 	sinceValue *widget.Label
 
-	primary     *widget.Button
-	settingsBtn *widget.Button
-	logBtn      *widget.Button
+	primary *widget.Button
+	logBtn  *widget.Button
 	// buttonRow holds the three buttons. Kept so setPrimary can refresh it: a
 	// relabelled button reports a new minimum size, but only a container refresh
 	// re-runs the layout that acts on it.
@@ -116,9 +115,13 @@ type Controller struct {
 	// now is injected so the uptime is testable without sleeping.
 	now func() time.Time
 
-	// closeRequested is what the window's close button runs. Held as a field so a
-	// test can invoke it: fyne exposes no getter for a window's close intercept.
-	closeRequested func()
+	// content is the whole panel, handed to the shell.
+	content fyne.CanvasObject
+
+	// OnHeightRequest asks the shell to make the window this tall, so revealing the
+	// history opens space for it instead of pushing it past the bottom edge. The
+	// shell owns the window, so it owns the resize.
+	OnHeightRequest func(h float32)
 }
 
 // New builds the window's content on the given (not-yet-shown) window and returns
@@ -206,14 +209,12 @@ func (c *Controller) build() {
 		cardKey("Connected since"), c.sinceValue,
 	)
 
-	// Secondary actions are low-importance and sit at the foot, where they cannot be
-	// mistaken for the primary action. Settings is the more common of the two, so it
-	// leads.
-	c.settingsBtn = widget.NewButton("Settings…", c.host.ShowSettings)
-	c.settingsBtn.Importance = widget.LowImportance
+	// Only the log remains here. A "Settings…" button became redundant the moment the
+	// window grew a navigation rail with Connection and Advanced on it — two ways to
+	// reach the same place, one of them pretending to be an action.
 	c.logBtn = widget.NewButton("Open log file…", c.host.OpenLog)
 	c.logBtn.Importance = widget.LowImportance
-	c.buttonRow = container.NewCenter(container.NewHBox(c.settingsBtn, c.logBtn))
+	c.buttonRow = container.NewCenter(c.logBtn)
 
 	// Activity, collapsed by default. It is the third thing anyone wants and keeping
 	// it open forced the window tall enough to strand the rest in whitespace; folded
@@ -242,17 +243,19 @@ func (c *Controller) build() {
 		spacer(4),
 	)
 
-	// A tray app's window must never quit the process: that would take the tunnel
-	// down with it. Closing hides, exactly as the settings window does.
-	c.closeRequested = c.win.Hide
-	c.win.SetCloseIntercept(func() { c.closeRequested() })
 	// An outer scroller as the backstop: expanding a section, a long error line or a
 	// small display must never put a control out of reach with no way to get at it.
-	outer := container.NewVScroll(container.NewPadded(content))
-	c.win.SetContent(outer)
-	c.win.Resize(fyne.NewSize(windowWidth, windowHeight))
-	c.win.SetFixedSize(false)
+	c.content = container.NewVScroll(container.NewPadded(content))
 }
+
+// SetClock replaces the time source. It exists for tests and renders, which need a
+// session clock that does not move between the setup and the assertion.
+func (c *Controller) SetClock(now func() time.Time) { c.now = now }
+
+// Content returns the status panel for the shell to place. This controller no
+// longer owns a window — the app has ONE window, and which section it shows is not
+// this controller's decision.
+func (c *Controller) Content() fyne.CanvasObject { return c.content }
 
 // centredText builds one of the hero's text lines.
 func centredText(size float32, bold bool, name fyne.ThemeColorName) *canvas.Text {
@@ -286,11 +289,9 @@ func cardValue(mono bool) *widget.Label {
 	return l
 }
 
-// Show reveals and focuses the window.
-func (c *Controller) Show() {
-	c.win.Show()
-	c.win.RequestFocus()
-}
+// Show is retained for symmetry with the settings controller and is a no-op:
+// revealing the single window is the shell's job.
+func (c *Controller) Show() {}
 
 // Apply renders one tunnel event.
 //
@@ -461,7 +462,9 @@ func (c *Controller) toggleActivity() {
 		c.activityScroll.Hide()
 		c.activityToggle.SetIcon(theme.MenuExpandIcon())
 	}
-	c.win.Resize(fyne.NewSize(windowWidth, float32(h)))
+	if c.OnHeightRequest != nil {
+		c.OnHeightRequest(float32(h))
+	}
 }
 
 // dotColor maps a view's severity onto the semantic tokens. These are the ONLY

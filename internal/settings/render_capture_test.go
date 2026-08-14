@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
@@ -47,8 +48,11 @@ func TestCaptureWindowRenders(t *testing.T) {
 	for name, v := range map[string]fyne.ThemeVariant{"light": 1, "dark": 0} {
 		for _, tab := range []struct {
 			label string
-			index int
-		}{{"basic", 0}, {"advanced", 1}} {
+			pick  func(*Controller) fyne.CanvasObject
+		}{
+			{"basic", func(c *Controller) fyne.CanvasObject { return c.ConnectionContent() }},
+			{"advanced", func(c *Controller) fyne.CanvasObject { return c.AdvancedContent() }},
+		} {
 			a := test.NewApp()
 			a.Settings().SetTheme(forcedVariant{Theme: uitheme.New(), v: v})
 
@@ -64,8 +68,12 @@ func TestCaptureWindowRenders(t *testing.T) {
 
 			w := test.NewWindow(nil)
 			c := New(&captureHost{cfg: cfg}, w)
-			c.tabs.SelectIndex(tab.index)
 			c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+			// The shell arranges these in production; the capture mirrors that
+			// arrangement so the render is what a user would see.
+			w.SetContent(container.NewBorder(
+				container.NewVBox(c.Banner(), c.ProfileBar()), c.Footer(), nil, nil,
+				tab.pick(c)))
 
 			w.Resize(fyne.NewSize(720, 560))
 			f, err := os.Create(dir + "/settings-" + tab.label + "-" + name + ".png")

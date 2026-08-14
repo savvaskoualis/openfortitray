@@ -4,6 +4,7 @@ import (
 	"errors"
 	"image/color"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -46,13 +47,22 @@ type Controller struct {
 	work *config.Config
 	sel  int
 
-	list *widget.List
+	// profileSelect replaces the old profile rail; syncing suppresses its OnChanged
+	// while syncProfileBar repaints it.
+	profileSelect *widget.Select
+	profileBar    *fyne.Container
+	syncing       bool
 
-	// tabs is the Basic/Advanced container; ShowIssue switches it to the tab an
-	// issue lives on. banner is the persistent inline strip at the top of the
-	// window that names a blocking Connect issue and its fix; it is hidden until
-	// ShowIssue raises it and stays up until dismissed or a successful Save.
-	tabs        *container.AppTabs
+	// The composed pieces the shell arranges. This controller no longer owns a
+	// window: it owns widgets, and something else decides where they live.
+	basic    fyne.CanvasObject
+	advanced fyne.CanvasObject
+	footer   fyne.CanvasObject
+	navigate func(tab string)
+
+	// banner is the persistent inline strip at the top of the settings sections that
+	// names a blocking Connect issue and its fix; it is hidden until ShowIssue
+	// raises it and stays up until dismissed or a successful Save.
 	banner      *fyne.Container
 	bannerLabel *widget.Label
 
@@ -86,6 +96,10 @@ type Controller struct {
 	statusText *canvas.Text
 	// reconnectBtn is "Save & Reconnect", enabled only while a tunnel is up.
 	reconnectBtn *widget.Button
+	// delBtn is disabled when only one profile remains, which states the rule
+	// without a dialog. savedNote is the transient "Saved" confirmation.
+	delBtn    *widget.Button
+	savedNote *canvas.Text
 	// activeBtn promotes the selected profile to the active one.
 	activeBtn *widget.Button
 
@@ -111,10 +125,11 @@ func New(host Host, win fyne.Window) *Controller {
 
 // Show refreshes the working copy from the live config (discarding any edits
 // left from a previous session) and reveals the window, focused.
+// Show re-syncs the form from the live config. Revealing the window is the shell's
+// job now — there is only one window, and it may already be on screen showing
+// another section.
 func (c *Controller) Show() {
 	c.reset()
-	c.win.Show()
-	c.win.RequestFocus()
 }
 
 // Apply renders one tunnel event onto the bottom status strip and mirrors the
@@ -141,9 +156,7 @@ func (c *Controller) Apply(e tunnel.Event) {
 func (c *Controller) reset() {
 	c.work = cloneConfig(c.host.Config())
 	c.sel = c.indexOf(c.work.ActiveProfile)
-	c.list.UnselectAll()
-	c.list.Refresh()
-	c.list.Select(c.sel)
+	c.syncProfileBar()
 	c.loadProfile(c.sel)
 }
 
@@ -159,76 +172,101 @@ func (c *Controller) indexOf(name string) int {
 }
 
 func (c *Controller) build() {
-	c.buildList()
-	form := c.buildBasicTab()
-	advanced := c.buildAdvancedTab()
-	c.tabs = container.NewAppTabs(
-		container.NewTabItem("Basic", form),
-		container.NewTabItem("Advanced", advanced),
-	)
+	c.buildProfileBar()
+	c.basic = c.buildBasicTab()
+	c.advanced = c.buildAdvancedTab()
 	c.buildBanner()
+	c.footer = c.buildActionStrip()
+}
 
-	// Profile rail. The four actions used to be a 2x2 grid of equal text buttons
-	// wedged under the list, which read as a debug panel: four same-weight controls,
-	// no indication that three are rare and one is routine.
-	//
-	// Now the three list-editing actions are icon buttons on one row — add,
-	// duplicate, delete, in that order of destructiveness — and "Set active", the one
-	// that changes what the app actually connects to, gets its own labelled row
-	// because it is a different KIND of action from editing the list.
+// Banner returns the inline warning strip, shown at the top of the settings
+// sections. Hidden until ShowIssue raises it; a BorderLayout gives a hidden child
+// no space.
+func (c *Controller) Banner() fyne.CanvasObject { return c.banner }
+
+// ProfileBar returns the profile selector and its management buttons. It governs
+// both settings sections, so the shell places it above whichever is showing.
+func (c *Controller) ProfileBar() fyne.CanvasObject { return c.profileBar }
+
+// ConnectionContent and AdvancedContent are the two settings sections. They were
+// tabs inside a window of their own; the shell now presents them as destinations
+// alongside Status, so the app has ONE window and one level of navigation.
+func (c *Controller) ConnectionContent() fyne.CanvasObject { return c.basic }
+func (c *Controller) AdvancedContent() fyne.CanvasObject   { return c.advanced }
+
+// Footer returns the Cancel / Save & Reconnect / Save strip.
+func (c *Controller) Footer() fyne.CanvasObject { return c.footer }
+
+// SetNavigator gives the controller a way to ask the shell to show a section, so
+// ShowIssue can put the user in front of the offending field.
+func (c *Controller) SetNavigator(nav func(tab string)) { c.navigate = nav }
+
+func (c *Controller) buildProfileBar() {
+	// The profile list used to be a permanent left rail. The left edge is now
+	// navigation, and for the handful of profiles anyone actually keeps a rail was
+	// always a lot of furniture for a one-of-N choice — a selector says the same
+	// thing in one row and puts it beside the fields it governs.
+	c.profileSelect = widget.NewSelect(nil, func(string) {
+		if c.syncing {
+			return
+		}
+		c.sel = c.profileSelect.SelectedIndex()
+		c.loadProfile(c.sel)
+	})
+
 	addBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), c.addProfile)
 	dupBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), c.duplicateProfile)
-	delBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), c.deleteProfile)
-	for _, b := range []*widget.Button{addBtn, dupBtn, delBtn} {
+	c.delBtn = widget.NewButtonWithIcon("", theme.DeleteIcon(), c.deleteProfile)
+	delBtn := c.delBtn
+	c.activeBtn = widget.NewButton("Set as active", c.setActive)
+	for _, b := range []*widget.Button{addBtn, dupBtn, delBtn, c.activeBtn} {
 		b.Importance = widget.LowImportance
 	}
-	c.activeBtn = widget.NewButton("Set as active", c.setActive)
-	c.activeBtn.Importance = widget.LowImportance
-	railTools := container.NewVBox(
-		container.NewGridWithColumns(3, addBtn, dupBtn, delBtn),
-		c.activeBtn,
+
+	label := canvas.NewText("PROFILE", theme.Color(theme.ColorNamePlaceHolder))
+	label.TextSize = theme.Size(theme.SizeNameCaptionText)
+	label.TextStyle = fyne.TextStyle{Bold: true}
+
+	c.profileBar = container.NewVBox(
+		container.NewBorder(nil, nil, container.NewPadded(label),
+			container.NewHBox(addBtn, dupBtn, delBtn, c.activeBtn), c.profileSelect),
+		widget.NewSeparator(),
 	)
-	railCap := canvas.NewText("PROFILES", theme.Color(theme.ColorNamePlaceHolder))
-	railCap.TextSize = theme.Size(theme.SizeNameCaptionText)
-	railCap.TextStyle = fyne.TextStyle{Bold: true}
-	left := container.NewBorder(
-		container.NewPadded(railCap), railTools, nil, nil, c.list)
-
-	bottom := c.buildActionStrip()
-
-	// The banner sits at the top; while hidden BorderLayout gives it no space.
-	// A rule between the rail and the panel: without it the two columns float in one
-	// undifferentiated field of background, which is most of why the window read as
-	// unfinished even once the spacing was right.
-	content := container.NewBorder(c.banner, bottom,
-		container.NewHBox(left, widget.NewSeparator()), nil, c.tabs)
-	c.win.SetContent(content)
-	c.win.Resize(fyne.NewSize(720, 560))
-	// The red close button hides the window; the app only ever exits via the
-	// tray's Quit item. Without this, closing the first-shown window would quit
-	// the whole app (fyne's master-window rule).
-	c.win.SetCloseIntercept(c.win.Hide)
 }
 
-func (c *Controller) buildList() {
-	c.list = widget.NewList(
-		func() int { return len(c.work.Profiles) },
-		func() fyne.CanvasObject { return widget.NewLabel("template") },
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			lbl := o.(*widget.Label)
-			name := c.work.Profiles[i].Name
-			if name == c.work.ActiveProfile {
-				name = "● " + name // active-profile marker
-			}
-			lbl.SetText(name)
-		},
-	)
-	c.list.OnSelected = func(id widget.ListItemID) {
-		c.sel = id
-		c.loadProfile(id)
+// syncProfileBar repaints the selector from the working copy. syncing suppresses
+// the Select's own OnChanged for the duration: SetSelectedIndex fires it, and
+// without the guard choosing a profile would reload it twice — once from the click
+// and once from this repaint.
+func (c *Controller) syncProfileBar() {
+	names := make([]string, len(c.work.Profiles))
+	for i, p := range c.work.Profiles {
+		name := p.Name
+		if name == c.work.ActiveProfile {
+			name = "● " + name // the profile the app actually connects with
+		}
+		names[i] = name
+	}
+	c.syncing = true
+	c.profileSelect.Options = names
+	if c.sel >= 0 && c.sel < len(names) {
+		c.profileSelect.SetSelectedIndex(c.sel)
+	}
+	c.syncing = false
+	c.profileSelect.Refresh()
+
+	// The last profile cannot be deleted. That rule used to be enforced by letting
+	// the user click Delete and then interrupting with a modal to say no — a dialog
+	// whose only job was to refuse. A disabled button states the rule before the
+	// click, and needs no words.
+	if c.delBtn != nil {
+		if canDeleteProfile(len(c.work.Profiles)) {
+			c.delBtn.Enable()
+		} else {
+			c.delBtn.Disable()
+		}
 	}
 }
-
 func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	c.nameEntry = widget.NewEntry()
 	c.nameEntry.Validator = func(s string) error { return validateName(s, c.work.Profiles, c.sel) }
@@ -239,7 +277,7 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 		// renameProfile keeps ActiveProfile pointing at this profile if it was
 		// the active one, so renaming the active profile does not orphan it.
 		renameProfile(c.work, c.sel, s)
-		c.list.Refresh()
+		c.syncProfileBar()
 	}
 
 	c.gatewayEntry = widget.NewEntry()
@@ -296,7 +334,7 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 		c.work.Autostart = on
 		if on {
 			c.work.ActiveProfile = c.work.Profiles[c.sel].Name
-			c.list.Refresh()
+			c.syncProfileBar()
 		}
 	})
 
@@ -371,8 +409,10 @@ func show(row *fyne.Container, visible bool) {
 // Measured, not guessed: the group's laid-out size and MinSize disagreed by the
 // combined height of the three hidden rows.
 func (c *Controller) relayout() {
-	if c.tabs != nil {
-		c.tabs.Refresh()
+	for _, o := range []fyne.CanvasObject{c.basic, c.advanced} {
+		if o != nil {
+			o.Refresh()
+		}
 	}
 }
 
@@ -452,7 +492,12 @@ func (c *Controller) buildActionStrip() fyne.CanvasObject {
 	cancelBtn := widget.NewButton("Cancel", c.cancel)
 	cancelBtn.Importance = widget.LowImportance
 
-	buttons := container.NewHBox(cancelBtn, c.reconnectBtn, saveBtn)
+	c.savedNote = canvas.NewText("", theme.Color(theme.ColorNameSuccess))
+	c.savedNote.TextSize = theme.Size(theme.SizeNameCaptionText)
+	c.savedNote.TextStyle = fyne.TextStyle{Bold: true}
+	c.savedNote.Hide()
+
+	buttons := container.NewHBox(c.savedNote, cancelBtn, c.reconnectBtn, saveBtn)
 	return container.NewBorder(widget.NewSeparator(), nil,
 		container.NewPadded(c.statusText), container.NewPadded(buttons))
 }
@@ -515,24 +560,18 @@ func (c *Controller) ShowIssue(issue *Issue) {
 	}
 	c.reset()
 	c.sel = c.indexOf(issue.ProfileName)
-	c.list.Select(c.sel) // fires OnSelected → loadProfile paints the form
+	c.syncProfileBar()
+	c.loadProfile(c.sel)
 	c.selectTab(issue.Tab)
 	c.markField(issue)
 	c.showBanner(issue.Message)
-	c.win.Show()
-	c.win.RequestFocus()
 }
 
 // selectTab switches the Basic/Advanced container to the tab an issue lives on.
 func (c *Controller) selectTab(tab string) {
-	if c.tabs == nil {
-		return
+	if c.navigate != nil {
+		c.navigate(tab)
 	}
-	if tab == TabAdvanced {
-		c.tabs.SelectIndex(1)
-		return
-	}
-	c.tabs.SelectIndex(0)
 }
 
 // markField puts the issue's field into its validation-error state and focuses
@@ -775,12 +814,17 @@ func (c *Controller) applyCertMode(mode config.ServerCertMode) {
 func (c *Controller) save(reconnect bool) {
 	work := cloneConfig(c.work)
 	normalizePorts(work)
+	// Failures land in the inline banner rather than a modal. The banner sits above
+	// the very fields the message is about, stays up until the problem is dealt with,
+	// and does not have to be dismissed before the user can act on it — all three of
+	// which a modal gets wrong. The mechanism already existed for refused Connects;
+	// there was no reason Save had its own, worse channel.
 	if err := validateConfig(work); err != nil {
-		dialog.ShowError(err, c.win)
+		c.showBanner(err.Error())
 		return
 	}
 	if err := c.host.Commit(work); err != nil {
-		dialog.ShowError(err, c.win)
+		c.showBanner("Could not save: " + err.Error())
 		return
 	}
 	// Keep the visible working copy consistent with what was just persisted.
@@ -794,7 +838,27 @@ func (c *Controller) save(reconnect bool) {
 		c.host.Connect()
 		return
 	}
-	dialog.ShowInformation("Saved", "Settings saved.", c.win)
+	c.flashSaved()
+}
+
+// flashSaved confirms a save in the footer for a couple of seconds.
+//
+// It replaces a modal that said "Settings saved." and had to be dismissed. A modal
+// for success is the purest form of interruption: it tells the user something went
+// right, and then makes them click to admit it.
+func (c *Controller) flashSaved() {
+	if c.savedNote == nil {
+		return
+	}
+	c.savedNote.Text = "Saved"
+	c.savedNote.Show()
+	c.savedNote.Refresh()
+	time.AfterFunc(2*time.Second, func() {
+		fyne.Do(func() {
+			c.savedNote.Hide()
+			c.savedNote.Refresh()
+		})
+	})
 }
 
 func (c *Controller) cancel() {
@@ -806,8 +870,7 @@ func (c *Controller) addProfile() {
 	name := uniqueName("New profile", c.work.Profiles)
 	c.work.Profiles = append(c.work.Profiles, config.NewProfile(name))
 	c.sel = len(c.work.Profiles) - 1
-	c.list.Refresh()
-	c.list.Select(c.sel)
+	c.syncProfileBar()
 	c.loadProfile(c.sel)
 	c.win.Canvas().Focus(c.nameEntry)
 }
@@ -818,15 +881,14 @@ func (c *Controller) duplicateProfile() {
 	dup.Name = uniqueName(src.Name+" copy", c.work.Profiles)
 	c.work.Profiles = append(c.work.Profiles, dup)
 	c.sel = len(c.work.Profiles) - 1
-	c.list.Refresh()
-	c.list.Select(c.sel)
+	c.syncProfileBar()
 	c.loadProfile(c.sel)
 }
 
 func (c *Controller) deleteProfile() {
+	// Guarded by the disabled button; kept as a belt-and-braces return rather than a
+	// dialog, because a refusal is not news worth a modal.
 	if !canDeleteProfile(len(c.work.Profiles)) {
-		dialog.ShowInformation("Cannot delete",
-			"This is the last profile; at least one must remain.", c.win)
 		return
 	}
 	victim := c.work.Profiles[c.sel]
@@ -844,15 +906,14 @@ func (c *Controller) deleteProfile() {
 			if c.sel >= len(c.work.Profiles) {
 				c.sel = len(c.work.Profiles) - 1
 			}
-			c.list.Refresh()
-			c.list.Select(c.sel)
+			c.syncProfileBar()
 			c.loadProfile(c.sel)
 		}, c.win)
 }
 
 func (c *Controller) setActive() {
 	c.work.ActiveProfile = c.work.Profiles[c.sel].Name
-	c.list.Refresh()
+	c.syncProfileBar()
 	// The auto-connect checkbox reflects "this profile is active"; refresh it.
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == c.work.Profiles[c.sel].Name)
 }

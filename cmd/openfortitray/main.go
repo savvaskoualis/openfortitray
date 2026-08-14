@@ -35,6 +35,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
+	"github.com/savvaskoualis/openfortitray/internal/shell"
 	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
@@ -63,9 +64,10 @@ type app struct {
 	fyneApp  fyne.App
 	tray     *tray.Controller
 	settings *settings.Controller
-	// status is the (initially hidden) status window — the only surface that shows
-	// live state, since a tray menu cannot repaint while it is open.
+	// status is the connection panel; the shell decides when it is on screen.
 	status *status.Controller
+	// shell owns the single window and which section of it is visible.
+	shell *shell.Shell
 	// stopTick stops the 1 Hz uptime ticker that drives the status window's clock.
 	// nil until the ticker is started in OnStarted; called once during teardown so
 	// the goroutine cannot outlive the UI it posts to.
@@ -377,16 +379,20 @@ func (a *app) Version() string { return version }
 // ShowSettings reveals the settings window (tray.App). It is built once at
 // startup; this only shows the existing, hidden window.
 func (a *app) ShowSettings() {
-	if a.settings != nil {
-		a.settings.Show()
+	if a.settings == nil || a.shell == nil {
+		return
 	}
+	// Re-sync the form from the live config before it is shown, discarding edits
+	// abandoned last time.
+	a.settings.Show()
+	a.shell.Reveal(shell.SectionConnection)
 }
 
 // ShowStatus reveals the status window (tray.App / the Status… item). Like the
 // settings window it is built once at startup and hidden.
 func (a *app) ShowStatus() {
-	if a.status != nil {
-		a.status.Show()
+	if a.shell != nil {
+		a.shell.Reveal(shell.SectionStatus)
 	}
 }
 
@@ -1380,19 +1386,37 @@ func main() {
 		log.Print("fyne lifecycle: OnStopped (fyne is quitting the run loop)")
 	})
 
-	// Build the settings window once, hidden. It is never ShowAndRun'd, so it
-	// cannot be the master window whose close quits the app; its close button is
-	// intercepted to Hide (see settings.build). The tray's Settings… item shows
-	// this same reused window.
-	win := a.fyneApp.NewWindow("OpenFortiTray — Settings")
+	// ONE window, built once and left hidden. It is never ShowAndRun'd, so it cannot
+	// be the master window whose close quits the app; the shell intercepts its close
+	// to Hide.
+	//
+	// Status and Settings were two separate windows: two things to find, two to
+	// arrange, and — once the app grew a Dock icon — an ambiguous answer to "bring
+	// this app up". The controllers still take the window, because dialogs and focus
+	// need one, but they no longer decide what it contains or when it appears.
+	win := a.fyneApp.NewWindow("OpenFortiTray")
 	a.win = win
 	a.settings = settings.New(a, win)
+	a.status = status.New(a, win)
 
-	// The status window, on the same contract: built once, hidden, close-intercepted
-	// to Hide. This is the surface that shows live state — the tray menu cannot
-	// repaint while it is open (see the KNOWN LIMITATION in internal/tray), so a
-	// state change is only visible here.
-	a.status = status.New(a, a.fyneApp.NewWindow("OpenFortiTray"))
+	a.shell = shell.New(win, shell.Parts{
+		Status:     a.status.Content(),
+		Connection: a.settings.ConnectionContent(),
+		Advanced:   a.settings.AdvancedContent(),
+		ProfileBar: a.settings.ProfileBar(),
+		Banner:     a.settings.Banner(),
+		Footer:     a.settings.Footer(),
+	})
+	// Settings asks the shell to navigate when a refused Connect points at a field.
+	a.settings.SetNavigator(func(tab string) {
+		if tab == settings.TabAdvanced {
+			a.shell.Reveal(shell.SectionAdvanced)
+			return
+		}
+		a.shell.Reveal(shell.SectionConnection)
+	})
+	// Revealing the activity history needs a taller window; the shell owns the size.
+	a.status.OnHeightRequest = a.shell.RequestHeight
 
 	// Route a refused Connect (invalid active profile) to the settings window,
 	// which opens on the offending field with a banner naming the fix.

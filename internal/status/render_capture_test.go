@@ -61,6 +61,7 @@ func TestCaptureWindowRenders(t *testing.T) {
 
 			w := test.NewWindow(nil)
 			c := New(&fakeHost{}, w)
+			w.SetContent(c.Content()) // the shell does this in production
 			base := time.Date(2026, 8, 13, 14, 22, 0, 0, time.UTC)
 			c.now = func() time.Time { return base }
 			c.Apply(tunnel.Event{State: tunnel.Connecting})

@@ -333,20 +333,20 @@ func TestActionRowMatchesTheState(t *testing.T) {
 	}
 }
 
-// The Status… row opens the window that can actually show live state, since this
-// menu cannot repaint while it is held open.
-func TestStatusItemOpensTheStatusWindow(t *testing.T) {
+// The Open row opens the app's window — named for what it does now that Status is
+// a section of one window rather than a window of its own.
+func TestOpenItemOpensTheWindow(t *testing.T) {
 	test.NewTempApp(t)
 	f := &fakeApp{}
 	c := newController(f)
 
-	it := itemByLabel(c.menu, "Status…")
+	it := itemByLabel(c.menu, "Open")
 	if it == nil || it.Action == nil {
-		t.Fatal("Status… item should exist with an action")
+		t.Fatal("Open item should exist with an action")
 	}
 	it.Action()
 	if f.statusShows != 1 {
-		t.Errorf("Status… fired %d ShowStatus calls, want 1", f.statusShows)
+		t.Errorf("Open fired %d ShowStatus calls, want 1", f.statusShows)
 	}
 }
 

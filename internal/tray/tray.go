@@ -23,13 +23,12 @@ type App interface {
 	LogPath() string
 	// Version is the build version string, shown under the title row.
 	Version() string
-	// ShowSettings reveals (and focuses) the settings window. The window is built
-	// once at startup and hidden; this only shows the existing one.
+	// ShowSettings opens the same window on its Connection section.
 	ShowSettings()
-	// ShowStatus reveals (and focuses) the status window, on the same
-	// built-once-then-hidden contract as ShowSettings. It is the only surface that
-	// shows live state: this menu cannot repaint while it is open (see the KNOWN
-	// LIMITATION below), so the window is where a state change is actually visible.
+	// ShowStatus opens the app's window on its Status section. It is the only
+	// surface that shows live state: this menu cannot repaint while it is open (see
+	// the KNOWN LIMITATION below), so the window is where a state change is
+	// actually visible.
 	ShowStatus()
 	// Quit begins teardown (tunnel down) and then quits the fyne app. The tray's
 	// Quit item drives this rather than fyne's built-in quit so the VPN is always
@@ -151,9 +150,13 @@ func newController(app App) *Controller {
 	c.autoItem = fyne.NewMenuItem("Auto-connect at login", c.toggleAutostart)
 	c.autoItem.Checked = app.AutostartEnabled()
 
-	// Status… sits at the top of the actionable rows because it is the surface that
-	// actually shows live state; this menu is a snapshot from the moment it opened.
-	statusWindowItem := fyne.NewMenuItem("Status…", func() { app.ShowStatus() })
+	// "Open" rather than "Status…": there is one window now, and this row opens it —
+	// on the Status section, which is what someone opening a VPN client wants to see.
+	// Naming it after a section made sense when the section WAS the window.
+	//
+	// It leads the actionable rows because it is the surface that actually shows live
+	// state; this menu is a snapshot from the moment it opened.
+	statusWindowItem := fyne.NewMenuItem("Open", func() { app.ShowStatus() })
 
 	settingsItem := fyne.NewMenuItem("Settings…", func() { app.ShowSettings() })
 

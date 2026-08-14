@@ -175,8 +175,8 @@ func TestOnlyThePrimaryButtonIsHighImportance(t *testing.T) {
 	if c.primary.Importance != widgetHigh {
 		t.Errorf("primary importance = %v, want high", c.primary.Importance)
 	}
-	if c.settingsBtn.Importance == widgetHigh {
-		t.Error("the Settings button must not compete with the primary action")
+	if c.logBtn.Importance == widgetHigh {
+		t.Error("the log button must not compete with the primary action")
 	}
 }
 
@@ -210,12 +210,10 @@ func TestPrimaryButtonDrivesTheHost(t *testing.T) {
 	}
 }
 
-func TestSettingsAndLogButtonsDriveTheHost(t *testing.T) {
+// Navigation to Settings belongs to the shell's rail, not to a button in here —
+// two routes to one place, one of them dressed as an action.
+func TestLogButtonDrivesTheHost(t *testing.T) {
 	c, h, _ := newTestController(t)
-	test.Tap(c.settingsBtn)
-	if h.settings != 1 {
-		t.Errorf("ShowSettings called %d times, want 1", h.settings)
-	}
 	test.Tap(c.logBtn)
 	if h.logOpens != 1 {
 		t.Errorf("OpenLog called %d times, want 1", h.logOpens)
@@ -319,24 +317,8 @@ func TestActivityListIsNewestFirst(t *testing.T) {
 	}
 }
 
-// Closing the window hides it. The app is a tray app: a closed window that quit
-// the process would take the tunnel down with it.
-func TestCloseHidesRatherThanQuitting(t *testing.T) {
-	c, _, _ := newTestController(t)
-	if c.closeRequested == nil {
-		t.Fatal("no close intercept was installed")
-	}
-	c.closeRequested()
-	// The controller must still be usable afterwards — a closed window is hidden,
-	// not torn down.
-	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if c.stateText.Text != "Connected" {
-		t.Errorf("after a close the window stopped rendering: %q", c.stateText.Text)
-	}
-	if fyne.CurrentApp() == nil {
-		t.Error("closing the status window must not quit the app")
-	}
-}
+// Closing the window is the shell's concern now — see internal/shell, where the
+// intercept and its test live. This controller owns widgets, not a window.
 
 // Opening the history must put it ON SCREEN. It is a hand-rolled disclosure rather
 // than a widget.Accordion precisely because the accordion cannot report when it was
