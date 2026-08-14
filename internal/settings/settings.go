@@ -9,6 +9,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -88,9 +89,11 @@ type Controller struct {
 	openconnectPath *widget.Entry
 	helperPath      *widget.Entry
 
-	statusText    *canvas.Text
-	connectBtn    *widget.Button
-	disconnectBtn *widget.Button
+	statusText *canvas.Text
+	// reconnectBtn is "Save & Reconnect", enabled only while a tunnel is up.
+	reconnectBtn *widget.Button
+	// activeBtn promotes the selected profile to the active one.
+	activeBtn *widget.Button
 
 	// loading suppresses the widgets' OnChanged handlers while loadProfile
 	// populates them, so repainting the form for a newly selected profile does
@@ -129,12 +132,13 @@ func (c *Controller) Apply(e tunnel.Event) {
 	c.statusText.Text = text
 	c.statusText.Color = colorFor(kind)
 	c.statusText.Refresh()
+	// Save & Reconnect only makes sense against a tunnel there is something to
+	// bounce. Offered when nothing is up, it is just a slower Save that briefly
+	// dials — so it is disabled instead, which says so without a word of UI text.
 	if active {
-		c.connectBtn.Disable()
-		c.disconnectBtn.Enable()
+		c.reconnectBtn.Enable()
 	} else {
-		c.connectBtn.Enable()
-		c.disconnectBtn.Disable()
+		c.reconnectBtn.Disable()
 	}
 }
 
@@ -170,19 +174,42 @@ func (c *Controller) build() {
 	)
 	c.buildBanner()
 
-	addBtn := widget.NewButton("Add", c.addProfile)
-	dupBtn := widget.NewButton("Duplicate", c.duplicateProfile)
-	delBtn := widget.NewButton("Delete", c.deleteProfile)
-	activeBtn := widget.NewButton("Set active", c.setActive)
-	listButtons := container.NewGridWithColumns(2, addBtn, dupBtn, delBtn, activeBtn)
-	left := container.NewBorder(nil, listButtons, nil, nil, c.list)
+	// Profile rail. The four actions used to be a 2x2 grid of equal text buttons
+	// wedged under the list, which read as a debug panel: four same-weight controls,
+	// no indication that three are rare and one is routine.
+	//
+	// Now the three list-editing actions are icon buttons on one row — add,
+	// duplicate, delete, in that order of destructiveness — and "Set active", the one
+	// that changes what the app actually connects to, gets its own labelled row
+	// because it is a different KIND of action from editing the list.
+	addBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), c.addProfile)
+	dupBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), c.duplicateProfile)
+	delBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), c.deleteProfile)
+	for _, b := range []*widget.Button{addBtn, dupBtn, delBtn} {
+		b.Importance = widget.LowImportance
+	}
+	c.activeBtn = widget.NewButton("Set as active", c.setActive)
+	c.activeBtn.Importance = widget.LowImportance
+	railTools := container.NewVBox(
+		container.NewGridWithColumns(3, addBtn, dupBtn, delBtn),
+		c.activeBtn,
+	)
+	railCap := canvas.NewText("PROFILES", theme.Color(theme.ColorNamePlaceHolder))
+	railCap.TextSize = theme.Size(theme.SizeNameCaptionText)
+	railCap.TextStyle = fyne.TextStyle{Bold: true}
+	left := container.NewBorder(
+		container.NewPadded(railCap), railTools, nil, nil, c.list)
 
 	bottom := c.buildActionStrip()
 
 	// The banner sits at the top; while hidden BorderLayout gives it no space.
-	content := container.NewBorder(c.banner, bottom, left, nil, c.tabs)
+	// A rule between the rail and the panel: without it the two columns float in one
+	// undifferentiated field of background, which is most of why the window read as
+	// unfinished even once the spacing was right.
+	content := container.NewBorder(c.banner, bottom,
+		container.NewHBox(left, widget.NewSeparator()), nil, c.tabs)
 	c.win.SetContent(content)
-	c.win.Resize(fyne.NewSize(700, 520))
+	c.win.Resize(fyne.NewSize(720, 560))
 	// The red close button hides the window; the app only ever exits via the
 	// tray's Quit item. Without this, closing the first-shown window would quit
 	// the whole app (fyne's master-window rule).
@@ -322,7 +349,7 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 			widget.NewFormItem("Profile name", c.nameEntry),
 			widget.NewFormItem("Gateway host", c.gatewayEntry),
 			widget.NewFormItem("", c.customPort),
-			widget.NewFormItem("Port", c.portEntry),
+			widget.NewFormItem("Port", narrow(c.portEntry, 110)),
 		),
 		c.group("Authentication",
 			c.row("Method", c.authSelect),
@@ -355,6 +382,8 @@ func (c *Controller) section(caption string, items ...*widget.FormItem) fyne.Can
 
 // show reveals or hides one of those rows. A nil row is tolerated so the
 // build order does not have to be perfect.
+//
+// Hiding is only half the job — see (*Controller).relayout.
 func show(row *fyne.Container, visible bool) {
 	if row == nil {
 		return
@@ -365,6 +394,35 @@ func show(row *fyne.Container, visible bool) {
 		row.Hide()
 	}
 	row.Refresh()
+}
+
+// relayout re-lays out the tabs after a row's visibility changed.
+//
+// Hiding a widget in fyne does NOT relayout its ancestors. A container keeps the
+// size it computed while the child was still visible, and its own MinSize quietly
+// drops without anything acting on the difference. The rows are hidden during the
+// first loadProfile, which runs AFTER build, so the Authentication group was laid
+// out at 210px while reporting a minimum of 93 — leaving a 120px hole between
+// "Method" and "Realm" that looked exactly like a spacing bug and was not.
+//
+// Measured, not guessed: the group's laid-out size and MinSize disagreed by the
+// combined height of the three hidden rows.
+func (c *Controller) relayout() {
+	if c.tabs != nil {
+		c.tabs.Refresh()
+	}
+}
+
+// narrow caps a field's width and left-aligns it, for values whose length is known
+// and short. A form stretches every field to the full column, so a five-digit port
+// got the same width as a hostname — which tells the reader nothing about what
+// belongs in it, and makes a settings pane look like a generated form rather than a
+// designed one.
+func narrow(o fyne.CanvasObject, w float32) fyne.CanvasObject {
+	return container.NewHBox(
+		container.New(layout.NewGridWrapLayout(fyne.NewSize(w, 34)), o),
+		layout.NewSpacer(),
+	)
 }
 
 // group is a captioned stack of arbitrary objects, for the groups that mix a form
@@ -405,26 +463,33 @@ func sections(groups ...fyne.CanvasObject) fyne.CanvasObject {
 	return container.NewVScroll(container.NewPadded(container.NewVBox(objs...)))
 }
 
+// buildActionStrip builds the footer: connection state on the left, the two save
+// actions and Cancel on the right.
+//
+// Connect and Disconnect USED to live here, making five equal-weight buttons in one
+// row with no hierarchy at all. They are gone: driving the tunnel is the tray's job
+// and the status window's job, and a settings window's job is settings. Every
+// surface having every control is what "nothing has a meaningful place" looks like.
+// The state text stays, because knowing whether a change will disrupt a live tunnel
+// is genuinely settings context.
 func (c *Controller) buildActionStrip() fyne.CanvasObject {
 	c.statusText = canvas.NewText("Disconnected", colorFor(statusGray))
+	c.statusText.TextSize = theme.Size(theme.SizeNameCaptionText)
 	c.statusText.TextStyle = fyne.TextStyle{Bold: true}
 
-	c.connectBtn = widget.NewButton("Connect", c.host.Connect)
-	c.disconnectBtn = widget.NewButton("Disconnect", c.host.Disconnect)
-	c.disconnectBtn.Disable()
-
+	// One high-importance action. Save & Reconnect is the same commit plus a tunnel
+	// bounce, so it reads as a variant of Save rather than a rival to it; Cancel is
+	// quietest because discarding is never what someone came here to do.
 	saveBtn := widget.NewButton("Save", func() { c.save(false) })
 	saveBtn.Importance = widget.HighImportance
-	reconnectBtn := widget.NewButton("Save & Reconnect", func() { c.save(true) })
+	c.reconnectBtn = widget.NewButton("Save & Reconnect", func() { c.save(true) })
+	c.reconnectBtn.Importance = widget.MediumImportance
 	cancelBtn := widget.NewButton("Cancel", c.cancel)
+	cancelBtn.Importance = widget.LowImportance
 
-	buttons := container.NewHBox(
-		c.connectBtn, c.disconnectBtn,
-		widget.NewSeparator(),
-		saveBtn, reconnectBtn, cancelBtn,
-	)
-	// Status on the left, actions on the right.
-	return container.NewBorder(widget.NewSeparator(), nil, container.NewPadded(c.statusText), buttons)
+	buttons := container.NewHBox(cancelBtn, c.reconnectBtn, saveBtn)
+	return container.NewBorder(widget.NewSeparator(), nil,
+		container.NewPadded(c.statusText), container.NewPadded(buttons))
 }
 
 // buildBanner constructs the persistent inline banner shown at the top of the
@@ -624,6 +689,7 @@ func (c *Controller) updateAuthNote() {
 		show(c.usernameRow, false)
 		show(c.certPathRow, false)
 	}
+	c.relayout()
 }
 
 // buildAdvancedTab builds the Advanced form: dual-stack, DTLS, the server-cert
@@ -741,7 +807,7 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 			widget.NewFormItem("", splitDNSNote),
 		),
 		c.section("Paths",
-			widget.NewFormItem("SAML redirect port", c.samlPortEntry),
+			widget.NewFormItem("SAML redirect port", narrow(c.samlPortEntry, 110)),
 			widget.NewFormItem("openconnect binary", c.openconnectPath),
 			widget.NewFormItem("", openconnectNote),
 			widget.NewFormItem("Privileged helper", c.helperPath),
@@ -761,6 +827,7 @@ func (c *Controller) applyCertMode(mode config.ServerCertMode) {
 		c.certPin.Disable()
 		show(c.certPinRow, false)
 	}
+	c.relayout()
 }
 
 func (c *Controller) save(reconnect bool) {

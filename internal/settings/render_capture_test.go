@@ -67,7 +67,7 @@ func TestCaptureWindowRenders(t *testing.T) {
 			c.tabs.SelectIndex(tab.index)
 			c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
 
-			w.Resize(fyne.NewSize(760, 520))
+			w.Resize(fyne.NewSize(720, 560))
 			f, err := os.Create(dir + "/settings-" + tab.label + "-" + name + ".png")
 			if err != nil {
 				t.Fatal(err)
