@@ -1364,8 +1364,10 @@ func main() {
 		watchDockActivation(func() {
 			if firstActivation {
 				firstActivation = false
+				log.Print("dock: first activation (launch) — leaving the window hidden")
 				return
 			}
+			log.Print("dock: activated — showing the status window")
 			a.ShowStatus()
 		})
 		a.startUptimeTicker()
