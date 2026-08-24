@@ -8,6 +8,25 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.37] — 2026-08-24
+
+### Fixed
+- **An update restart now really does bring the VPN back on its own.** The
+  restart prompt has said that since 0.1.36, but "comes back on its own" was
+  actually gated on the login-item ("launch at login") preference — so anyone
+  who had that turned off (a separate, unrelated choice) lost their VPN after
+  every update, with no automatic recovery. The relaunch now reconnects
+  whenever the tunnel was actually up when the restart began, independent of
+  that setting. ([#1](https://github.com/savvaskoualis/openfortitray/issues/1))
+- **Connect-at-login no longer loses a valid session to a keychain race.** A
+  macOS login item can start before the login keychain finishes its automatic
+  unlock; a stored-cookie lookup made right then used to be silently treated as
+  "no cookie stored" and fell back to an interactive SAML browser flow the user
+  never saw (the app has no Dock icon). The lookup now recognizes that specific
+  failure and retries for a few seconds before giving up, so a valid session
+  reconnects instead of quietly requiring a manual sign-in every login.
+  ([#2](https://github.com/savvaskoualis/openfortitray/issues/2))
+
 ## [0.1.36] — 2026-08-14
 
 ### Added
