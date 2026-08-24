@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>OpenFortiTray</string>
+	<key>CFBundleDisplayName</key>
+	<string>OpenFortiTray</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.savvaskoualis.openfortitray</string>
+	<key>CFBundleExecutable</key>
+	<string>openfortitray</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<!-- LSUIElement is deliberately ABSENT, so the app is a normal Dock-visible
+	     application with a menu-bar status item as well. It was previously an
+	     agent (LSUIElement=1, no Dock icon), which is the usual shape for a
+	     status-item app; the Dock icon is a product decision, not a technical
+	     one. The activation policy is also asserted at runtime — see
+	     dockpolicy_darwin.go — because fyne/glfw sets its own while starting. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
