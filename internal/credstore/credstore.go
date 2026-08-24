@@ -14,6 +14,15 @@
 // without touching the real keychain.
 package credstore
 
+import "errors"
+
+// ErrBusy indicates the OS secret store could not be reached because it
+// currently requires user interaction it cannot provide — e.g. the macOS login
+// keychain has not finished its automatic unlock yet at login time. It is
+// distinct from a miss (Get returning ("", nil)): the secret may well be
+// there, the store just cannot answer yet. Callers may retry shortly.
+var ErrBusy = errors.New("credstore: secret store requires interaction")
+
 // Backend persists small secrets keyed by an opaque, caller-namespaced string,
 // scoped to the current OS user. Get returns ("", nil) when no secret is stored
 // for key — a miss is not an error.

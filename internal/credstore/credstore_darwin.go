@@ -4,6 +4,7 @@ package credstore
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 )
@@ -31,16 +32,41 @@ func (keychain) Get(key string) (string, error) {
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			// Any non-zero exit here means "not found" in practice (there is no
-			// other failure mode for a well-formed query against the login
-			// keychain). Treat it as an empty miss rather than a hard error so a
-			// first-ever Connect just falls through to SAML.
-			return "", nil
+			if miss, cerr := classifyFindError(ee.Stderr); miss {
+				return "", nil
+			} else {
+				return "", cerr
+			}
 		}
 		return "", err
 	}
 	// -w emits the password followed by a newline.
 	return strings.TrimRight(string(out), "\n"), nil
+}
+
+// classifyFindError turns find-generic-password's stderr into either a clean
+// miss (true, nil) or a real error to surface. It exists as its own function so
+// the two failure texts `security` actually produces can be told apart in a
+// unit test without executing the real binary or touching the login keychain.
+//
+// A genuine miss ("could not be found in the keychain", errSecItemNotFound) is
+// the only case that should look like an empty Get — a first-ever Connect must
+// fall through to SAML rather than erroring. Everything else, in particular
+// "User interaction is not allowed" (errSecInteractionNotAllowed), is a real
+// failure: the item may well be there, the keychain just cannot answer right
+// now (e.g. a login-item launch racing the login keychain's automatic unlock).
+// Silently treating that as a miss used to mean an otherwise-valid stored
+// session cookie was thrown away and SAML ran needlessly on every such race.
+func classifyFindError(stderr []byte) (miss bool, err error) {
+	s := string(stderr)
+	switch {
+	case strings.Contains(s, "could not be found in the keychain"):
+		return true, nil
+	case strings.Contains(s, "User interaction is not allowed"):
+		return false, ErrBusy
+	default:
+		return false, fmt.Errorf("keychain: find-generic-password: %s", strings.TrimSpace(s))
+	}
 }
 
 // Set stores value under key, replacing any existing item (-U). The value is

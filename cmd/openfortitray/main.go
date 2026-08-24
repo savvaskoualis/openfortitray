@@ -133,6 +133,11 @@ type app struct {
 	cookieSet    func(key, value string) error
 	cookieDelete func(key string) error
 	samlAuth     func(ctx context.Context, prof config.Profile) (string, error)
+	// cookieRetryInterval/cookieRetryWindow default to the package constants of
+	// the same name and are overridden in tests so a retry loop does not
+	// actually sleep. See cookieGetWithRetry.
+	cookieRetryInterval time.Duration
+	cookieRetryWindow   time.Duration
 
 	// notify posts a desktop notification. It is the fyne app's
 	// SendNotification in production and a recorder in tests; nil means "no
@@ -243,6 +248,31 @@ func (a *app) startTunnel() {
 // profiles/gateways keep independent cookies.
 func cookieKey(gateway string) string { return "openfortitray:" + gateway }
 
+// cookieGetWithRetry reads the stored cookie, retrying while the store reports
+// credstore.ErrBusy (the OS secret store cannot answer yet — on macOS, most
+// often the login keychain mid-unlock) for up to cookieRetryWindow. Any other
+// result, including a clean miss, returns immediately.
+//
+// It exists because a macOS Login Item can start before the login keychain's
+// automatic unlock finishes. Without this, that race made a perfectly valid
+// stored session look like a miss on every such launch, so "connect at login"
+// fell back to an interactive SAML browser flow the user never asked for and,
+// running under an LSUIElement app, may not even notice appearing.
+func (a *app) cookieGetWithRetry(ctx context.Context, key string) (string, error) {
+	deadline := time.Now().Add(a.cookieRetryWindow)
+	for {
+		cookie, err := a.cookieGet(key)
+		if !errors.Is(err, credstore.ErrBusy) || time.Now().After(deadline) {
+			return cookie, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(a.cookieRetryInterval):
+		}
+	}
+}
+
 // authenticate is the supervisor's AuthFunc. It is cache-first: on a fresh
 // Connect (storedCookieTried just reset by startTunnel) it offers the profile's
 // stored cookie ONCE, with no browser, so a still-valid session reconnects
@@ -262,7 +292,7 @@ func (a *app) authenticate(ctx context.Context) (string, error) {
 	// the profile opts in, and only for a real gateway. Swap(true) both consumes
 	// the one-shot and marks it used for any later re-mint this Connect.
 	if prof.RememberSession && gw != "" && !a.storedCookieTried.Swap(true) {
-		if cookie, err := a.cookieGet(key); err != nil {
+		if cookie, err := a.cookieGetWithRetry(ctx, key); err != nil {
 			log.Printf("auth: could not read stored session cookie: %v", err)
 		} else if cookie != "" {
 			log.Print("auth: reusing stored session cookie (no browser)")
@@ -964,6 +994,50 @@ func (a *app) watchSignals(sigs <-chan os.Signal, quit func()) {
 	}
 }
 
+// resumeMarkerName is the one-shot file finishUpdate leaves in cfgDir when the
+// tunnel was up at restart time, and the next launch consumes to reconnect —
+// see shouldResumeAfterUpdate and consumeResumeMarker.
+const resumeMarkerName = "resume-connect"
+
+// shouldResumeAfterUpdate reports whether finishUpdate should leave a resume
+// marker for the next launch: only when the tunnel was actually connected at
+// restart time, so an update offered (and declined, or applied while
+// disconnected) never fabricates a reconnect the user never had.
+//
+// lastNotified already tracks every tunnel state seen, not just the ones that
+// notified (see notifyFor), so this needs no extra bookkeeping.
+func (a *app) shouldResumeAfterUpdate() bool { return a.lastNotified == tunnel.Connected }
+
+// writeResumeMarker leaves the one-shot marker consumeResumeMarker looks for on
+// the next launch. Best-effort: a write failure only costs the user a manual
+// reconnect after this particular update, which is what happened before this
+// existed at all.
+func writeResumeMarker(cfgDir string) error {
+	return os.WriteFile(filepath.Join(cfgDir, resumeMarkerName), nil, 0o600)
+}
+
+// consumeResumeMarker reports whether an update-triggered relaunch left a
+// resume marker for this launch, removing it either way so it fires at most
+// once. It is deliberately a SEPARATE signal from cfg.Autostart: that setting
+// registers the OS login item and answers "connect every time the app
+// launches", which is a different question from "this particular launch is
+// resuming a session that was up when finishUpdate tore it down a moment ago".
+// Conflating the two used to mean a user who had disabled autostart (a login
+// item preference, not an update-recovery opt-out) lost their VPN, with no
+// automatic recovery, after every single update — even though the restart
+// prompt promised it "comes back on its own".
+func consumeResumeMarker(cfgDir string) bool {
+	p := filepath.Join(cfgDir, resumeMarkerName)
+	_, err := os.Stat(p)
+	found := err == nil
+	if found {
+		if rmErr := os.Remove(p); rmErr != nil {
+			log.Printf("openfortitray: could not remove resume marker %s: %v", p, rmErr)
+		}
+	}
+	return found
+}
+
 // selfHealThenConnect runs the startup sequence off the UI thread: it first reaps
 // any tunnel orphaned by a previous unclean exit (so a prior crash's root
 // openconnect and its FortiGate session are cleared BEFORE we mint a new cookie),
@@ -1077,6 +1151,17 @@ const shutdownWait = 35 * time.Second
 // against a wedged privileged call holding up connect-on-launch.
 const startupReapWait = 15 * time.Second
 
+// cookieRetryInterval/cookieRetryWindow bound cookieGetWithRetry: how long
+// authenticate waits for a busy OS secret store (credstore.ErrBusy) before
+// giving up on the stored cookie and falling back to SAML. A macOS login-item
+// launch can race the login keychain's automatic unlock by a couple of
+// seconds; this window is chosen to comfortably outlast that race without
+// making a genuinely-empty store noticeably slower to fall back.
+const (
+	cookieRetryInterval = 500 * time.Millisecond
+	cookieRetryWindow   = 5 * time.Second
+)
+
 func main() {
 	// Windows ships a bundled Mesa software OpenGL (the app-dir opengl32.dll
 	// shadows the system one), whose default gallium driver is llvmpipe. llvmpipe
@@ -1161,6 +1246,9 @@ func main() {
 		cookieSet:    credstore.Set,
 		cookieDelete: credstore.Delete,
 		samlAuth:     defaultSAMLAuth,
+
+		cookieRetryInterval: cookieRetryInterval,
+		cookieRetryWindow:   cookieRetryWindow,
 	}
 
 	// The auth/run funcs read a.snapshot() rather than a value captured at
@@ -1386,8 +1474,17 @@ func main() {
 	// The connect is marshalled back onto the UI goroutine (a.Connect touches the
 	// settings window when the active profile is unconfigured); it queues onto
 	// fyne's main-loop queue and runs as soon as Run starts.
+	// resumed is a SEPARATE question from cfg.Autostart: it is set for exactly one
+	// launch, right after an update restart that tore down a tunnel which was
+	// actually connected — see consumeResumeMarker. Without it, a user who
+	// disabled the login item (cfg.Autostart) lost the promised automatic
+	// reconnect after every update.
+	resumed := consumeResumeMarker(cfgDir)
+	if resumed {
+		log.Print("openfortitray: resuming the VPN session that was up before this update restart")
+	}
 	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
-	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart, func() { fyne.Do(a.Connect) })
+	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, func() { fyne.Do(a.Connect) })
 
 	// Background update checker: polls GitHub for a newer release and, if found,
 	// surfaces a one-click "Update … & Restart" item on the tray. Fully best-effort

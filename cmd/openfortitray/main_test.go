@@ -245,6 +245,48 @@ func TestSelfHealWithoutAutostartReapsButDoesNotConnect(t *testing.T) {
 	}
 }
 
+// shouldResumeAfterUpdate must reflect whether the tunnel was actually
+// connected, not merely "not disconnected" or "an update happened" — an
+// update declined or applied with no active session must not fabricate a
+// reconnect on the next launch.
+func TestShouldResumeAfterUpdate(t *testing.T) {
+	tests := []struct {
+		state tunnel.State
+		want  bool
+	}{
+		{tunnel.Connected, true},
+		{tunnel.Disconnected, false},
+		{tunnel.Connecting, false},
+		{tunnel.Reconnecting, false},
+		{tunnel.Error, false},
+	}
+	for _, tt := range tests {
+		a := &app{lastNotified: tt.state}
+		if got := a.shouldResumeAfterUpdate(); got != tt.want {
+			t.Errorf("lastNotified=%v: shouldResumeAfterUpdate() = %v, want %v", tt.state, got, tt.want)
+		}
+	}
+}
+
+// The resume marker is a one-shot: finishUpdate writes it, the next launch
+// must see it exactly once and then behave as if it were never there.
+func TestResumeMarkerRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	if consumeResumeMarker(dir) {
+		t.Fatal("consumeResumeMarker on an empty dir = true, want false")
+	}
+	if err := writeResumeMarker(dir); err != nil {
+		t.Fatalf("writeResumeMarker: %v", err)
+	}
+	if !consumeResumeMarker(dir) {
+		t.Fatal("consumeResumeMarker after writeResumeMarker = false, want true")
+	}
+	if consumeResumeMarker(dir) {
+		t.Fatal("consumeResumeMarker fired a second time; the marker must be one-shot")
+	}
+}
+
 // newCookieTestApp builds an app wired to an in-memory credstore fake and a
 // stubbed SAML flow that hands out FRESH-1, FRESH-2, … on each call, so the
 // cache-first auth flow is exercised without a real keychain or a live gateway.
@@ -340,6 +382,59 @@ func TestAuthenticateSkipsStoreWhenRememberOff(t *testing.T) {
 	// The pre-existing stored cookie must be left untouched (never overwritten).
 	if stored, _ := mem.Get(cookieKey("vpn.example.com")); stored != "STORED-COOKIE" {
 		t.Errorf("stored cookie = %q; remember-off must not write", stored)
+	}
+}
+
+// A keychain that is temporarily busy (credstore.ErrBusy — e.g. the macOS login
+// keychain mid-unlock at login) must be retried, not treated as a miss: the
+// stored cookie is still there, the store just cannot answer yet.
+func TestAuthenticateRetriesOnBusyStoreThenReuses(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, mem, saml := newCookieTestApp(prof)
+	a.cookieRetryInterval = time.Millisecond
+	a.cookieRetryWindow = time.Second
+	mem.Set(cookieKey("vpn.example.com"), "STORED-COOKIE")
+
+	var calls int
+	real := a.cookieGet
+	a.cookieGet = func(key string) (string, error) {
+		calls++
+		if calls < 3 {
+			return "", credstore.ErrBusy
+		}
+		return real(key)
+	}
+
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "STORED-COOKIE" {
+		t.Errorf("cookie = %q, want STORED-COOKIE", got)
+	}
+	if calls != 3 {
+		t.Errorf("cookieGet called %d times, want 3 (two busy + one success)", calls)
+	}
+	if *saml != 0 {
+		t.Errorf("SAML ran %d times; a busy-then-valid store must open no browser", *saml)
+	}
+}
+
+// A store that never stops reporting busy must eventually give up and fall
+// back to SAML rather than hanging or looping forever.
+func TestAuthenticateGivesUpOnPermanentlyBusyStore(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, _, saml := newCookieTestApp(prof)
+	a.cookieRetryInterval = time.Millisecond
+	a.cookieRetryWindow = 20 * time.Millisecond
+	a.cookieGet = func(key string) (string, error) { return "", credstore.ErrBusy }
+
+	got, err := a.authenticate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "FRESH-1" || *saml != 1 {
+		t.Errorf("auth = %q (saml=%d), want a fallback SAML run once the retry window elapses", got, *saml)
 	}
 }
 

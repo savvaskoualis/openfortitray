@@ -3,10 +3,64 @@
 package credstore
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
 )
+
+// TestClassifyFindError pins down the three stderr shapes find-generic-password
+// actually produces (verified against the real /usr/bin/security), so a miss, a
+// busy keychain, and any other failure are never confused for one another.
+func TestClassifyFindError(t *testing.T) {
+	tests := []struct {
+		name      string
+		stderr    string
+		wantMiss  bool
+		wantErr   error // sentinel to check with errors.Is; nil means "any non-nil, non-sentinel error"
+		wantNoErr bool
+	}{
+		{
+			name:      "item not found is a clean miss",
+			stderr:    "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n",
+			wantMiss:  true,
+			wantNoErr: true,
+		},
+		{
+			name:     "interaction not allowed is busy, not a miss",
+			stderr:   "security: SecKeychainItemCopyContent: User interaction is not allowed.\n",
+			wantMiss: false,
+			wantErr:  ErrBusy,
+		},
+		{
+			name:     "anything else is a real, surfaced error",
+			stderr:   "security: SecKeychainOpen: The specified keychain could not be found.\n",
+			wantMiss: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			miss, err := classifyFindError([]byte(tt.stderr))
+			if miss != tt.wantMiss {
+				t.Errorf("miss = %v, want %v", miss, tt.wantMiss)
+			}
+			switch {
+			case tt.wantNoErr:
+				if err != nil {
+					t.Errorf("err = %v, want nil", err)
+				}
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("err = %v, want %v", err, tt.wantErr)
+				}
+			default:
+				if err == nil {
+					t.Error("err = nil, want a surfaced error")
+				}
+			}
+		})
+	}
+}
 
 // TestKeychainRoundTrip drives the REAL macOS login keychain. It is gated behind
 // availability: a headless/CI runner with no unlocked login keychain (or no

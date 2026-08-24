@@ -177,6 +177,13 @@ func (a *app) finishUpdate(method update.Method, p update.Prepared, rel *update.
 		_ = xopen.URL(releasesPageURL)
 		return
 	}
+	// If the tunnel was actually up, leave a marker so the next launch resumes it
+	// regardless of the autostart/login-item setting — see shouldResumeAfterUpdate.
+	if a.shouldResumeAfterUpdate() {
+		if err := writeResumeMarker(a.cfgDir); err != nil {
+			log.Printf("update: could not write resume marker: %v", err)
+		}
+	}
 	// The detached updater is now waiting for this process to exit — quit gracefully
 	// so the tunnel is torn down before the upgrade replaces the app.
 	fyne.Do(a.Quit)
