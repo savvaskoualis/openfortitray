@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2/test"
+
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
@@ -99,6 +101,72 @@ func TestConnectWithGatewayStartsSupervisor(t *testing.T) {
 	case <-authCalled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("supervisor never started authenticating")
+	}
+}
+
+// wantConnected is what onSystemWake consults (see its doc comment for why it is
+// a separate atomic rather than reading lastNotified). Connect must set it and
+// Disconnect must clear it, independent of whether the dial actually succeeds.
+func TestWantConnectedTracksConnectAndDisconnect(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	if a.wantConnected.Load() {
+		t.Fatal("wantConnected must start false")
+	}
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+	if !a.wantConnected.Load() {
+		t.Error("wantConnected must be true once Connect has started the supervisor")
+	}
+	a.Disconnect()
+	if a.wantConnected.Load() {
+		t.Error("wantConnected must be false once Disconnect is called")
+	}
+}
+
+// A wake with nothing to resume (never connected, or already disconnected) must
+// not dial — a wake notification arriving while the user is deliberately
+// disconnected must never surprise them with a connection attempt.
+func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
+	test.NewApp()
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.onSystemWake()
+
+	select {
+	case <-authCalled:
+		t.Error("onSystemWake dialed despite wantConnected being false")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// The real case: connected before sleep, so a wake must force a fresh
+// Disconnect+Connect rather than trust a tunnel that may have died silently
+// while the machine slept.
+func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
+	test.NewApp()
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+
+	a.onSystemWake()
+
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onSystemWake did not force a fresh reconnect")
+	}
+	if !a.wantConnected.Load() {
+		t.Error("wantConnected must still be true after a wake-forced reconnect")
 	}
 }
 

@@ -124,6 +124,12 @@ type app struct {
 	// is crossed between the UI goroutine (reset) and the supervisor's (auth), so
 	// it is atomic.
 	storedCookieTried atomic.Bool
+	// wantConnected records whether the app currently wants the tunnel up: true
+	// from startTunnel, false from Disconnect. It exists so onSystemWake (called
+	// from an OS thread, never the pump goroutine that owns lastNotified) has a
+	// race-free answer to "should this reconnect" without touching pump-goroutine-
+	// only state.
+	wantConnected atomic.Bool
 	// cookieGet/cookieSet/cookieDelete are the credstore seam. They default to the
 	// package funcs in main(); tests substitute an in-memory fake so the cache-first
 	// flow is exercised without touching the real keychain. samlAuth is the SAML
@@ -241,7 +247,32 @@ func (a *app) startTunnel() {
 	// supervisor's first authFn call reads it. A later re-mint within this same
 	// Connect (gateway rejected the stored cookie) finds the flag set and runs SAML.
 	a.storedCookieTried.Store(false)
+	a.wantConnected.Store(true)
 	a.sup.Connect()
+}
+
+// onSystemWake forces a fresh reconnect after the OS reports the machine resumed
+// from sleep — see watchSystemSleep. It exists because openconnect's own dead-peer
+// detection is comparatively slow (this gateway explicitly disables openconnect's
+// self-managed reconnect, so a stale post-sleep tunnel is only caught once a
+// keepalive round trip times out), which can leave the tray looking "Connected" to
+// a session that has been dead since before the laptop went to sleep. Forcing an
+// immediate Disconnect+Connect is exactly what the tray's own Disconnect-then-
+// Connect already does when a user does it manually — this only automates that.
+//
+// wantConnected, not lastNotified, answers "was this connected": lastNotified is
+// documented pump-goroutine-only, and the OS delivers this callback on its own
+// thread (a Cocoa notification queue, a Windows callback thread, or the D-Bus
+// goroutine) — never the pump.
+func (a *app) onSystemWake() {
+	if !a.wantConnected.Load() {
+		return
+	}
+	log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
+	fyne.DoAndWait(func() {
+		a.Disconnect()
+		a.Connect()
+	})
 }
 
 // cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
@@ -395,7 +426,10 @@ func resolveBundledOpenconnect(configured, exeDir string, exists func(string) bo
 	return configured
 }
 
-func (a *app) Disconnect()            { a.sup.Disconnect() }
+func (a *app) Disconnect() {
+	a.wantConnected.Store(false)
+	a.sup.Disconnect()
+}
 func (a *app) AutostartEnabled() bool { return autostart.IsEnabled() }
 func (a *app) LogPath() string        { return a.logPath }
 
@@ -1466,6 +1500,14 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go a.watchSignals(sigs, func() { fyne.Do(a.fyneApp.Quit) })
+
+	// Sleep/wake-driven reconnect: a laptop resuming from sleep is the one drop
+	// openconnect's own dead-peer detection is slowest to notice (this gateway
+	// disables openconnect's self-managed reconnect entirely — see
+	// onSystemWake). watchSystemSleep is a native per-OS hook (NSWorkspace on
+	// macOS, PowerRegisterSuspendResumeNotification on Windows, logind's
+	// PrepareForSleep over D-Bus on Linux); onSystemWake decides whether to act.
+	watchSystemSleep(a.onSystemWake)
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a
