@@ -54,6 +54,22 @@ const (
 	AuthCert AuthMethod = "cert"
 )
 
+// Backend selects which VPN protocol a profile dials. AuthSSL (openconnect,
+// wired into the runtime today) or AuthIPsec (strongSwan — schema only,
+// not yet wired; see internal/tunnel and the IPsec design doc).
+type Backend string
+
+const (
+	// BackendSSL is openconnect's FortiGate SSL-VPN protocol — the only
+	// backend actually implemented today.
+	BackendSSL Backend = "ssl"
+	// BackendIPsec is FortiGate's IPsec remote-access mode. Forward-designed
+	// in the schema; connecting with it is refused with a clear message
+	// (see internal/settings' updateAuthNote/authNoteText) until the
+	// strongSwan runtime exists.
+	BackendIPsec Backend = "ipsec"
+)
+
 // AuthConfig carries the auth method and its non-secret parameters. A password
 // is NEVER stored here; if password auth is ever implemented the secret goes to
 // the OS keychain, not config.json.
@@ -89,8 +105,9 @@ type Profile struct {
 	CustomPort bool   `json:"custom_port"` // FortiClient EnableCustomPort
 	SAMLPort   int    `json:"saml_port"`   // default 8020
 
-	Auth  AuthConfig `json:"auth"`
-	Realm string     `json:"realm,omitempty"`
+	Auth    AuthConfig `json:"auth"`
+	Backend Backend    `json:"backend"`
+	Realm   string     `json:"realm,omitempty"`
 
 	DualStack  bool       `json:"dual_stack"`
 	DTLS       bool       `json:"dtls"`       // default true (PreferDtlsTunnel)
@@ -122,6 +139,7 @@ func defaultProfile() Profile {
 		Port:            10443,
 		SAMLPort:        8020,
 		Auth:            AuthConfig{Method: AuthSAML},
+		Backend:         BackendSSL,
 		DTLS:            true,
 		ServerCert:      ServerCert{Mode: CertWarn},
 		RememberSession: true,
@@ -156,6 +174,9 @@ func normalizeProfile(p *Profile) {
 	}
 	if p.Auth.Method == "" {
 		p.Auth.Method = AuthSAML
+	}
+	if p.Backend == "" {
+		p.Backend = BackendSSL
 	}
 	if p.ServerCert.Mode == "" {
 		p.ServerCert.Mode = CertWarn

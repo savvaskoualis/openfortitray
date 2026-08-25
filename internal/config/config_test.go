@@ -147,6 +147,26 @@ func TestMigrate(t *testing.T) {
 			raw:     `{not json`,
 			wantErr: true,
 		},
+		{
+			name:         "backend defaults to ssl when omitted",
+			raw:          `{"schemaVersion":3,"activeProfile":"A","profiles":[{"name":"A","gateway":"a"}]}`,
+			wantUpgraded: false,
+			check: func(t *testing.T, c *Config) {
+				if c.Profiles[0].Backend != BackendSSL {
+					t.Errorf("backend = %q, want %q when omitted", c.Profiles[0].Backend, BackendSSL)
+				}
+			},
+		},
+		{
+			name:         "explicit backend ipsec is preserved",
+			raw:          `{"schemaVersion":3,"activeProfile":"A","profiles":[{"name":"A","gateway":"a","backend":"ipsec"}]}`,
+			wantUpgraded: false,
+			check: func(t *testing.T, c *Config) {
+				if c.Profiles[0].Backend != BackendIPsec {
+					t.Errorf("backend = %q, want %q when explicitly set", c.Profiles[0].Backend, BackendIPsec)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -324,6 +344,12 @@ func TestGatewayURL(t *testing.T) {
 	p := &Profile{Gateway: "vpn.example.com", Port: 10443}
 	if got := p.GatewayURL(); got != "https://vpn.example.com:10443" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNewProfileDefaultsToSSLBackend(t *testing.T) {
+	if defaultProfile().Backend != BackendSSL {
+		t.Errorf("defaultProfile().Backend = %q, want %q", defaultProfile().Backend, BackendSSL)
 	}
 }
 
