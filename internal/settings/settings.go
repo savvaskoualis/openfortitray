@@ -76,11 +76,14 @@ type Controller struct {
 	authSelect    *widget.Select
 	authNote      *widget.Label
 	backendSelect *widget.Select
-	// The rows that appear and disappear with the chosen auth method, each in its
-	// own container so hiding one reclaims its space as well as its label (see row).
-	authNoteRow *fyne.Container
-	autoConnect *widget.Check
-	keepAlive   *widget.Check
+	backendNote   *widget.Label
+	// The rows that appear and disappear with the chosen auth method / backend,
+	// each in its own container so hiding one reclaims its space as well as its
+	// label (see row).
+	authNoteRow    *fyne.Container
+	backendNoteRow *fyne.Container
+	autoConnect    *widget.Check
+	keepAlive      *widget.Check
 
 	// Advanced tab.
 	dualStack       *widget.Check
@@ -327,15 +330,19 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 			return
 		}
 		c.work.Profiles[c.sel].Backend = backendFromLabel(label)
-		c.updateAuthNote()
+		c.updateBackendNote()
 	})
+	c.backendNote = widget.NewLabel("")
+	c.backendNote.Importance = widget.WarningImportance
 
-	// Auth sub-fields. Only SAML is wired into the runtime; these are shown so
-	// the roadmap is visible but kept disabled (updateAuthNote toggles them), and
-	// Save refuses to activate a non-SAML profile. They still round-trip to the
-	// config so the shape is forward-designed.
+	// Auth/backend sub-fields. Only SSL+SAML is wired into the runtime; these are
+	// shown so the roadmap is visible but kept disabled (updateAuthNote and
+	// updateBackendNote toggle them), and Save refuses to activate an
+	// unsupported backend or auth method. They still round-trip to the config so
+	// the shape is forward-designed.
 
 	c.authNoteRow = c.row("", c.authNote)
+	c.backendNoteRow = c.row("", c.backendNote)
 
 	c.autoConnect = widget.NewCheck("Auto-connect at login", func(on bool) {
 		if c.loading {
@@ -359,17 +366,31 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	// one column. The grouping is the whole change: a flat twelve-row form gives a
 	// reader no way to tell which fields belong together, and "Realm" next to
 	// "Auto-connect at login" implies a relationship that does not exist.
+	//
+	// Connection is built from group (not the section helper) so the IPsec note
+	// can sit right under Protocol, the control that triggers it, the same way
+	// Authentication already mixes a form with a conditional row below it. Using
+	// section here would only accept FormItems and force the note two rows away
+	// from the field it explains.
+	connectionForm := widget.NewForm(
+		widget.NewFormItem("Profile name", c.nameEntry),
+		widget.NewFormItem("Gateway host", c.gatewayEntry),
+		widget.NewFormItem("Port", narrow(c.portEntry, 150)),
+		widget.NewFormItem("Protocol", c.backendSelect),
+	)
+	c.forms = append(c.forms, connectionForm)
+
 	return sections(
-		c.section("Connection",
-			widget.NewFormItem("Profile name", c.nameEntry),
-			widget.NewFormItem("Gateway host", c.gatewayEntry),
-			widget.NewFormItem("Port", narrow(c.portEntry, 150)),
-			widget.NewFormItem("Protocol", c.backendSelect),
+		c.group("Connection",
+			connectionForm,
+			// The note row sits outside that form, in its own container, so the
+			// group closes up under SSL instead of leaving a hole under Protocol.
+			c.backendNoteRow,
 		),
 		c.group("Authentication",
 			c.row("Method", c.authSelect),
-			// The three conditional rows sit outside that form, each in its own
-			// container, so the group closes up under SAML instead of leaving a hole.
+			// The conditional row sits outside that form, in its own container,
+			// so the group closes up under SAML instead of leaving a hole.
 			c.authNoteRow,
 		),
 		c.section("Startup",
@@ -589,8 +610,9 @@ func (c *Controller) selectTab(tab string) {
 // it. Entries are marked via AlwaysShowValidationError with an explicit error,
 // so even the empty-gateway case — which the entry's own validator deliberately
 // accepts (an unconfigured profile is savable) — still shows as invalid. The
-// auth control is a Select with no error affordance, so it is only focused; the
-// banner carries the "choose SAML / SSO" instruction.
+// backend and auth controls are Selects with no error affordance, so they are
+// only focused; the banner carries the "choose SSL VPN" / "choose SAML / SSO"
+// instruction.
 func (c *Controller) markField(issue *Issue) {
 	var focus fyne.Focusable
 	switch issue.Field {
@@ -600,6 +622,8 @@ func (c *Controller) markField(issue *Issue) {
 	case FieldPort:
 		markEntryInvalid(c.portEntry, "enter a port between 1 and 65535")
 		focus = c.portEntry
+	case FieldBackend:
+		focus = c.backendSelect
 	case FieldAuth:
 		focus = c.authSelect
 	case FieldServerCert:
@@ -654,14 +678,31 @@ func (c *Controller) loadProfile(i int) {
 	c.helperPath.SetText(c.work.HelperPath)
 
 	c.loading = false
+	c.updateBackendNote()
 	c.updateAuthNote()
 }
 
+// updateAuthNote refreshes the auth-method warning shown next to the Method
+// select. This is only the visual affordance shown before the user even tries
+// to Save; the real gate is validateAuthSupported, which Save and Connect both
+// run regardless of what this note says.
 func (c *Controller) updateAuthNote() {
 	p := c.work.Profiles[c.sel]
-	text := authNoteText(p.Backend, p.Auth.Method)
+	text := authMethodNoteText(p.Auth.Method)
 	c.authNote.SetText(text)
 	show(c.authNoteRow, text != "")
+	c.relayout()
+}
+
+// updateBackendNote refreshes the IPsec warning shown next to the Protocol
+// select. This is only the visual affordance shown before the user even tries
+// to Save; the real gate is validateBackendSupported, which Save and Connect
+// both run regardless of what this note says.
+func (c *Controller) updateBackendNote() {
+	p := c.work.Profiles[c.sel]
+	text := backendNoteText(p.Backend)
+	c.backendNote.SetText(text)
+	show(c.backendNoteRow, text != "")
 	c.relayout()
 }
 

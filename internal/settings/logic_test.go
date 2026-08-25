@@ -361,6 +361,11 @@ func TestFirstConnectIssue(t *testing.T) {
 			wantTab: TabBasic, wantField: FieldPort, wantMsgSub: "port",
 		},
 		{
+			name:    "unsupported ipsec backend routes to Basic backend",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}},
+			wantTab: TabBasic, wantField: FieldBackend, wantMsgSub: "IPsec is not yet supported",
+		},
+		{
 			name:    "unsupported password auth routes to Basic auth",
 			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Auth: config.AuthConfig{Method: config.AuthPassword}},
 			wantTab: TabBasic, wantField: FieldAuth, wantMsgSub: "SAML",
@@ -492,6 +497,51 @@ func TestValidateAuthGating(t *testing.T) {
 	}
 }
 
+// Save must refuse to activate a profile whose backend has no runtime, and
+// must accept an SSL active profile even if a non-active one is IPsec.
+func TestValidateBackendGating(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *config.Config
+		wantErr bool
+	}{
+		{
+			name: "active ssl profile passes",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{{Name: "Work", Backend: config.BackendSSL, Auth: config.AuthConfig{Method: config.AuthSAML}}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "active ipsec profile is rejected",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{{Name: "Work", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "a non-active ipsec profile does not block Save",
+			cfg: &config.Config{
+				ActiveProfile: "Work", OpenconnectPath: "openconnect",
+				Profiles: []config.Profile{
+					{Name: "Work", Backend: config.BackendSSL, Auth: config.AuthConfig{Method: config.AuthSAML}},
+					{Name: "Lab", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateConfig(tc.cfg); (err != nil) != tc.wantErr {
+				t.Errorf("validateConfig err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // The Pin server-cert mode requires a valid fingerprint; the other modes ignore
 // the pin field entirely.
 func TestValidateConfigServerCertPin(t *testing.T) {
@@ -576,29 +626,56 @@ func TestAuthLabelRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAuthNoteText(t *testing.T) {
+func TestAuthMethodNoteText(t *testing.T) {
 	tests := []struct {
-		name    string
-		backend config.Backend
-		method  config.AuthMethod
-		want    string
+		name   string
+		method config.AuthMethod
+		want   string
 	}{
-		{"ssl + saml is the only wired combination", config.BackendSSL, config.AuthSAML, ""},
-		{"ssl + password not yet supported", config.BackendSSL, config.AuthPassword,
+		{"saml is the only wired method", config.AuthSAML, ""},
+		{"password not yet supported", config.AuthPassword,
 			"(username/password auth not yet supported — use SAML/SSO)"},
-		{"ssl + cert not yet supported", config.BackendSSL, config.AuthCert,
+		{"cert not yet supported", config.AuthCert,
 			"(client-certificate auth not yet supported — use SAML/SSO)"},
-		{"ipsec is not yet supported regardless of auth method", config.BackendIPsec, config.AuthPassword,
-			"(IPsec is not yet supported)"},
-		{"ipsec overrides even a saml auth method", config.BackendIPsec, config.AuthSAML,
-			"(IPsec is not yet supported)"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := authNoteText(tc.backend, tc.method); got != tc.want {
-				t.Errorf("authNoteText(%v, %v) = %q, want %q", tc.backend, tc.method, got, tc.want)
+			if got := authMethodNoteText(tc.method); got != tc.want {
+				t.Errorf("authMethodNoteText(%v) = %q, want %q", tc.method, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBackendNoteText(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend config.Backend
+		want    string
+	}{
+		{"ssl is the only wired backend", config.BackendSSL, ""},
+		{"ipsec is not yet supported", config.BackendIPsec, "(IPsec is not yet supported)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backendNoteText(tc.backend); got != tc.want {
+				t.Errorf("backendNoteText(%v) = %q, want %q", tc.backend, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBackendLabelRoundTrip(t *testing.T) {
+	for _, b := range []config.Backend{config.BackendSSL, config.BackendIPsec} {
+		if got := backendFromLabel(backendLabel(b)); got != b {
+			t.Errorf("backendFromLabel(backendLabel(%q)) = %q, want round-trip", b, got)
+		}
+	}
+	if got := backendLabel(config.Backend("bogus")); got != backendSSLLabel {
+		t.Errorf("unknown backend should fall back to SSL label, got %q", got)
+	}
+	if got := backendFromLabel("bogus label"); got != config.BackendSSL {
+		t.Errorf("unknown label should fall back to SSL backend, got %q", got)
 	}
 }
 

@@ -65,8 +65,8 @@ const (
 	BackendSSL Backend = "ssl"
 	// BackendIPsec is FortiGate's IPsec remote-access mode. Forward-designed
 	// in the schema; connecting with it is refused with a clear message
-	// (see internal/settings' updateAuthNote/authNoteText) until the
-	// strongSwan runtime exists.
+	// (see internal/settings' validateBackendSupported/backendNoteText) until
+	// the strongSwan runtime exists.
 	BackendIPsec Backend = "ipsec"
 )
 

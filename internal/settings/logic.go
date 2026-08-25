@@ -82,6 +82,15 @@ const (
 	authCertLabel = "Client certificate"
 )
 
+// Backend labels shown in the Protocol Select. Only SSL (openconnect) is wired
+// into the runtime today; IPsec is rendered so the config shape is
+// forward-designed, but choosing it shows a "(not yet supported)" note and Save
+// refuses to activate it (validateBackendSupported).
+const (
+	backendSSLLabel   = "SSL VPN"
+	backendIPsecLabel = "IPsec"
+)
+
 // authLabels is the Select's option list, in display order.
 var authLabels = []string{authSAMLLabel, authPassLabel, authCertLabel}
 
@@ -111,35 +120,44 @@ func authMethod(label string) config.AuthMethod {
 }
 
 // backendLabels is the Protocol Select's option list, in display order.
-var backendLabels = []string{"SSL VPN", "IPsec"}
+var backendLabels = []string{backendSSLLabel, backendIPsecLabel}
 
 // backendLabel maps a stored backend to its Select label.
 func backendLabel(b config.Backend) string {
 	if b == config.BackendIPsec {
-		return "IPsec"
+		return backendIPsecLabel
 	}
-	return "SSL VPN"
+	return backendSSLLabel
 }
 
 // backendFromLabel maps a Select label back to a stored backend.
 func backendFromLabel(label string) config.Backend {
-	if label == "IPsec" {
+	if label == backendIPsecLabel {
 		return config.BackendIPsec
 	}
 	return config.BackendSSL
 }
 
-// authNoteText returns the warning text for a backend/auth-method
-// combination, or "" when the combination is the one wired into the runtime
-// (SSL + SAML). Backend takes precedence: an IPsec profile is not yet
-// supported no matter what its Auth.Method says, and telling the user to
-// "use SAML/SSO" — the SSL-backend message — would be actively wrong advice
-// for a gateway that requires IPsec. Pure, so it is testable without a
-// widget tree.
-func authNoteText(backend config.Backend, method config.AuthMethod) string {
+// backendNoteText returns the warning text for a profile's backend, or "" when
+// the backend is the one wired into the runtime (SSL). This is only the visual
+// affordance shown next to the Protocol select before the user even tries to
+// Save; the actual gate is validateBackendSupported, which Save and Connect
+// both run regardless of what this text says. Pure, so it is testable without
+// a widget tree.
+func backendNoteText(backend config.Backend) string {
 	if backend == config.BackendIPsec {
 		return "(IPsec is not yet supported)"
 	}
+	return ""
+}
+
+// authMethodNoteText returns the warning text for a profile's auth method, or
+// "" when the method is the one wired into the runtime (SAML). Like
+// backendNoteText, this is only the visual affordance shown next to the
+// Method select before the user even tries to Save; the actual gate is
+// validateAuthSupported, which Save and Connect both run regardless of what
+// this text says. Pure, so it is testable without a widget tree.
+func authMethodNoteText(method config.AuthMethod) string {
 	switch method {
 	case config.AuthPassword:
 		return "(username/password auth not yet supported — use SAML/SSO)"
@@ -351,6 +369,20 @@ func openconnectPathEntryValidator(s string) error {
 	return validateOpenconnectPath(s)
 }
 
+// validateBackendSupported gates Save on the backend of the profile that will
+// actually be dialed. Only SSL (openconnect) is wired into the runtime today;
+// IPsec is forward-designed in the schema but has no strongSwan runtime behind
+// it yet — refuse it at Save with a message that names the fix, exactly like
+// validateAuthSupported does for the still-unimplemented auth methods.
+//
+// When IPsec ships, delete this function and its two call sites below.
+func validateBackendSupported(c *config.Config) error {
+	if c.Active().Backend == config.BackendIPsec {
+		return errors.New("IPsec is not yet supported — use SSL VPN")
+	}
+	return nil
+}
+
 // validateAuthSupported gates Save on the auth method of the profile that will
 // actually be dialed (the active one). Only SAML/SSO is wired into the runtime
 // today (internal/auth); the other methods are forward-designed in the schema
@@ -480,7 +512,13 @@ func validateConfig(c *config.Config) error {
 		return fmt.Errorf("openconnect path: %w", err)
 	}
 	// The active profile is the one that will be dialed; refuse to save a config
-	// that would try to use an auth method with no runtime behind it.
+	// that would try to use a backend or auth method with no runtime behind it.
+	// Backend is checked first: it is the more fundamental choice (an IPsec
+	// gateway needs a runtime this app does not have at all, independent of
+	// what its Auth.Method says).
+	if err := validateBackendSupported(c); err != nil {
+		return err
+	}
 	if err := validateAuthSupported(c); err != nil {
 		return err
 	}
@@ -500,6 +538,7 @@ const (
 const (
 	FieldGateway    = "gateway"
 	FieldPort       = "port"
+	FieldBackend    = "backend"
 	FieldAuth       = "auth"
 	FieldServerCert = "servercert"
 	FieldSplitDNS   = "splitdns"
@@ -520,13 +559,13 @@ type Issue struct {
 // FirstConnectIssue reports the first blocking problem that would stop the
 // active profile from dialing, or nil when it is ready to connect. It inspects
 // only the active profile — the one Connect dials — and reuses the same
-// validators Save runs (validateHost, validatePortValue, validateAuthSupported,
-// validateFingerprint, validateDomain), so the Connect path and Save can never
-// disagree about what "valid" means.
+// validators Save runs (validateHost, validatePortValue, validateBackendSupported,
+// validateAuthSupported, validateFingerprint, validateDomain), so the Connect
+// path and Save can never disagree about what "valid" means.
 //
 // Issues are returned in a fixed, user-facing order so the guidance always
-// points at the most fundamental fix first — gateway, then port, then auth
-// method, then the Advanced-tab settings — and only the first is surfaced
+// points at the most fundamental fix first — gateway, then port, then backend,
+// then auth method, then the Advanced-tab settings — and only the first is surfaced
 // (first-issue-wins), because fixing it and reconnecting re-runs this check for
 // whatever remains.
 func FirstConnectIssue(cfg *config.Config) *Issue {
@@ -549,6 +588,12 @@ func FirstConnectIssue(cfg *config.Config) *Issue {
 	if prof.CustomPort && validatePortValue(prof.Port) != nil {
 		return &Issue{name, TabBasic, FieldPort,
 			"The custom port must be a whole number between 1 and 65535 — fix it in Basic ▸ Port."}
+	}
+
+	// Backend: only SSL is wired into the runtime today.
+	if validateBackendSupported(cfg) != nil {
+		return &Issue{name, TabBasic, FieldBackend,
+			"IPsec is not yet supported — choose SSL VPN in Basic ▸ Protocol."}
 	}
 
 	// Authentication: only SAML / SSO is wired into the runtime today.
