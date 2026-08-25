@@ -122,6 +122,32 @@ func TestCloseHidesRatherThanQuitting(t *testing.T) {
 	}
 }
 
+// Reveal is the one entry point that shows the window; the glass attach
+// must run every time it does, not just the first, since Hide/Reveal is
+// a normal cycle for this window (the tray hides it, Reveal brings it
+// back) and RunNative's handle can only be trusted once a window is
+// actually visible.
+func TestRevealAttachesGlassEveryTime(t *testing.T) {
+	s, _, _ := newShell(t)
+	var calls int
+	s.AttachGlass = func(w fyne.Window) { calls++ }
+
+	s.Reveal(SectionStatus)
+	s.win.Hide()
+	s.Reveal(SectionStatus)
+
+	if calls != 2 {
+		t.Errorf("AttachGlass called %d times across two Reveals, want 2", calls)
+	}
+}
+
+// A nil AttachGlass (the zero value, and every existing shell test's
+// configuration) must not panic Reveal.
+func TestRevealToleratesNilAttachGlass(t *testing.T) {
+	s, _, _ := newShell(t)
+	s.Reveal(SectionStatus) // must not panic
+}
+
 // A section asking for more room must not shrink the window below the height its
 // section needs, and giving up the request must return it.
 func TestHeightRequestRaisesAndReleases(t *testing.T) {

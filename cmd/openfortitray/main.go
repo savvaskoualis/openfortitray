@@ -29,6 +29,7 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/go-gl/glfw/v3.4/glfw"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -695,6 +696,7 @@ func (a *app) reportCheckResult(heading, body string) {
 		if a.quitting.Load() {
 			return
 		}
+		glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
 		w := a.fyneApp.NewWindow("OpenFortiTray Update")
 		w.SetFixedSize(true)
 		w.Resize(fyne.NewSize(420, 200))
@@ -715,6 +717,7 @@ func (a *app) reportCheckResult(heading, body string) {
 			container.NewHBox(layout.NewSpacer(), ok),
 		)))
 		w.Show()
+		attachGlass(w)
 		w.RequestFocus()
 	})
 }
@@ -1453,6 +1456,7 @@ func main() {
 	// arrange, and — once the app grew a Dock icon — an ambiguous answer to "bring
 	// this app up". The controllers still take the window, because dialogs and focus
 	// need one, but they no longer decide what it contains or when it appears.
+	glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
 	win := a.fyneApp.NewWindow("OpenFortiTray")
 	a.win = win
 	a.settings = settings.New(a, win)
@@ -1466,6 +1470,7 @@ func main() {
 		Banner:     a.settings.Banner(),
 		Footer:     a.settings.Footer(),
 	})
+	a.shell.AttachGlass = attachGlass
 	// Settings asks the shell to navigate when a refused Connect points at a field.
 	a.settings.SetNavigator(func(tab string) {
 		if tab == settings.TabAdvanced {

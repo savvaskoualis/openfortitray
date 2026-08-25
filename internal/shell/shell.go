@@ -75,6 +75,12 @@ type Shell struct {
 	// closeRequested is what the window's close button runs.
 	closeRequested func()
 
+	// AttachGlass, when non-nil, is called every time Reveal shows the
+	// window — the app wires this to its platform glass-attach function
+	// (cmd/openfortitray/glass.go). nil is a safe no-op default so shell
+	// package tests never need a real Fyne native window.
+	AttachGlass func(win fyne.Window)
+
 	// extraHeight is a section's request for more room (the activity history), kept
 	// so switching away and back does not forget it.
 	extraHeight float32
@@ -179,6 +185,9 @@ func (s *Shell) Current() Section { return s.current }
 func (s *Shell) Reveal(sec Section) {
 	s.Select(sec)
 	s.win.Show()
+	if s.AttachGlass != nil {
+		s.AttachGlass(s.win)
+	}
 	s.win.RequestFocus()
 }
 

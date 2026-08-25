@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/go-gl/glfw/v3.4/glfw"
 
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
@@ -40,6 +41,7 @@ type updateFlow struct {
 }
 
 func newUpdateFlow(a *app, rel *update.Release) *updateFlow {
+	glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
 	w := a.fyneApp.NewWindow("OpenFortiTray Update")
 	w.SetFixedSize(true)
 	w.Resize(fyne.NewSize(460, 290))
@@ -60,6 +62,7 @@ func (f *updateFlow) start() {
 		f.prepare()
 	}))
 	f.win.Show()
+	attachGlass(f.win)
 	f.win.RequestFocus()
 }
 
