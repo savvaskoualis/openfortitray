@@ -141,17 +141,30 @@ func TestBackgroundIsTranslucentForGlass(t *testing.T) {
 	th := New()
 	for _, v := range []fyne.ThemeVariant{theme.VariantLight, theme.VariantDark} {
 		c := th.Color(theme.ColorNameBackground, v)
-		if _, _, _, a := c.RGBA(); a == 0 || a == 0xffff {
-			t.Errorf("variant %d: background alpha = %d, want partial transparency", v, a>>8)
+		nc, ok := c.(color.NRGBA)
+		if !ok {
+			t.Errorf("variant %d: background is not color.NRGBA, got %T", v, c)
+			continue
+		}
+		if nc.A == 0 || nc.A == 0xff {
+			t.Errorf("variant %d: background alpha = %d, want partial transparency", v, nc.A)
 		}
 	}
-	lr, lg, lb, _ := th.Color(theme.ColorNameBackground, theme.VariantLight).RGBA()
-	if lr>>8 != 0xF6 || lg>>8 != 0xF7 || lb>>8 != 0xF9 {
-		t.Errorf("light background hue changed: got #%02X%02X%02X, want #F6F7F9", lr>>8, lg>>8, lb>>8)
+	lc, ok := th.Color(theme.ColorNameBackground, theme.VariantLight).(color.NRGBA)
+	if !ok {
+		t.Errorf("light background is not color.NRGBA, got %T", th.Color(theme.ColorNameBackground, theme.VariantLight))
+	} else {
+		if lc.R != 0xF6 || lc.G != 0xF7 || lc.B != 0xF9 {
+			t.Errorf("light background hue changed: got #%02X%02X%02X, want #F6F7F9", lc.R, lc.G, lc.B)
+		}
 	}
-	dr, dg, db, _ := th.Color(theme.ColorNameBackground, theme.VariantDark).RGBA()
-	if dr>>8 != 0x16 || dg>>8 != 0x18 || db>>8 != 0x1C {
-		t.Errorf("dark background hue changed: got #%02X%02X%02X, want #16181C", dr>>8, dg>>8, db>>8)
+	dc, ok := th.Color(theme.ColorNameBackground, theme.VariantDark).(color.NRGBA)
+	if !ok {
+		t.Errorf("dark background is not color.NRGBA, got %T", th.Color(theme.ColorNameBackground, theme.VariantDark))
+	} else {
+		if dc.R != 0x16 || dc.G != 0x18 || dc.B != 0x1C {
+			t.Errorf("dark background hue changed: got #%02X%02X%02X, want #16181C", dc.R, dc.G, dc.B)
+		}
 	}
 }
 

@@ -91,7 +91,7 @@ func rgb(v uint32) color.Color {
 // native backdrop attached behind the window (see cmd/openfortitray
 // glass*.go) show through at all.
 func rgba(v uint32, a uint8) color.Color {
-	return color.RGBA{R: uint8(v >> 16), G: uint8(v >> 8), B: uint8(v), A: a}
+	return color.NRGBA{R: uint8(v >> 16), G: uint8(v >> 8), B: uint8(v), A: a}
 }
 
 // The palettes. Neutrals are biased a few points cool rather than being pure
