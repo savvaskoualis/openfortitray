@@ -128,6 +128,31 @@ func TestWantConnectedTracksConnectAndDisconnect(t *testing.T) {
 	}
 }
 
+// startTunnel must thread the active profile's KeepAlive through to the
+// supervisor on every Connect — Settings only edits config.Profile, so this is
+// the one place that setting actually reaches the tunnel.
+func TestStartTunnelThreadsKeepAliveToSupervisor(t *testing.T) {
+	fs := &fakeSupervisor{}
+	a := &app{
+		sup: fs,
+		cfg: &config.Config{
+			ActiveProfile: "P",
+			Profiles:      []config.Profile{{Name: "P", Gateway: "vpn.example.com", KeepAlive: false}},
+		},
+	}
+
+	a.startTunnel()
+	if fs.keepAliveSet() {
+		t.Error("startTunnel must pass the profile's KeepAlive=false through")
+	}
+
+	a.cfg.Profiles[0].KeepAlive = true
+	a.startTunnel()
+	if !fs.keepAliveSet() {
+		t.Error("startTunnel must pass the profile's KeepAlive=true through")
+	}
+}
+
 // A wake with nothing to resume (never connected, or already disconnected) must
 // not dial — a wake notification arriving while the user is deliberately
 // disconnected must never surprise them with a connection attempt.
@@ -202,11 +227,19 @@ type fakeSupervisor struct {
 	connects    int
 	disconnects int
 	waits       int
+	keepAlive   bool
 }
 
 func (f *fakeSupervisor) Connect()                 { f.mu.Lock(); f.connects++; f.mu.Unlock() }
 func (f *fakeSupervisor) Disconnect()              { f.mu.Lock(); f.disconnects++; f.mu.Unlock() }
 func (f *fakeSupervisor) Wait(ctx context.Context) { f.mu.Lock(); f.waits++; f.mu.Unlock() }
+func (f *fakeSupervisor) SetKeepAlive(on bool)     { f.mu.Lock(); f.keepAlive = on; f.mu.Unlock() }
+
+func (f *fakeSupervisor) keepAliveSet() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keepAlive
+}
 
 func (f *fakeSupervisor) counts() (connects, disconnects, waits int) {
 	f.mu.Lock()
@@ -589,8 +622,9 @@ type slowSupervisor struct {
 	done  bool
 }
 
-func (s *slowSupervisor) Connect()    {}
-func (s *slowSupervisor) Disconnect() {}
+func (s *slowSupervisor) Connect()             {}
+func (s *slowSupervisor) Disconnect()          {}
+func (s *slowSupervisor) SetKeepAlive(on bool) {}
 func (s *slowSupervisor) Wait(ctx context.Context) {
 	select {
 	case <-time.After(s.delay):

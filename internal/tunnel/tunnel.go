@@ -106,6 +106,12 @@ type Supervisor struct {
 	cancel context.CancelFunc
 	gen    uint64        // identifies the running loop: stale loops cannot cancel or emit
 	done   chan struct{} // closed when the current loop has fully torn down
+
+	// keepAlive gates whether a drop AFTER the tunnel has been up at least once
+	// this Connect retries at all — see SetKeepAlive. Guarded by mu because
+	// SetKeepAlive is called from the UI goroutine while loop() (a different
+	// goroutine per Connect) reads it.
+	keepAlive bool
 }
 
 func New(authFn func(ctx context.Context) (string, error),
@@ -134,7 +140,35 @@ func New(authFn func(ctx context.Context) (string, error),
 		// spread over that cannot get in, something needs a human — so stop and say so
 		// rather than reopening the browser indefinitely.
 		maxConnectRounds: 4,
+		// Default true: reconnect-after-a-healthy-drop is the existing, long-shipped
+		// behaviour. SetKeepAlive(false) is an explicit opt-out, not the default.
+		keepAlive: true,
 	}
+}
+
+// SetKeepAlive controls whether a drop AFTER the tunnel has been up at least
+// once this Connect is retried at all. true (the default) retries with the
+// existing backoff/re-auth logic, indefinitely, exactly as before this existed.
+// false means a post-healthy drop ends the session immediately (Disconnected,
+// not Reconnecting) rather than fighting to bring it back — the user asked not
+// to. It has no effect before the tunnel has ever come up this Connect: a
+// Connect that has not yet succeeded is governed by maxConnectRounds, not this.
+//
+// Safe to call at any time, including while a loop is running; it takes effect
+// at that loop's next reconnect decision.
+func (s *Supervisor) SetKeepAlive(on bool) {
+	s.mu.Lock()
+	s.keepAlive = on
+	s.mu.Unlock()
+}
+
+// keepAliveEnabled reads keepAlive under the same lock SetKeepAlive writes it
+// with, since loop() (the reader) and SetKeepAlive's caller (the UI goroutine)
+// are different goroutines.
+func (s *Supervisor) keepAliveEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAlive
 }
 
 // emit delivers an event unless a newer loop generation has taken over, so a
@@ -450,6 +484,12 @@ func (s *Supervisor) loop(ctx context.Context, gen uint64, prev, done chan struc
 				s.emit(gen, Error, "couldn't connect — click Connect to try again")
 				return
 			}
+		} else if !s.keepAliveEnabled() {
+			// The tunnel worked at least once this Connect, then dropped, and the
+			// profile has opted out of fighting to bring it back. Disconnected, not
+			// Reconnecting: retryNotified/lastNotified elsewhere key off exactly
+			// this transition to know an episode has genuinely ended.
+			return
 		}
 		s.emit(gen, Reconnecting, friendlyDetail(err))
 		select {

@@ -51,6 +51,7 @@ type supervisor interface {
 	Connect()
 	Disconnect()
 	Wait(ctx context.Context)
+	SetKeepAlive(on bool)
 }
 
 // app adapts the packages to tray.App; it holds no logic of its own.
@@ -248,6 +249,7 @@ func (a *app) startTunnel() {
 	// Connect (gateway rejected the stored cookie) finds the flag set and runs SAML.
 	a.storedCookieTried.Store(false)
 	a.wantConnected.Store(true)
+	a.sup.SetKeepAlive(prof.KeepAlive)
 	a.sup.Connect()
 }
 

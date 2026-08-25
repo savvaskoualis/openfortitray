@@ -1688,6 +1688,54 @@ func TestGiveUpDoesNotApplyAfterAHealthySession(t *testing.T) {
 	}
 }
 
+// SetKeepAlive(false) is the opt-out: once a session has been healthy, a later
+// drop must end the episode (Disconnected) rather than retry, and it must not
+// keep dialing.
+func TestKeepAliveOffStopsRetryingAfterAHealthySession(t *testing.T) {
+	events := make(chan Event, 256)
+	c := collect(events)
+	defer c.close()
+
+	auth := func(ctx context.Context) (string, error) { return "C", nil }
+	var runs atomic.Int32
+	run := func(ctx context.Context, cookie string, connected func(string)) error {
+		if runs.Add(1) == 1 {
+			connected("10.0.0.5") // one healthy bring-up
+			return errors.New("network blip")
+		}
+		t.Error("kept retrying after a healthy session with keepAlive off")
+		return errors.New("must not be reached")
+	}
+	s := New(auth, run, events)
+	s.backoffBase = 5 * time.Millisecond
+	s.backoffMax = 5 * time.Millisecond
+	s.SetKeepAlive(false)
+	s.Connect()
+	defer s.Disconnect()
+
+	c.waitFor(t, Connected, 2*time.Second)
+	ev := c.waitFor(t, Disconnected, 2*time.Second)
+	if ev.Detail != "" {
+		t.Errorf("Disconnected detail = %q, want empty (this is an opt-out, not an error)", ev.Detail)
+	}
+
+	// Must not keep dialing after the opt-out took effect.
+	time.Sleep(60 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Errorf("run calls = %d, want exactly 1 (no retry after keepAlive-off drop)", got)
+	}
+}
+
+// keepAlive must default to true: this is an opt-out, not an opt-in, and every
+// pre-existing reconnect-after-drop test (e.g.
+// TestGiveUpDoesNotApplyAfterAHealthySession) relies on that default holding.
+func TestKeepAliveDefaultsToTrue(t *testing.T) {
+	s := New(nil, nil, nil)
+	if !s.keepAliveEnabled() {
+		t.Error("a freshly constructed Supervisor must default to keepAlive=true")
+	}
+}
+
 // The direct (Windows) path must hand openconnect the cookie WHOLE, in a file:
 // --cookie-on-stdin truncates at 1024 bytes and this gateway's cookies exceed
 // that, which showed up only as "Cookie was rejected by server".
