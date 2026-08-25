@@ -110,6 +110,46 @@ func authMethod(label string) config.AuthMethod {
 	}
 }
 
+// backendLabels is the Protocol Select's option list, in display order.
+var backendLabels = []string{"SSL VPN", "IPsec"}
+
+// backendLabel maps a stored backend to its Select label.
+func backendLabel(b config.Backend) string {
+	if b == config.BackendIPsec {
+		return "IPsec"
+	}
+	return "SSL VPN"
+}
+
+// backendFromLabel maps a Select label back to a stored backend.
+func backendFromLabel(label string) config.Backend {
+	if label == "IPsec" {
+		return config.BackendIPsec
+	}
+	return config.BackendSSL
+}
+
+// authNoteText returns the warning text for a backend/auth-method
+// combination, or "" when the combination is the one wired into the runtime
+// (SSL + SAML). Backend takes precedence: an IPsec profile is not yet
+// supported no matter what its Auth.Method says, and telling the user to
+// "use SAML/SSO" — the SSL-backend message — would be actively wrong advice
+// for a gateway that requires IPsec. Pure, so it is testable without a
+// widget tree.
+func authNoteText(backend config.Backend, method config.AuthMethod) string {
+	if backend == config.BackendIPsec {
+		return "(IPsec is not yet supported)"
+	}
+	switch method {
+	case config.AuthPassword:
+		return "(username/password auth not yet supported — use SAML/SSO)"
+	case config.AuthCert:
+		return "(client-certificate auth not yet supported — use SAML/SSO)"
+	default:
+		return ""
+	}
+}
+
 // Server-certificate mode labels shown in the Advanced tab's RadioGroup.
 //
 // The old "Trust (accept invalid)" option was removed. In that mode the
