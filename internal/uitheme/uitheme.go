@@ -85,6 +85,15 @@ func rgb(v uint32) color.Color {
 	return color.NRGBA{R: uint8(v >> 16), G: uint8(v >> 8), B: uint8(v), A: 0xff}
 }
 
+// rgba is rgb with an explicit alpha, used only for ColorNameBackground:
+// Fyne's GL painter clears the framebuffer with this color every frame
+// (internal/painter/gl painter.go Clear()), so its alpha is what lets a
+// native backdrop attached behind the window (see cmd/openfortitray
+// glass*.go) show through at all.
+func rgba(v uint32, a uint8) color.Color {
+	return color.RGBA{R: uint8(v >> 16), G: uint8(v >> 8), B: uint8(v), A: a}
+}
+
 // The palettes. Neutrals are biased a few points cool rather than being pure
 // grey — a pure mid-grey is the thing that reads as unconsidered.
 //
@@ -94,7 +103,7 @@ func rgb(v uint32) color.Color {
 // never has to compete with "the tunnel is up".
 var (
 	lightColors = map[fyne.ThemeColorName]color.Color{
-		theme.ColorNameBackground:        rgb(0xF6F7F9),
+		theme.ColorNameBackground:        rgba(0xF6F7F9, 0x40),
 		theme.ColorNameHeaderBackground:  rgb(0xFFFFFF),
 		theme.ColorNameMenuBackground:    rgb(0xFFFFFF),
 		theme.ColorNameOverlayBackground: rgb(0xFFFFFF),
@@ -118,7 +127,7 @@ var (
 	}
 
 	darkColors = map[fyne.ThemeColorName]color.Color{
-		theme.ColorNameBackground:        rgb(0x16181C),
+		theme.ColorNameBackground:        rgba(0x16181C, 0x40),
 		theme.ColorNameHeaderBackground:  rgb(0x1E2128),
 		theme.ColorNameMenuBackground:    rgb(0x1E2128),
 		theme.ColorNameOverlayBackground: rgb(0x1E2128),

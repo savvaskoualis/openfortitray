@@ -94,7 +94,6 @@ func TestColorsMatchTheSpec(t *testing.T) {
 		name        fyne.ThemeColorName
 		light, dark string
 	}{
-		{theme.ColorNameBackground, "#F6F7F9", "#16181C"},
 		{theme.ColorNameHeaderBackground, "#FFFFFF", "#1E2128"},
 		{theme.ColorNameMenuBackground, "#FFFFFF", "#1E2128"},
 		{theme.ColorNameOverlayBackground, "#FFFFFF", "#1E2128"},
@@ -129,6 +128,30 @@ func TestHoverIsTranslucent(t *testing.T) {
 		if _, _, _, a := c.RGBA(); a == 0 || a == 0xffff {
 			t.Errorf("variant %d: hover alpha = %d, want partial transparency", v, a>>8)
 		}
+	}
+}
+
+// ColorNameBackground drives the GL clear-color alpha Fyne paints every
+// frame (internal/painter/gl painter.go Clear()); it must be translucent
+// for a native backdrop attached behind the window to show through at
+// all, in both variants, while keeping the same hue as before so the
+// fallback (no native backdrop available) still reads as this app's
+// palette rather than a random grey.
+func TestBackgroundIsTranslucentForGlass(t *testing.T) {
+	th := New()
+	for _, v := range []fyne.ThemeVariant{theme.VariantLight, theme.VariantDark} {
+		c := th.Color(theme.ColorNameBackground, v)
+		if _, _, _, a := c.RGBA(); a == 0 || a == 0xffff {
+			t.Errorf("variant %d: background alpha = %d, want partial transparency", v, a>>8)
+		}
+	}
+	lr, lg, lb, _ := th.Color(theme.ColorNameBackground, theme.VariantLight).RGBA()
+	if lr>>8 != 0xF6 || lg>>8 != 0xF7 || lb>>8 != 0xF9 {
+		t.Errorf("light background hue changed: got #%02X%02X%02X, want #F6F7F9", lr>>8, lg>>8, lb>>8)
+	}
+	dr, dg, db, _ := th.Color(theme.ColorNameBackground, theme.VariantDark).RGBA()
+	if dr>>8 != 0x16 || dg>>8 != 0x18 || db>>8 != 0x1C {
+		t.Errorf("dark background hue changed: got #%02X%02X%02X, want #16181C", dr>>8, dg>>8, db>>8)
 	}
 }
 
