@@ -15,6 +15,8 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/savvaskoualis/openfortitray/internal/status"
 )
 
 // Section is a destination in the window.
@@ -50,8 +52,12 @@ type Parts struct {
 // fits the tallest section would leave the shortest one sitting in dead space,
 // which is the specific thing that made the old windows look unfinished.
 const (
-	width         = 780
-	heightStatus  = 560
+	width = 780
+	// heightStatus is status.WindowHeight, not a second guess: the two packages
+	// must agree on the Status section's base height, or toggling the activity
+	// history (which resizes relative to status.WindowHeight) and the shell's own
+	// resize() would disagree about where "closed" is.
+	heightStatus  = status.WindowHeight
 	heightSetting = 620
 )
 

@@ -56,13 +56,16 @@ const activityDepth = 50
 // simply unreachable, with no scrollbar to suggest otherwise.
 const activityHeight = 190
 
-// The window's two heights: closed, and grown by exactly the disclosure it opened.
-// Growing it is the point — a fixed height either wastes space while the history is
-// folded away or hides the history when it is not.
-const (
-	windowWidth  = 400
-	windowHeight = 560
-)
+// WindowHeight is the window's closed height, grown by exactly activityHeight when
+// the disclosure opens (see toggleActivity). shell.go uses this as the Status
+// section's base height too, rather than a second hardcoded number: the collapsed
+// content's real MinSize (measured headless) is ~521px, and a single guess shared
+// by both packages is the only way it stays true window-to-window instead of two
+// numbers someone has to remember to keep in sync. The margin above that measured
+// size is deliberately generous — a fixed pixel height rendered across three OSes'
+// different default font metrics needs slack, or a longer gateway string / a
+// slightly taller system font reintroduces the very scrollbar this exists to avoid.
+const WindowHeight = 600
 
 // emDash is what an unknown value reads as. An empty cell in a two-column card
 // looks like a rendering bug; a dash reads as "nothing to report".
@@ -453,7 +456,7 @@ func (c *Controller) setActivityTitle(n int) {
 // bottom edge.
 func (c *Controller) toggleActivity() {
 	c.activityOpen = !c.activityOpen
-	h := windowHeight
+	h := WindowHeight
 	if c.activityOpen {
 		c.activityScroll.Show()
 		c.activityToggle.SetIcon(theme.MenuDropDownIcon())
