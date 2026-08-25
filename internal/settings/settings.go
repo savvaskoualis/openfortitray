@@ -70,11 +70,12 @@ type Controller struct {
 	// change can be pushed through all of them at once.
 	forms []*widget.Form
 
-	nameEntry    *widget.Entry
-	gatewayEntry *widget.Entry
-	portEntry    *widget.Entry
-	authSelect   *widget.Select
-	authNote     *widget.Label
+	nameEntry     *widget.Entry
+	gatewayEntry  *widget.Entry
+	portEntry     *widget.Entry
+	authSelect    *widget.Select
+	authNote      *widget.Label
+	backendSelect *widget.Select
 	// The rows that appear and disappear with the chosen auth method, each in its
 	// own container so hiding one reclaims its space as well as its label (see row).
 	authNoteRow *fyne.Container
@@ -267,6 +268,26 @@ func (c *Controller) syncProfileBar() {
 		}
 	}
 }
+
+// backendLabels is the Protocol Select's option list, in display order.
+var backendLabels = []string{"SSL VPN", "IPsec"}
+
+// backendLabel maps a stored backend to its Select label.
+func backendLabel(b config.Backend) string {
+	if b == config.BackendIPsec {
+		return "IPsec"
+	}
+	return "SSL VPN"
+}
+
+// backendFromLabel maps a Select label back to a stored backend.
+func backendFromLabel(label string) config.Backend {
+	if label == "IPsec" {
+		return config.BackendIPsec
+	}
+	return config.BackendSSL
+}
+
 func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	c.nameEntry = widget.NewEntry()
 	c.nameEntry.Validator = func(s string) error { return validateName(s, c.work.Profiles, c.sel) }
@@ -320,6 +341,14 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	c.authNote = widget.NewLabel("")
 	c.authNote.Importance = widget.WarningImportance
 
+	c.backendSelect = widget.NewSelect(backendLabels, func(label string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].Backend = backendFromLabel(label)
+		c.updateAuthNote()
+	})
+
 	// Auth sub-fields. Only SAML is wired into the runtime; these are shown so
 	// the roadmap is visible but kept disabled (updateAuthNote toggles them), and
 	// Save refuses to activate a non-SAML profile. They still round-trip to the
@@ -354,6 +383,7 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 			widget.NewFormItem("Profile name", c.nameEntry),
 			widget.NewFormItem("Gateway host", c.gatewayEntry),
 			widget.NewFormItem("Port", narrow(c.portEntry, 150)),
+			widget.NewFormItem("Protocol", c.backendSelect),
 		),
 		c.group("Authentication",
 			c.row("Method", c.authSelect),
@@ -626,6 +656,7 @@ func (c *Controller) loadProfile(i int) {
 	c.gatewayEntry.SetText(p.Gateway)
 	c.portEntry.SetText(itoa(effectivePort(p.CustomPort, p.Port)))
 	c.authSelect.SetSelected(authLabel(p.Auth.Method))
+	c.backendSelect.SetSelected(backendLabel(p.Backend))
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 	c.keepAlive.SetChecked(p.KeepAlive)
 
@@ -645,26 +676,32 @@ func (c *Controller) loadProfile(i int) {
 	c.updateAuthNote()
 }
 
-// updateAuthNote shows the "(not yet supported)" note for the two methods that
-// are designed in the schema but not wired into the runtime yet, and reveals the
-// matching sub-field — always disabled, because none of them are functional.
-// SAML has no sub-field and clears the note. Save's validateAuthSupported is the
-// real gate; this is only the visual affordance.
-func (c *Controller) updateAuthNote() {
-	method := c.work.Profiles[c.sel].Auth.Method
+// authNoteText returns the warning text for a backend/auth-method
+// combination, or "" when the combination is the one wired into the runtime
+// (SSL + SAML). Backend takes precedence: an IPsec profile is not yet
+// supported no matter what its Auth.Method says, and telling the user to
+// "use SAML/SSO" — the SSL-backend message — would be actively wrong advice
+// for a gateway that requires IPsec. Pure, so it is testable without a
+// widget tree.
+func authNoteText(backend config.Backend, method config.AuthMethod) string {
+	if backend == config.BackendIPsec {
+		return "(IPsec is not yet supported)"
+	}
 	switch method {
 	case config.AuthPassword:
-		c.authNote.SetText("(username/password auth not yet supported — use SAML/SSO)")
-		show(c.authNoteRow, true)
+		return "(username/password auth not yet supported — use SAML/SSO)"
 	case config.AuthCert:
-		c.authNote.SetText("(client-certificate auth not yet supported — use SAML/SSO)")
-		show(c.authNoteRow, true)
+		return "(client-certificate auth not yet supported — use SAML/SSO)"
 	default:
-		// SAML: no sub-field and no note, so the note row goes too rather than
-		// leaving an empty gap under the Method select.
-		c.authNote.SetText("")
-		show(c.authNoteRow, false)
+		return ""
 	}
+}
+
+func (c *Controller) updateAuthNote() {
+	p := c.work.Profiles[c.sel]
+	text := authNoteText(p.Backend, p.Auth.Method)
+	c.authNote.SetText(text)
+	show(c.authNoteRow, text != "")
 	c.relayout()
 }
 

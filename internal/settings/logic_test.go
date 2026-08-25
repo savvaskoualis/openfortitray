@@ -576,6 +576,32 @@ func TestAuthLabelRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuthNoteText(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend config.Backend
+		method  config.AuthMethod
+		want    string
+	}{
+		{"ssl + saml is the only wired combination", config.BackendSSL, config.AuthSAML, ""},
+		{"ssl + password not yet supported", config.BackendSSL, config.AuthPassword,
+			"(username/password auth not yet supported — use SAML/SSO)"},
+		{"ssl + cert not yet supported", config.BackendSSL, config.AuthCert,
+			"(client-certificate auth not yet supported — use SAML/SSO)"},
+		{"ipsec is not yet supported regardless of auth method", config.BackendIPsec, config.AuthPassword,
+			"(IPsec is not yet supported)"},
+		{"ipsec overrides even a saml auth method", config.BackendIPsec, config.AuthSAML,
+			"(IPsec is not yet supported)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := authNoteText(tc.backend, tc.method); got != tc.want {
+				t.Errorf("authNoteText(%v, %v) = %q, want %q", tc.backend, tc.method, got, tc.want)
+			}
+		})
+	}
+}
+
 // cloneConfig must produce an independent copy: edits to the clone (including
 // its per-profile SplitDNS slice) must not reach the original, which is what
 // lets the window edit a working copy and only commit on Save.
