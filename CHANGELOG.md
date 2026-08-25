@@ -8,6 +8,31 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.38] — 2026-08-25
+
+### Added
+- **The VPN reconnects on its own after your laptop wakes from sleep.**
+  Reconnect-after-a-drop already existed, but it only ever noticed once
+  openconnect's own dead-peer detection timed out — which this gateway makes
+  slower than usual, since it disables openconnect's self-managed reconnect
+  entirely. A sleep could leave the tray reading "Connected" against a
+  session that had been dead since before the lid closed. The app now hooks
+  each OS's native sleep/wake notification directly and forces a fresh
+  reconnect the moment the machine wakes, instead of waiting.
+- **A Protocol field in Settings, ahead of an IPsec option that's coming.**
+  Basic ▸ Protocol now shows SSL VPN or IPsec. IPsec isn't wired into the
+  runtime yet — picking it tells you so up front, both in Settings and if you
+  try to Connect, rather than attempting a doomed connection.
+
+### Fixed
+- **"Keep VPN up (auto-reconnect)" now actually does something.** The
+  checkbox saved to your profile but nothing ever read it back — the app
+  reconnected after every drop regardless of the setting. Turning it off now
+  really stops the automatic reconnect.
+- **The Status window no longer shows a scrollbar for content that fits.**
+  Two copies of the same hardcoded window height had drifted just short of
+  what the panel actually needs to render on every platform's default fonts.
+
 ## [0.1.37] — 2026-08-24
 
 ### Fixed
