@@ -613,7 +613,7 @@ func TestWorkingCopySaveRoundTrip(t *testing.T) {
 		Autostart:     true,
 		Profiles: []config.Profile{
 			{Name: "Work", Gateway: "vpn.example.com", Port: 10443, SAMLPort: 8020,
-				Auth: config.AuthConfig{Method: config.AuthSAML}, DTLS: true,
+				Auth: config.AuthConfig{Method: config.AuthSAML}, Backend: config.BackendSSL, DTLS: true,
 				ServerCert: config.ServerCert{Mode: config.CertWarn}},
 		},
 		OpenconnectPath: "openconnect",

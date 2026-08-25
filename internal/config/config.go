@@ -54,8 +54,8 @@ const (
 	AuthCert AuthMethod = "cert"
 )
 
-// Backend selects which VPN protocol a profile dials. AuthSSL (openconnect,
-// wired into the runtime today) or AuthIPsec (strongSwan — schema only,
+// Backend selects which VPN protocol a profile dials. BackendSSL (openconnect,
+// wired into the runtime today) or BackendIPsec (strongSwan — schema only,
 // not yet wired; see internal/tunnel and the IPsec design doc).
 type Backend string
 
