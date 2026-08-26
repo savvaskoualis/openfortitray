@@ -23,7 +23,10 @@ import (
 
 // RunFunc runs the IPsec backend until the tunnel goes down or ctx is
 // cancelled. It calls connected(ip) once the backend reports the tunnel is
-// up. Implemented per-platform (strongswan_unix.go, ipsec_windows.go).
+// up. connected MUST be called synchronously, on the same goroutine running
+// this RunFunc — loop()'s bookkeeping around the callback is not
+// synchronized against a call from any other goroutine. Implemented
+// per-platform (strongswan_unix.go, ipsec_windows.go).
 type RunFunc func(ctx context.Context, connected func(ip string)) error
 
 // Supervisor keeps an IPsec tunnel up: runs the backend and reconnects with
