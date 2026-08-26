@@ -8,6 +8,16 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.40] — 2026-08-26
+
+### Fixed
+- **The main window went completely blank on macOS in 0.1.39.** The new
+  glass backdrop's native view was nested inside the window's own content
+  instead of behind it as a true sibling, so it ended up covering
+  everything — no nav rail, no buttons, no text, just a flat panel. Fixed
+  by wrapping the window's content correctly; the blur now sits behind the
+  UI the way it was meant to.
+
 ## [0.1.39] — 2026-08-26
 
 ### Added
