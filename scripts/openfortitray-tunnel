@@ -1,0 +1,501 @@
+#!/bin/sh
+# openfortitray-tunnel — root-owned privileged helper for the openfortitray tray app.
+#
+# Installed by scripts/install.sh as /usr/local/libexec/openfortitray-tunnel
+# (owner root, mode 0755, in a root-owned directory). The sudoers rule written by
+# the installer grants NOPASSWD for *this path only*, never for openconnect
+# itself: a bare NOPASSWD on openconnect would let any local process run
+# arbitrary code as root via openconnect's own --script/--csd-wrapper options.
+#
+# Two reasons this helper exists at all:
+#
+#  1. Teardown. openconnect must run as root, so the unprivileged tray app
+#     cannot signal it (kill(2) returns EPERM) — the tunnel and its routes would
+#     leak until something killed sudo, which does not restore routing. The app
+#     therefore asks for teardown through "stop", which runs as root and can
+#     deliver SIGINT.
+#  2. Attack surface. Everything reachable with NOPASSWD is confined to the two
+#     subcommands below, with the gateway argument validated, and every extra
+#     openconnect flag checked against a fixed allowlist, before anything is
+#     handed to openconnect.
+#
+# THREAT MODEL — read before widening anything here.
+#
+#   Argument injection: blocked on both platforms. The gateway is validated
+#   against a strict host:port pattern, and every remaining argument to "start"
+#   is validated against an EXACT allowlist, before openconnect is reached. A
+#   local caller cannot smuggle --script=/--csd-wrapper= (which openconnect would
+#   run as root) through the NOPASSWD rule.
+#
+#   Flag allowlist: "start" no longer forbids ALL openconnect options — it
+#   forbids all EXCEPT three vetted, argument-validated flags that shape the
+#   tunnel and CANNOT lead to code execution:
+#     --no-dtls        boolean; disables DTLS/ESP. Takes no argument.
+#     --disable-ipv6   boolean; forces IPv4-only. Takes no argument.
+#     --servercert FP  pins the server certificate to fingerprint FP. It takes
+#                      only a fingerprint — never a script, command or path that
+#                      openconnect could execute — and FP itself is validated
+#                      against a strict charset/length (see validate_fingerprint),
+#                      so a value like "--servercert /tmp/evil" or a fingerprint
+#                      that smuggles a shell metacharacter is refused.
+#   Everything else — any other flag, any --script/--csd-wrapper/-o/--, any bare
+#   "-x", a "--servercert" with no valid fingerprint following it — is rejected
+#   (die, non-zero, no exec). None of the three allowlisted flags takes a
+#   payload openconnect runs, which is what keeps the "no arbitrary root code
+#   execution" guarantee intact while letting the Advanced toggles work.
+#   The flags are validated as SEPARATE argv elements (sudo/exec pass them
+#   through without a shell), so a fingerprint value can never be re-parsed as an
+#   option, and the sudoers match is on the helper path only — argv does not
+#   affect it, so no sudoers change was needed to widen "start".
+#
+#   Binary tampering: blocked on Linux, only WARNED ABOUT on macOS. The
+#   openconnect path is baked in at install time rather than resolved through
+#   PATH, and checked at run time, because a passwordless-root helper that
+#   resolves its payload through a writable directory is a root exploit, not a
+#   helper. On Linux the installer refuses to proceed unless the binary and every
+#   ancestor directory are root-owned and not group/other-writable, so this
+#   boundary holds. On macOS, Homebrew's prefix (/opt/homebrew, /usr/local) is
+#   owned by the installing user *by design*: anyone who can write there could
+#   replace openconnect and gain root through this rule. We warn loudly and
+#   continue, because on a single-user mac that user is already an admin who can
+#   run sudo directly, so the helper grants them nothing new. This is a
+#   documented limit of the design, not a property we claim to enforce. On a
+#   multi-user mac, install openconnect somewhere root-owned and point the
+#   installer at it.
+#
+# Usage (as invoked by the app via `sudo -n`):
+#   openfortitray-tunnel start <host:port> [flag ...]  # exec openconnect,
+#                                                        cookie on stdin
+#     where each flag is one of the allowlisted:
+#       --no-dtls | --disable-ipv6 | --servercert <fingerprint>
+#   openfortitray-tunnel stop                          # SIGINT the running openconnect
+#   openfortitray-tunnel dns-set <dns-ip> <domain>...  # install scoped resolvers
+#   openfortitray-tunnel dns-clear <domain>...         # remove OUR scoped resolvers
+#
+# DNS subcommands (macOS split-DNS coexistence). dns-set writes, as root,
+# /etc/resolver/<domain> = "nameserver <dns-ip>" for each domain, so those
+# domains resolve through the VPN-pushed DNS even when a global override
+# (Tailscale MagicDNS, a corp DNS proxy) owns the primary resolver. Both
+# subcommands validate as strictly as "start": the DNS IP must be a bare
+# IPv4/IPv6 address and each domain must match ^[A-Za-z0-9._-]+$ (bounded length,
+# no leading '-', no '/', no whitespace or shell metacharacter) BEFORE anything
+# is written or removed, so a local caller cannot turn the filename into a path
+# trick or smuggle a metacharacter into a root-owned file. dns-clear removes only
+# files carrying RESOLVER_MARKER, so a pre-existing resolver file (e.g. one a VPN
+# client left for database.windows.net) always survives.
+set -eu
+
+# Fixed PATH for the coreutils this script itself calls (cat, ps, kill, rm,
+# sleep, find). System directories only: the caller's environment must never
+# influence what runs as root, and package-manager prefixes are deliberately
+# absent — openconnect is not resolved through PATH at all (see OPENCONNECT).
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# OPENCONNECT is substituted with an absolute path by scripts/install.sh when it
+# installs this file. The repo copy keeps the placeholder and refuses to run:
+# resolving openconnect at run time (command -v, or a PATH containing a
+# user-writable Homebrew prefix) would turn the NOPASSWD rule into passwordless
+# root code execution for anyone who can write to that directory.
+OPENCONNECT='@OPENCONNECT@'
+
+PIDFILE=/var/run/openfortitray-openconnect.pid
+# Directory for the short-lived openconnect config file that carries the session
+# cookie (see cmd_start). Root-only, so the cookie is readable by nobody the
+# helper does not already trust.
+CONFDIR=/var/run/openfortitray-conf
+# HELPER_ABI is bumped whenever the app<->helper contract changes, so the app can
+# tell an outdated helper from a current one and offer to reinstall it. ABI 2
+# stopped passing the cookie via --cookie-on-stdin (see cmd_start).
+HELPER_ABI=2
+# Seconds to wait for openconnect to exit (restoring routing) after SIGINT.
+# openconnect uses this window to send its logout request to the FortiGate, so
+# the server-side session is released and does NOT linger to reject the next
+# run's first cookie (one-session-per-user). Killing it sooner is what leaves a
+# stale session behind, so keep this generous. internal/tunnel's
+# helperStopTimeout allows a little more than this before giving up on us.
+STOP_TIMEOUT=8
+
+# RESOLVER_DIR is macOS's per-domain scoped-resolver directory. A file
+# /etc/resolver/<domain> containing "nameserver <ip>" makes <domain> resolve
+# through <ip> and BEATS a global DNS override (e.g. Tailscale MagicDNS, which
+# points the system's primary resolver at 100.100.100.100): corp-internal names
+# then resolve through the VPN-pushed DNS while the tunnel is up, exactly as
+# FortiClient coexists. dns-set/dns-clear write and remove these files. It is
+# hard-coded and NEVER taken from the environment — a caller-controlled path here
+# would let an unprivileged process aim root writes (or deletes) at an arbitrary
+# directory. The Go tests string-substitute it to a temp dir, like PIDFILE.
+RESOLVER_DIR=/etc/resolver
+# RESOLVER_MARKER is the first line of every resolver file WE create, so
+# dns-clear can tell ours from a pre-existing /etc/resolver/<domain> that a VPN
+# client or the admin installed and must NOT be removed.
+RESOLVER_MARKER='# openfortitray-managed'
+
+die() {
+	echo "openfortitray-tunnel: $1" >&2
+	exit 1
+}
+
+# validate_gateway rejects anything that is not a plain host:port. Without this,
+# a caller could smuggle openconnect options (--script=..., --csd-wrapper=...)
+# into the argument list and get arbitrary root code execution.
+# validate_cookie is a SECURITY BOUNDARY, not a sanity check.
+#
+# cmd_start writes the cookie into an openconnect config file, and that file
+# format accepts ANY openconnect long option — including script=, which
+# openconnect runs as root. A cookie containing a newline could therefore append
+# arbitrary options and turn "start a tunnel" into "run this as root". So the
+# cookie is restricted to the characters a FortiGate SVPNCOOKIE actually uses
+# (base64/hex with URL-safe and percent-encoding punctuation): no whitespace, no
+# newlines, no control characters, nothing that could begin a new config line.
+#
+# It must also be non-empty, and must not start with '-' so it can never be
+# mistaken for a flag by anything downstream.
+validate_cookie() {
+	case "$1" in
+	'') die "empty cookie" ;;
+	-*) die "cookie must not start with '-'" ;;
+	*[!A-Za-z0-9._~%=+/-]*) die "cookie contains invalid characters" ;;
+	esac
+}
+
+validate_gateway() {
+	case "$1" in
+	-*) die "gateway must not start with '-'" ;;
+	*[!A-Za-z0-9.:_-]*) die "gateway contains invalid characters" ;;
+	*:*) ;;
+	*) die "gateway must be host:port" ;;
+	esac
+	_host=${1%:*}
+	_port=${1##*:}
+	case "$_host" in
+	'' | *:*) die "gateway must be host:port" ;;
+	esac
+	case "$_port" in
+	'' | *[!0-9]*) die "gateway port must be numeric" ;;
+	esac
+}
+
+# validate_fingerprint rejects anything that is not a plausible certificate
+# fingerprint. It never leads to code execution — --servercert only pins a cert —
+# but a strict charset and length keep the value from being a path or carrying a
+# shell metacharacter. Accepts the forms openconnect (and internal/tunnel's
+# openconnectFlags) emit: a bare hex string, "sha256:AB:CD:…" byte form, or the
+# "pin-sha256:<base64>" pin form (whose base64 may contain + / =). A leading '-'
+# would look like a flag and a leading '/' like a path, so both are refused.
+validate_fingerprint() {
+	_fp=$1
+	case "$_fp" in
+	'') die "--servercert requires a fingerprint" ;;
+	-*) die "--servercert fingerprint must not start with '-'" ;;
+	/*) die "--servercert fingerprint must not look like a path" ;;
+	*[!A-Za-z0-9:+/=._-]*) die "--servercert fingerprint contains invalid characters" ;;
+	esac
+	if [ "${#_fp}" -gt 256 ]; then
+		die "--servercert fingerprint is too long"
+	fi
+}
+
+# validate_flags refuses every "start" argument that is not on the exact
+# allowlist, BEFORE openconnect (or any pidfile side effect) is reached. This is
+# what preserves the "no arbitrary openconnect options" guarantee now that the
+# app threads the Advanced toggles through: only --no-dtls, --disable-ipv6 and
+# --servercert <fingerprint> pass, and none of them takes a script/command
+# openconnect would run as root. Anything else — another flag, --script/
+# --csd-wrapper/-o/--, a bare "-x", or --servercert without a valid fingerprint —
+# dies. Arguments arrive as distinct argv elements (no shell between the app and
+# here), so a fingerprint value can never be re-split into a fresh option.
+validate_flags() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--no-dtls | --disable-ipv6)
+			shift
+			;;
+		--servercert)
+			shift
+			[ $# -ge 1 ] || die "--servercert requires a fingerprint"
+			validate_fingerprint "$1"
+			shift
+			;;
+		*)
+			die "disallowed openconnect option: '$1' (only --no-dtls, --disable-ipv6, --servercert <fingerprint> are permitted)"
+			;;
+		esac
+	done
+}
+
+# is_ipv4 succeeds only for exactly four dot-separated decimal octets, each
+# 0-255. Run in a subshell so IFS/set -f changes never leak into the caller.
+is_ipv4() (
+	set -f
+	IFS=.
+	# shellcheck disable=SC2086 # deliberate word-split on '.' into octets
+	set -- $1
+	[ $# -eq 4 ] || return 1
+	for _o in "$@"; do
+		case "$_o" in
+		'' | *[!0-9]*) return 1 ;;
+		esac
+		# Bound the length first: "$_o" -le 255 on a 100-digit string is still a
+		# valid arithmetic comparison, but a stray leading run of digits should
+		# not sneak through, and a bounded numeric compare is the clean check.
+		[ "${#_o}" -le 3 ] || return 1
+		[ "$_o" -le 255 ] || return 1
+	done
+	return 0
+)
+
+# is_ipv6 is a deliberately loose but safe check: the value only ever gets
+# written into a resolver file, so what matters for security is charset (hex and
+# colons only — no path, flag, whitespace or metacharacter), a colon shape, and a
+# length bound. It does not attempt full RFC 4291 validation.
+is_ipv6() {
+	case "$1" in
+	*[!0-9A-Fa-f:]*) return 1 ;; # anything outside hex/colon
+	*:*:*) ;;                    # must look like an IPv6 (>= two colons)
+	*) return 1 ;;
+	esac
+	[ "${#1}" -le 45 ] || return 1
+	return 0
+}
+
+# validate_dns_ip rejects anything that is not a bare IPv4 or IPv6 address. The
+# value is written verbatim into a root-owned resolver file, so — exactly like
+# validate_gateway — it must not be a path, start like a flag, or carry a shell
+# metacharacter or newline.
+validate_dns_ip() {
+	case "$1" in
+	'') die "dns-set requires a DNS server IP" ;;
+	-*) die "DNS server IP must not start with '-'" ;;
+	*[!0-9A-Fa-f.:]*) die "DNS server IP contains invalid characters" ;;
+	esac
+	if is_ipv4 "$1" || is_ipv6 "$1"; then
+		return 0
+	fi
+	die "DNS server IP is not a valid IPv4/IPv6 address: '$1'"
+}
+
+# validate_domain enforces a strict hostname/domain shape on every dns-set/
+# dns-clear argument. The value becomes the FILENAME /etc/resolver/<domain>, so a
+# '/', a leading '-', '.'/'..', whitespace or any shell metacharacter must be
+# refused: without this a caller could aim a root write — or a root delete — at
+# an arbitrary path. Charset is ^[A-Za-z0-9._-]+$, bounded length.
+validate_domain() {
+	case "$1" in
+	'') die "domain must not be empty" ;;
+	-*) die "domain must not start with '-'" ;;
+	. | ..) die "domain must not be '.' or '..'" ;;
+	*[!A-Za-z0-9._-]*) die "domain contains invalid characters: '$1'" ;;
+	esac
+	if [ "${#1}" -gt 253 ]; then
+		die "domain is too long: '$1'"
+	fi
+}
+
+# running_openconnect_pid echoes the pid from the pidfile if it is a live
+# openconnect process, and nothing otherwise (missing, stale or recycled pid).
+running_openconnect_pid() {
+	[ -f "$PIDFILE" ] || return 0
+	pid=$(cat "$PIDFILE" 2>/dev/null) || return 0
+	case "$pid" in
+	'' | *[!0-9]*) return 0 ;;
+	esac
+	[ "$pid" -gt 1 ] 2>/dev/null || return 0
+	# Never signal a pid the kernel has since handed to something else.
+	comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 0
+	case "$comm" in
+	*openconnect*) echo "$pid" ;;
+	esac
+}
+
+# terminate_running interrupts the recorded openconnect, if any, and waits for it
+# to go away. Always succeeds: "no tunnel running" is the desired end state.
+terminate_running() {
+	pid=$(running_openconnect_pid)
+	if [ -n "$pid" ]; then
+		# SIGINT, not SIGKILL: openconnect only tears the tunnel down and
+		# restores the routing table on a clean shutdown.
+		kill -INT "$pid" 2>/dev/null || true
+		i=0
+		while [ "$i" -lt "$STOP_TIMEOUT" ]; do
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 1
+			i=$((i + 1))
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			# Wedged past the grace period; routing may stay broken, but a live
+			# tunnel nobody can control is worse.
+			kill -KILL "$pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$PIDFILE"
+}
+
+# resolve_openconnect echoes the baked-in openconnect path after checking that it
+# is still safe to execute as root. See the threat model at the top: on Linux a
+# tampered-with binary is fatal, on macOS it is a warning because the Homebrew
+# prefix is user-owned by design.
+resolve_openconnect() {
+	case "$OPENCONNECT" in
+	'@OPENCONNECT@' | '')
+		die "not installed: run scripts/install.sh, which bakes in the openconnect path" ;;
+	/*) ;;
+	*) die "openconnect path must be absolute, got '$OPENCONNECT'" ;;
+	esac
+	[ -x "$OPENCONNECT" ] || die "$OPENCONNECT is missing or not executable"
+
+	# find, not stat: the -perm/-user predicates below behave identically on BSD
+	# and GNU find, whereas stat's format flags do not.
+	unsafe=''
+	if [ -n "$(find "$OPENCONNECT" -maxdepth 0 ! -user root -print 2>/dev/null)" ]; then
+		unsafe="not owned by root"
+	elif [ -n "$(find "$OPENCONNECT" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
+		unsafe="writable by group or other"
+	fi
+	if [ -n "$unsafe" ]; then
+		if [ "$(uname -s)" = Darwin ]; then
+			echo "openfortitray-tunnel: WARNING: $OPENCONNECT is $unsafe;" \
+				"anyone who can write it gains root through this helper" >&2
+		else
+			die "refusing to run as root: $OPENCONNECT is $unsafe"
+		fi
+	fi
+	echo "$OPENCONNECT"
+}
+
+cmd_start() {
+	[ $# -ge 1 ] || die "usage: openfortitray-tunnel start <host:port> [flag ...]"
+	validate_gateway "$1"
+	gateway=$1
+	shift
+	# Everything after the gateway must be an allowlisted, argument-validated
+	# flag. Do this BEFORE resolve_openconnect / terminate_running / the pidfile
+	# so a rejected argument has no side effect at all.
+	validate_flags "$@"
+	oc=$(resolve_openconnect)
+
+	# Adopt-and-replace: if a previous app instance died without stopping its
+	# tunnel, that root openconnect is orphaned and unreachable from the tray.
+	# Clear it before starting ours, so a crash cannot leave the machine with a
+	# tunnel and no way to bring it down.
+	terminate_running
+
+	# Record the pid *before* exec: exec replaces this shell in place, so $$
+	# becomes openconnect's pid. openconnect's own --pid-file only writes the
+	# file when it daemonises (--background), and we deliberately keep it in the
+	# foreground so the supervisor can read its progress output and reap it.
+	umask 022
+	echo $$ >"$PIDFILE" || die "cannot write $PIDFILE"
+
+	# The cookie arrives on stdin (sudo passes it through), so it never touches the
+	# argv or the process table. It does NOT go on to openconnect's stdin, though:
+	# openconnect's --cookie-on-stdin reads the cookie with a 1024-byte buffer and
+	# silently TRUNCATES anything longer, and this gateway's SAML cookies routinely
+	# exceed that (1288 bytes observed). A truncated cookie is rejected with an
+	# opaque "Cookie was rejected by server", which looked for a long time like a
+	# gateway problem: same cookie, --cookie-on-stdin refused and --cookie accepted,
+	# proven side by side.
+	#
+	# So hand it over through a config file instead. Not the argv (--cookie would
+	# publish the session cookie in `ps` for the tunnel's whole life) and not
+	# /dev/fd (openconnect needs a seekable config): a 0600 file in a 0700
+	# root-owned directory, unlinked a few seconds later, once openconnect has
+	# parsed it at startup.
+	IFS= read -r cookie || die "no cookie on stdin"
+	validate_cookie "$cookie"
+	rm -rf "$CONFDIR" || die "cannot clear $CONFDIR"
+	(umask 077 && mkdir -p "$CONFDIR") || die "cannot create $CONFDIR"
+	conf=$CONFDIR/openconnect.conf
+	(umask 077 && printf 'cookie=SVPNCOOKIE=%s\n' "$cookie" >"$conf") ||
+		die "cannot write $conf"
+	# A trap cannot survive exec, so schedule the unlink in a detached child.
+	# openconnect parses its config within milliseconds of starting; a few seconds
+	# is generous and bounded, and cmd_stop clears the directory too.
+	(sleep 5; rm -rf "$CONFDIR") >/dev/null 2>&1 &
+
+	# --non-inter: never prompt (there is no tty). The validated flags ("$@") sit
+	# before the gateway, matching the order internal/tunnel builds for the direct
+	# path.
+	exec "$oc" --protocol=fortinet --config "$conf" --non-inter "$@" "$gateway"
+}
+
+cmd_stop() {
+	[ $# -eq 0 ] || die "usage: openfortitray-tunnel stop"
+	rm -rf "$CONFDIR" # never leave a cookie file behind
+	terminate_running
+	exit 0 # stop is idempotent: "already gone" is success
+}
+
+# cmd_dns_set installs a scoped resolver for each domain, all pointing at the one
+# DNS IP the caller discovered from the live tunnel. Every argument is validated
+# BEFORE any file is written, so a bad argument in the middle leaves nothing
+# half-installed. Each file is written to a temp name and moved into place, so a
+# reader never observes a half-written resolver, and stamped with RESOLVER_MARKER
+# so dns-clear can recognise it as ours later.
+cmd_dns_set() {
+	[ $# -ge 2 ] || die "usage: openfortitray-tunnel dns-set <dns-ip> <domain> [domain ...]"
+	_ip=$1
+	shift
+	validate_dns_ip "$_ip"
+	for _d in "$@"; do
+		validate_domain "$_d"
+	done
+
+	umask 022
+	mkdir -p "$RESOLVER_DIR" || die "cannot create $RESOLVER_DIR"
+	for _d in "$@"; do
+		_f=$RESOLVER_DIR/$_d
+		_tmp=$_f.openfortitray.tmp
+		{
+			printf '%s\n' "$RESOLVER_MARKER"
+			printf 'nameserver %s\n' "$_ip"
+		} >"$_tmp" || die "cannot write $_tmp"
+		chmod 0644 "$_tmp" || {
+			rm -f "$_tmp"
+			die "cannot chmod $_tmp"
+		}
+		mv -f "$_tmp" "$_f" || {
+			rm -f "$_tmp"
+			die "cannot install $_f"
+		}
+	done
+	exit 0
+}
+
+# cmd_dns_clear removes ONLY the scoped resolvers we created — those whose first
+# line is RESOLVER_MARKER. A resolver file without the marker was put there by
+# something else (a VPN client, corp tooling, the admin) and is left untouched.
+# Idempotent: a missing or foreign file is not an error. Every domain is
+# validated first, so a '/'-bearing argument can never reach the rm.
+cmd_dns_clear() {
+	[ $# -ge 1 ] || die "usage: openfortitray-tunnel dns-clear <domain> [domain ...]"
+	for _d in "$@"; do
+		validate_domain "$_d"
+	done
+	for _d in "$@"; do
+		_f=$RESOLVER_DIR/$_d
+		[ -f "$_f" ] || continue
+		if head -n 1 "$_f" 2>/dev/null | grep -qxF "$RESOLVER_MARKER"; then
+			rm -f "$_f" || die "cannot remove $_f"
+		fi
+	done
+	exit 0
+}
+
+[ $# -ge 1 ] || die "usage: openfortitray-tunnel {start <host:port>|stop|dns-set|dns-clear|abi}"
+sub=$1
+shift
+case "$sub" in
+start) cmd_start "$@" ;;
+stop) cmd_stop "$@" ;;
+abi) # Print the app<->helper contract version, so the app can spot an outdated
+	# helper and offer to reinstall it instead of failing in a way that looks
+	# like a gateway problem. Takes no arguments and changes nothing.
+	[ $# -eq 0 ] || die "usage: openfortitray-tunnel abi"
+	echo "$HELPER_ABI"
+	exit 0
+	;;
+dns-set) cmd_dns_set "$@" ;;
+dns-clear) cmd_dns_clear "$@" ;;
+*) die "unknown subcommand: $sub" ;;
+esac
