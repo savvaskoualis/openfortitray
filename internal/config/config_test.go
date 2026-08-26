@@ -367,7 +367,7 @@ func TestNewProfileDefaultsToPSKWithDefaultProposals(t *testing.T) {
 }
 
 func TestNormalizeIPsecConfigBackfillsRemoteIDFromGateway(t *testing.T) {
-	p := Profile{Name: "Test", Gateway: "vpn.example.com"}
+	p := Profile{Name: "Test", Gateway: "vpn.example.com", Backend: BackendIPsec}
 	normalizeProfile(&p)
 	if p.IPsec.RemoteID != "vpn.example.com" {
 		t.Errorf("RemoteID = %q, want %q", p.IPsec.RemoteID, "vpn.example.com")
@@ -375,7 +375,7 @@ func TestNormalizeIPsecConfigBackfillsRemoteIDFromGateway(t *testing.T) {
 }
 
 func TestNormalizeIPsecConfigLeavesExplicitRemoteIDAlone(t *testing.T) {
-	p := Profile{Name: "Test", Gateway: "vpn.example.com",
+	p := Profile{Name: "Test", Gateway: "vpn.example.com", Backend: BackendIPsec,
 		IPsec: IPsecConfig{RemoteID: "custom-remote-id"}}
 	normalizeProfile(&p)
 	if p.IPsec.RemoteID != "custom-remote-id" {
@@ -391,6 +391,23 @@ func TestIPsecPSKCredstoreKeyDistinctFromSSLCookieKey(t *testing.T) {
 	sslKey := "openfortitray:" + gw
 	if IPsecPSKCredstoreKey(gw) == sslKey {
 		t.Errorf("IPsecPSKCredstoreKey(%q) collides with the SSL cookie key %q", gw, sslKey)
+	}
+}
+
+func TestNormalizeSSLProfileKeepsEmptyIPsecConfig(t *testing.T) {
+	p := Profile{Name: "Test", Gateway: "vpn.example.com", Backend: BackendSSL}
+	normalizeProfile(&p)
+	if p.IPsec.AuthMethod != "" {
+		t.Errorf("SSL profile AuthMethod should stay empty after normalize, got %q", p.IPsec.AuthMethod)
+	}
+	if p.IPsec.IKEProposal != "" {
+		t.Errorf("SSL profile IKEProposal should stay empty after normalize, got %q", p.IPsec.IKEProposal)
+	}
+	if p.IPsec.ESPProposal != "" {
+		t.Errorf("SSL profile ESPProposal should stay empty after normalize, got %q", p.IPsec.ESPProposal)
+	}
+	if p.IPsec.RemoteID != "" {
+		t.Errorf("SSL profile RemoteID should stay empty after normalize, got %q", p.IPsec.RemoteID)
 	}
 }
 

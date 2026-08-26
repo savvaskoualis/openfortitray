@@ -181,12 +181,12 @@ func (p *Profile) GatewayURL() string {
 // the empty-gateway guard still trips) and every other field at its default.
 func defaultProfile() Profile {
 	return Profile{
-		Name:            "Default",
-		Gateway:         "",
-		Port:            10443,
-		SAMLPort:        8020,
-		Auth:            AuthConfig{Method: AuthSAML},
-		Backend:         BackendSSL,
+		Name:     "Default",
+		Gateway:  "",
+		Port:     10443,
+		SAMLPort: 8020,
+		Auth:     AuthConfig{Method: AuthSAML},
+		Backend:  BackendSSL,
 		IPsec: IPsecConfig{
 			AuthMethod:  IPsecAuthPSK,
 			IKEProposal: defaultIPsecProposal,
@@ -230,7 +230,9 @@ func normalizeProfile(p *Profile) {
 	if p.Backend == "" {
 		p.Backend = BackendSSL
 	}
-	normalizeIPsecConfig(&p.IPsec, p.Gateway)
+	if p.Backend == BackendIPsec {
+		normalizeIPsecConfig(&p.IPsec, p.Gateway)
+	}
 	if p.ServerCert.Mode == "" {
 		p.ServerCert.Mode = CertWarn
 	}
