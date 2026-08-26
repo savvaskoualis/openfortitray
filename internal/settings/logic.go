@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
@@ -180,21 +181,52 @@ func validateIPsecFieldsPresent(ic config.IPsecConfig) (field, message string) {
 	return "", ""
 }
 
+// pskRetryInterval/pskRetryWindow bound how long validateIPsecPSKPresent
+// waits out credstore.ErrBusy before giving up — the same login-keychain-
+// not-yet-unlocked race cmd/openfortitray's cookieGetWithRetry already
+// retries through for the SSL cookie read (an autostart-at-login launch can
+// race the OS secret store's automatic unlock). Package-level vars, not
+// consts, so tests can shrink them to avoid actually sleeping.
+var (
+	pskRetryInterval = 200 * time.Millisecond
+	pskRetryWindow   = 5 * time.Second
+)
+
 // validateIPsecPSKPresent reports whether an IPsec PSK-auth profile has a
 // stored secret in credstore. Only meaningful when Backend == BackendIPsec
 // and IPsec.AuthMethod == IPsecAuthPSK; the caller gates on that.
+//
+// credstore.ErrBusy (the OS secret store cannot answer yet — e.g. the macOS
+// login keychain mid-unlock on an autostart-at-login launch) is distinct from
+// a genuine miss: the secret may well be there, the store just cannot answer
+// yet. Collapsing it to "no PSK stored" — as this used to — would wrongly
+// route Connect to "add a PSK" for a profile that already has one, during
+// exactly the startup race cookieGetWithRetry exists to survive for the SSL
+// cookie. So this retries through ErrBusy, bounded by pskRetryWindow, before
+// concluding there is truly nothing stored.
 //
 // Unlike validateIPsecFieldsPresent, this does real I/O (a credstore read),
 // so it is deliberately kept as its own function rather than folded into
 // that one, which stays pure and needs no widget tree or credstore backend
 // to test. Tests swap credstore.SetBackend(credstore.NewMemory()) to avoid
-// touching the real OS keychain.
+// touching the real OS keychain, and a fake Backend that returns ErrBusy to
+// exercise the retry.
 func validateIPsecPSKPresent(gateway string) error {
-	secret, err := credstore.Get(config.IPsecPSKCredstoreKey(gateway))
-	if err != nil || secret == "" {
-		return errors.New("no PSK stored")
+	key := config.IPsecPSKCredstoreKey(gateway)
+	deadline := time.Now().Add(pskRetryWindow)
+	for {
+		secret, err := credstore.Get(key)
+		if err == nil {
+			if secret == "" {
+				return errors.New("no PSK stored")
+			}
+			return nil
+		}
+		if !errors.Is(err, credstore.ErrBusy) || time.Now().After(deadline) {
+			return fmt.Errorf("reading PSK from credstore: %w", err)
+		}
+		time.Sleep(pskRetryInterval)
 	}
-	return nil
 }
 
 // authMethodNoteText returns the warning text for a profile's auth method, or

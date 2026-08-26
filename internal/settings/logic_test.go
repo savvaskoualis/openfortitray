@@ -1,9 +1,11 @@
 package settings
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
@@ -715,6 +717,84 @@ func TestValidateIPsecPSKPresent(t *testing.T) {
 	// namespaced per-gateway.
 	if err := validateIPsecPSKPresent("other.example.com"); err == nil {
 		t.Error("different gateway, no secret stored for it: want an error, got nil")
+	}
+}
+
+// busyThenBackend is a credstore.Backend fake that returns credstore.ErrBusy
+// for the first busyFor calls to Get, then falls through to an in-memory
+// store — simulating the OS secret store racing an autostart-at-login launch
+// (e.g. the macOS login keychain mid-unlock) before it settles.
+type busyThenBackend struct {
+	mem     *credstore.Memory
+	busyFor int
+	calls   int
+}
+
+func newBusyThenBackend(busyFor int) *busyThenBackend {
+	return &busyThenBackend{mem: credstore.NewMemory(), busyFor: busyFor}
+}
+
+func (b *busyThenBackend) Get(key string) (string, error) {
+	b.calls++
+	if b.calls <= b.busyFor {
+		return "", credstore.ErrBusy
+	}
+	return b.mem.Get(key)
+}
+func (b *busyThenBackend) Set(key, value string) error { return b.mem.Set(key, value) }
+func (b *busyThenBackend) Delete(key string) error     { return b.mem.Delete(key) }
+
+// permanentlyBusyBackend always reports credstore.ErrBusy, so
+// validateIPsecPSKPresent's retry loop must eventually give up rather than
+// hang or spin forever.
+type permanentlyBusyBackend struct{}
+
+func (permanentlyBusyBackend) Get(string) (string, error) { return "", credstore.ErrBusy }
+func (permanentlyBusyBackend) Set(string, string) error   { return nil }
+func (permanentlyBusyBackend) Delete(string) error        { return nil }
+
+// credstore.ErrBusy (the OS secret store not yet unlocked) must be retried,
+// not immediately collapsed to "no PSK stored" — that would wrongly tell the
+// user to add a PSK that is already there (Important #3).
+func TestValidateIPsecPSKPresentRetriesOnBusyStoreThenSucceeds(t *testing.T) {
+	origInterval, origWindow := pskRetryInterval, pskRetryWindow
+	pskRetryInterval = time.Millisecond
+	pskRetryWindow = time.Second
+	defer func() { pskRetryInterval, pskRetryWindow = origInterval, origWindow }()
+
+	backend := newBusyThenBackend(2)
+	restore := credstore.SetBackend(backend)
+	defer restore()
+	if err := backend.Set(config.IPsecPSKCredstoreKey("vpn.example.com"), "s3cr3t"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := validateIPsecPSKPresent("vpn.example.com"); err != nil {
+		t.Errorf("validateIPsecPSKPresent = %v, want nil once the store stops being busy", err)
+	}
+	if backend.calls < 3 {
+		t.Errorf("Get called %d times, want at least 3 (two busy + one success)", backend.calls)
+	}
+}
+
+// A store that never stops reporting busy must not hang: the retry window
+// bounds it, and the caller sees a distinguishable error rather than a false
+// "no PSK stored".
+func TestValidateIPsecPSKPresentGivesUpOnPermanentlyBusyStore(t *testing.T) {
+	origInterval, origWindow := pskRetryInterval, pskRetryWindow
+	pskRetryInterval = time.Millisecond
+	pskRetryWindow = 20 * time.Millisecond
+	defer func() { pskRetryInterval, pskRetryWindow = origInterval, origWindow }()
+
+	restore := credstore.SetBackend(permanentlyBusyBackend{})
+	defer restore()
+
+	err := validateIPsecPSKPresent("vpn.example.com")
+	if err == nil {
+		t.Fatal("want an error once the retry window elapses, got nil")
+	}
+	if !errors.Is(err, credstore.ErrBusy) {
+		t.Errorf("error = %v, want it to still wrap credstore.ErrBusy so callers can tell this apart from a genuine miss", err)
 	}
 }
 

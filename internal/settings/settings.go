@@ -1023,21 +1023,33 @@ func (c *Controller) save(reconnect bool) {
 		c.showBanner("Could not save: " + err.Error())
 		return
 	}
-	// Persist the IPsec PSK secret, if one was entered for the profile
-	// currently shown in the form. Like the SSL password/cookie, it is never
-	// stored in config.json — only in credstore, keyed by gateway
+	// Persist EVERY profile's IPsec PSK secret with an unsaved edit — not just
+	// the one currently shown in the form. Like the SSL password/cookie, a PSK
+	// is never stored in config.json — only in credstore, keyed by gateway
 	// (config.IPsecPSKCredstoreKey). ipsecSecretDirty/ipsecSecretValue are
-	// keyed by profile index, so this reads c.sel's entry specifically.
-	profile := c.work.Profiles[c.sel]
-	if profile.Backend == config.BackendIPsec && profile.IPsec.AuthMethod == config.IPsecAuthPSK && c.ipsecSecretDirty[c.sel] {
-		if err := credstore.Set(config.IPsecPSKCredstoreKey(profile.Gateway), c.ipsecSecretValue[c.sel]); err != nil {
+	// keyed by profile index specifically so switching the profile dropdown
+	// does not lose an edit made to another profile; Save must honor that by
+	// writing each dirty entry to ITS OWN profile's credstore key, not just
+	// c.sel's — reading only c.sel here silently dropped every other dirty
+	// profile's PSK on the next reset() (Cancel or reopening Settings).
+	for idx, dirty := range c.ipsecSecretDirty {
+		if !dirty || idx < 0 || idx >= len(c.work.Profiles) {
+			continue // stale/cleared entry; skip rather than index out of range
+		}
+		profile := c.work.Profiles[idx]
+		if profile.Backend != config.BackendIPsec || profile.IPsec.AuthMethod != config.IPsecAuthPSK {
+			continue
+		}
+		if err := credstore.Set(config.IPsecPSKCredstoreKey(profile.Gateway), c.ipsecSecretValue[idx]); err != nil {
 			c.showBanner("Could not save the pre-shared key: " + err.Error())
 			return
 		}
 		// Persisted: drop the plaintext from memory rather than leaving it
-		// sitting in the map for the life of the window.
-		delete(c.ipsecSecretDirty, c.sel)
-		delete(c.ipsecSecretValue, c.sel)
+		// sitting in the map for the life of the window. Safe to delete the
+		// current key while ranging over the same map (see the Go spec on map
+		// iteration).
+		delete(c.ipsecSecretDirty, idx)
+		delete(c.ipsecSecretValue, idx)
 	}
 	// Keep the visible working copy consistent with what was just persisted.
 	c.work = cloneConfig(work)

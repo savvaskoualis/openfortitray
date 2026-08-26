@@ -11,6 +11,7 @@ import (
 	"fyne.io/fyne/v2/test"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uitheme"
 )
@@ -129,5 +130,62 @@ func TestResetClearsUnsavedIPsecSecret(t *testing.T) {
 	}
 	if v, ok := c.ipsecSecretValue[c.sel]; ok {
 		t.Errorf("after reset, ipsecSecretValue still holds %q for profile %d, want the map cleared", v, c.sel)
+	}
+}
+
+// TestSavePersistsAllDirtyIPsecPSKsNotJustSelected is Important #4: typing a
+// PSK for profile A, switching to profile B (which — per
+// ipsecSecretDirty/ipsecSecretValue being per-profile maps — must NOT lose
+// A's unsaved edit), typing a different PSK for B, then hitting Save must
+// persist BOTH profiles' PSKs to their own credstore keys, not just the one
+// shown in the form when Save was clicked.
+func TestSavePersistsAllDirtyIPsecPSKsNotJustSelected(t *testing.T) {
+	test.NewApp()
+	restore := credstore.SetBackend(credstore.NewMemory())
+	defer restore()
+
+	profA := config.NewProfile("A")
+	profA.Gateway = "a.example.com"
+	profA.Backend = config.BackendIPsec
+	profA.IPsec.AuthMethod = config.IPsecAuthPSK
+
+	profB := config.NewProfile("B")
+	profB.Gateway = "b.example.com"
+	profB.Backend = config.BackendIPsec
+	profB.IPsec.AuthMethod = config.IPsecAuthPSK
+
+	cfg := &config.Config{ActiveProfile: "A", Profiles: []config.Profile{profA, profB}}
+
+	w := test.NewWindow(nil)
+	defer w.Close()
+	c := New(&captureHost{cfg: cfg}, w)
+
+	// Type A's PSK (profile A is shown first, matching ActiveProfile), switch
+	// to B, and type a different PSK there.
+	c.ipsecSecretEntry.SetText("psk-for-A")
+	c.loadProfile(1)
+	c.ipsecSecretEntry.SetText("psk-for-B")
+
+	c.save(false)
+
+	gotA, err := credstore.Get(config.IPsecPSKCredstoreKey("a.example.com"))
+	if err != nil {
+		t.Fatalf("credstore.Get(A): %v", err)
+	}
+	if gotA != "psk-for-A" {
+		t.Errorf("profile A's PSK = %q, want %q — an edit made before switching to B must survive Save", gotA, "psk-for-A")
+	}
+	gotB, err := credstore.Get(config.IPsecPSKCredstoreKey("b.example.com"))
+	if err != nil {
+		t.Fatalf("credstore.Get(B): %v", err)
+	}
+	if gotB != "psk-for-B" {
+		t.Errorf("profile B's PSK = %q, want %q", gotB, "psk-for-B")
+	}
+	if len(c.ipsecSecretDirty) != 0 {
+		t.Errorf("ipsecSecretDirty has %d leftover entries after Save, want all cleared: %v", len(c.ipsecSecretDirty), c.ipsecSecretDirty)
+	}
+	if len(c.ipsecSecretValue) != 0 {
+		t.Errorf("ipsecSecretValue has %d leftover entries after Save, want the plaintext dropped from memory: %v", len(c.ipsecSecretValue), c.ipsecSecretValue)
 	}
 }
