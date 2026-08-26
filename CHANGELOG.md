@@ -8,6 +8,15 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.41] — 2026-08-26
+
+### Fixed
+- **The titlebar was a mismatched, see-through strip above the glass
+  content.** Making it transparent just showed whatever's behind the
+  window, raw and unblurred, instead of matching the blurred content right
+  below it. It's now a normal, opaque titlebar — like every other vibrant
+  macOS app's.
+
 ## [0.1.40] — 2026-08-26
 
 ### Fixed
