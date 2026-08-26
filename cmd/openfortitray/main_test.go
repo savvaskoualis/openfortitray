@@ -842,6 +842,38 @@ func (s *slowSupervisor) finished() bool {
 	return s.done
 }
 
+// shutdown must wait on both supervisors CONCURRENTLY, not sequentially: two
+// slowSupervisors each taking most of shutdownWait would blow the shared
+// budget if waited on one after the other, starving whichever is checked
+// second of any real chance to finish before the process exits — exactly the
+// orphaned-tunnel-on-quit failure this dual-supervisor teardown exists to
+// prevent. If both are genuinely waited on in parallel, shutdown returns in
+// roughly one delay, not the sum of both.
+func TestShutdownWaitsOnBothSupervisorsConcurrently(t *testing.T) {
+	const delay = 200 * time.Millisecond
+	ss := &slowSupervisor{delay: delay}
+	is := &slowSupervisor{delay: delay}
+	a := &app{sup: ss, ipsecSup: is}
+
+	start := time.Now()
+	quit := make(chan struct{}, 1)
+	a.shutdown(func() { quit <- struct{}{} })
+	select {
+	case <-quit:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown never completed")
+	}
+	elapsed := time.Since(start)
+
+	if !ss.finished() || !is.finished() {
+		t.Error("shutdown returned before both supervisors' teardown finished")
+	}
+	if elapsed > delay+150*time.Millisecond {
+		t.Errorf("shutdown took %v for two %v-delay supervisors — looks sequential (~%v), not concurrent (~%v)",
+			elapsed, delay, 2*delay, delay)
+	}
+}
+
 // awaitShutdown must not return until the tunnel teardown has finished.
 //
 // This is the regression test for a real leak: fyne installs its OWN

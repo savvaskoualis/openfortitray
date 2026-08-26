@@ -1208,14 +1208,33 @@ func (a *app) shutdown(done func()) {
 			// so doing both here is free and guarantees a clean quit can never leave
 			// EITHER backend's process orphaned, even if that invariant is ever
 			// violated elsewhere.
+			//
+			// The two Waits run concurrently, not sequentially, sharing one
+			// shutdownWait deadline: sequential Waits on the same ctx let the
+			// FIRST one (often the already-inactive backend, mid-teardown from a
+			// recent switch via teardownOtherBackend) consume the whole budget,
+			// starving the second Wait — on the backend that might still be
+			// genuinely live — of any time to observe real completion before the
+			// process exits. That reintroduces exactly the orphaned-tunnel-on-quit
+			// failure this dual-supervisor teardown exists to prevent.
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
 			defer cancel()
-			a.sup.Disconnect()
-			a.sup.Wait(ctx)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.sup.Disconnect()
+				a.sup.Wait(ctx)
+			}()
 			if a.ipsecSup != nil {
-				a.ipsecSup.Disconnect()
-				a.ipsecSup.Wait(ctx)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					a.ipsecSup.Disconnect()
+					a.ipsecSup.Wait(ctx)
+				}()
 			}
+			wg.Wait()
 			if ctx.Err() != nil {
 				log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
 			}
