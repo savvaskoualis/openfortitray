@@ -35,6 +35,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
+	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/shell"
 	"github.com/savvaskoualis/openfortitray/internal/status"
@@ -239,6 +240,18 @@ func (a *app) Connect() {
 // caller reaches it there); the supervisor's goroutines read only the snapshot.
 func (a *app) startTunnel() {
 	prof := *a.cfg.Active()
+	if prof.Backend == config.BackendIPsec {
+		psk, err := credstore.Get(config.IPsecPSKCredstoreKey(prof.Gateway))
+		if err != nil {
+			log.Printf("ipsec: reading PSK from credstore: %v", err)
+		}
+		ipsecSup := ipsec.New(newIPsecRunFunc(prof, psk), a.events)
+		ipsecSup.SetKeepAlive(prof.KeepAlive)
+		a.sup = ipsecSup
+		a.wantConnected.Store(true)
+		a.sup.Connect()
+		return
+	}
 	a.setSnapshot(tunnelParams{
 		prof:            prof,
 		openconnectPath: resolveOpenconnectPath(a.cfg.OpenconnectPath),

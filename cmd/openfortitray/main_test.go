@@ -15,6 +15,7 @@ import (
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
+	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
@@ -150,6 +151,19 @@ func TestStartTunnelThreadsKeepAliveToSupervisor(t *testing.T) {
 	a.startTunnel()
 	if !fs.keepAliveSet() {
 		t.Error("startTunnel must pass the profile's KeepAlive=true through")
+	}
+}
+
+// An IPsec-backend profile must dial through an *ipsec.Supervisor, not the
+// SSL/openconnect *tunnel.Supervisor a.sup starts out holding.
+func TestStartTunnelUsesIPsecSupervisorForIPsecBackend(t *testing.T) {
+	a, _ := newTestApp(t, "vpn.example.com", t.TempDir())
+	a.cfg.Profiles[0].Backend = config.BackendIPsec
+	a.startTunnel()
+	defer a.sup.Disconnect()
+
+	if _, ok := a.sup.(*ipsec.Supervisor); !ok {
+		t.Errorf("a.sup is %T, want *ipsec.Supervisor for an IPsec-backend profile", a.sup)
 	}
 }
 
