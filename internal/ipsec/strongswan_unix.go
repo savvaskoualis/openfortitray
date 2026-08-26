@@ -161,11 +161,13 @@ func NewStrongSwanRunFunc(p config.Profile, psk string) RunFunc {
 		if err := os.WriteFile(connPath, []byte(swanctlConnFragment(p)), 0o644); err != nil {
 			return fmt.Errorf("ipsec: writing swanctl config: %w", err)
 		}
+		defer os.Remove(connPath)
+
+		secretsPath := filepath.Join(dir, connName+".secrets.conf")
 		if err := writeSecretsFragment(p, psk); err != nil {
 			return fmt.Errorf("ipsec: writing swanctl secrets: %w", err)
 		}
-		defer os.Remove(connPath)
-		defer os.Remove(filepath.Join(dir, connName+".secrets.conf"))
+		defer os.Remove(secretsPath)
 
 		if out, err := exec.CommandContext(ctx, "swanctl", "--load-all").CombinedOutput(); err != nil {
 			return fmt.Errorf("ipsec: swanctl --load-all: %w: %s", err, out)
