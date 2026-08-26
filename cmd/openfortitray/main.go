@@ -263,16 +263,25 @@ func (a *app) startTunnel() {
 // immediate Disconnect+Connect is exactly what the tray's own Disconnect-then-
 // Connect already does when a user does it manually — this only automates that.
 //
+// It also unconditionally re-asserts the tray icon and menu, regardless of
+// wantConnected: a sleep/wake cycle can silently drop the NSStatusItem (the same
+// class of issue ReassertTray's OnStarted call already guards against at launch),
+// leaving a live, working app with no visible or clickable tray icon at all.
+//
 // wantConnected, not lastNotified, answers "was this connected": lastNotified is
 // documented pump-goroutine-only, and the OS delivers this callback on its own
 // thread (a Cocoa notification queue, a Windows callback thread, or the D-Bus
 // goroutine) — never the pump.
 func (a *app) onSystemWake() {
-	if !a.wantConnected.Load() {
-		return
-	}
-	log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
+	wantConnected := a.wantConnected.Load()
 	fyne.DoAndWait(func() {
+		if a.tray != nil {
+			a.tray.ReassertTray()
+		}
+		if !wantConnected {
+			return
+		}
+		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
 		a.Connect()
 	})
