@@ -1,0 +1,8 @@
+# Normalize line endings: source is LF everywhere, so gofmt and shell tools
+# behave identically on Windows runners (Git would otherwise check out CRLF and
+# gofmt -l would flag every .go file).
+* text=auto eol=lf
+*.png binary
+*.icns binary
+*.dmg binary
+*.ico binary
