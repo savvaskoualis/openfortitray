@@ -8,6 +8,23 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.42] — 2026-08-26
+
+### Added
+- **IPsec (IKEv2) is now a real, working Protocol option** — not just
+  schema-only plumbing. Pick it in Basic ▸ Protocol, choose pre-shared key
+  or certificate authentication, and connect. On macOS and Linux it drives
+  strongSwan directly (install it separately — `brew install strongswan` on
+  macOS); on Windows it drives the built-in IKEv2 VPN stack, certificate
+  auth only for now (Windows has no supported path for IKEv2 with a
+  pre-shared key — picking PSK there gives a clear message instead of a
+  silent failure). Custom IKE/ESP proposals and identities are available
+  under Advanced for gateways that need them.
+
+### Fixed
+- A pre-shared key typed into Settings no longer vanishes if you switch to
+  another profile before saving.
+
 ## [0.1.41] — 2026-08-26
 
 ### Fixed
