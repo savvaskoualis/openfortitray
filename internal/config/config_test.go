@@ -353,6 +353,47 @@ func TestNewProfileDefaultsToSSLBackend(t *testing.T) {
 	}
 }
 
+func TestNewProfileDefaultsToPSKWithDefaultProposals(t *testing.T) {
+	p := NewProfile("Test")
+	if p.IPsec.AuthMethod != IPsecAuthPSK {
+		t.Errorf("AuthMethod = %q, want %q", p.IPsec.AuthMethod, IPsecAuthPSK)
+	}
+	if p.IPsec.IKEProposal != defaultIPsecProposal {
+		t.Errorf("IKEProposal = %q, want %q", p.IPsec.IKEProposal, defaultIPsecProposal)
+	}
+	if p.IPsec.ESPProposal != defaultIPsecProposal {
+		t.Errorf("ESPProposal = %q, want %q", p.IPsec.ESPProposal, defaultIPsecProposal)
+	}
+}
+
+func TestNormalizeIPsecConfigBackfillsRemoteIDFromGateway(t *testing.T) {
+	p := Profile{Name: "Test", Gateway: "vpn.example.com"}
+	normalizeProfile(&p)
+	if p.IPsec.RemoteID != "vpn.example.com" {
+		t.Errorf("RemoteID = %q, want %q", p.IPsec.RemoteID, "vpn.example.com")
+	}
+}
+
+func TestNormalizeIPsecConfigLeavesExplicitRemoteIDAlone(t *testing.T) {
+	p := Profile{Name: "Test", Gateway: "vpn.example.com",
+		IPsec: IPsecConfig{RemoteID: "custom-remote-id"}}
+	normalizeProfile(&p)
+	if p.IPsec.RemoteID != "custom-remote-id" {
+		t.Errorf("RemoteID = %q, want unchanged %q", p.IPsec.RemoteID, "custom-remote-id")
+	}
+}
+
+func TestIPsecPSKCredstoreKeyDistinctFromSSLCookieKey(t *testing.T) {
+	gw := "vpn.example.com"
+	if IPsecPSKCredstoreKey(gw) == gw {
+		t.Fatal("sanity: gateway alone must not be a valid key")
+	}
+	sslKey := "openfortitray:" + gw
+	if IPsecPSKCredstoreKey(gw) == sslKey {
+		t.Errorf("IPsecPSKCredstoreKey(%q) collides with the SSL cookie key %q", gw, sslKey)
+	}
+}
+
 func mustRead(t *testing.T, dir string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))

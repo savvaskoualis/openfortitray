@@ -70,6 +70,52 @@ const (
 	BackendIPsec Backend = "ipsec"
 )
 
+// IPsecAuthMethod distinguishes how the IKE peer is authenticated. IKEv2
+// only — see the Backend doc comment.
+type IPsecAuthMethod string
+
+const (
+	// IPsecAuthPSK is pre-shared-key authentication. The default, and the
+	// simplest to get working against a fresh gateway config.
+	IPsecAuthPSK IPsecAuthMethod = "psk"
+	// IPsecAuthCert is client-certificate authentication.
+	IPsecAuthCert IPsecAuthMethod = "cert"
+)
+
+// IPsecConfig holds the fields an IPsec (IKEv2-only) profile needs beyond
+// the Gateway field it already shares with SSL profiles. The PSK secret
+// itself is NEVER stored here — it lives in credstore under
+// IPsecPSKCredstoreKey(gateway), exactly like the SSL password/cookie.
+type IPsecConfig struct {
+	AuthMethod IPsecAuthMethod `json:"auth_method"`
+	// LocalID/RemoteID are IKE identities. RemoteID defaults to the
+	// profile's Gateway host when empty (see normalizeIPsecConfig).
+	LocalID  string `json:"local_id,omitempty"`
+	RemoteID string `json:"remote_id,omitempty"`
+	// CertPath/KeyPath are used only when AuthMethod == IPsecAuthCert.
+	CertPath string `json:"cert_path,omitempty"`
+	KeyPath  string `json:"key_path,omitempty"`
+	// IKEProposal/ESPProposal are strongSwan-style cipher-suite strings
+	// (e.g. "aes256-sha256-modp2048"). Pre-filled with a strong default,
+	// editable — this is what makes "any valid IKEv2 config" possible
+	// without a raw config-file paste-in.
+	IKEProposal string `json:"ike_proposal,omitempty"`
+	ESPProposal string `json:"esp_proposal,omitempty"`
+}
+
+// defaultIPsecProposal is the strong, widely-supported modern cipher suite
+// new profiles and normalizeIPsecConfig pre-fill IKEProposal/ESPProposal
+// with.
+const defaultIPsecProposal = "aes256-sha256-modp2048"
+
+// IPsecPSKCredstoreKey is the credstore key an IPsec profile's PSK secret
+// is stored/read under. Distinct from the SSL cookie key
+// ("openfortitray:"+gateway) so a gateway shared by an SSL and an IPsec
+// profile never collides.
+func IPsecPSKCredstoreKey(gateway string) string {
+	return "openfortitray:ipsec-psk:" + gateway
+}
+
 // AuthConfig carries the auth method and its non-secret parameters. A password
 // is NEVER stored here; if password auth is ever implemented the secret goes to
 // the OS keychain, not config.json.
@@ -105,9 +151,10 @@ type Profile struct {
 	CustomPort bool   `json:"custom_port"` // FortiClient EnableCustomPort
 	SAMLPort   int    `json:"saml_port"`   // default 8020
 
-	Auth    AuthConfig `json:"auth"`
-	Backend Backend    `json:"backend"`
-	Realm   string     `json:"realm,omitempty"`
+	Auth    AuthConfig  `json:"auth"`
+	Backend Backend     `json:"backend"`
+	IPsec   IPsecConfig `json:"ipsec,omitempty"`
+	Realm   string      `json:"realm,omitempty"`
 
 	DualStack  bool       `json:"dual_stack"`
 	DTLS       bool       `json:"dtls"`       // default true (PreferDtlsTunnel)
@@ -140,6 +187,11 @@ func defaultProfile() Profile {
 		SAMLPort:        8020,
 		Auth:            AuthConfig{Method: AuthSAML},
 		Backend:         BackendSSL,
+		IPsec: IPsecConfig{
+			AuthMethod:  IPsecAuthPSK,
+			IKEProposal: defaultIPsecProposal,
+			ESPProposal: defaultIPsecProposal,
+		},
 		DTLS:            true,
 		ServerCert:      ServerCert{Mode: CertWarn},
 		RememberSession: true,
@@ -178,8 +230,28 @@ func normalizeProfile(p *Profile) {
 	if p.Backend == "" {
 		p.Backend = BackendSSL
 	}
+	normalizeIPsecConfig(&p.IPsec, p.Gateway)
 	if p.ServerCert.Mode == "" {
 		p.ServerCert.Mode = CertWarn
+	}
+}
+
+// normalizeIPsecConfig fills IPsecConfig fields whose zero value is invalid
+// with their default. RemoteID defaults to the profile's own Gateway host,
+// so a hand-edited or pre-v-ipsec file that never set it still has a usable
+// IKE remote identity.
+func normalizeIPsecConfig(ic *IPsecConfig, gateway string) {
+	if ic.AuthMethod == "" {
+		ic.AuthMethod = IPsecAuthPSK
+	}
+	if ic.IKEProposal == "" {
+		ic.IKEProposal = defaultIPsecProposal
+	}
+	if ic.ESPProposal == "" {
+		ic.ESPProposal = defaultIPsecProposal
+	}
+	if ic.RemoteID == "" {
+		ic.RemoteID = gateway
 	}
 }
 
