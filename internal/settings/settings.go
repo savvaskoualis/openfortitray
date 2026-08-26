@@ -15,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
@@ -76,14 +77,29 @@ type Controller struct {
 	authSelect    *widget.Select
 	authNote      *widget.Label
 	backendSelect *widget.Select
-	backendNote   *widget.Label
-	// The rows that appear and disappear with the chosen auth method / backend,
-	// each in its own container so hiding one reclaims its space as well as its
-	// label (see row).
-	authNoteRow    *fyne.Container
-	backendNoteRow *fyne.Container
-	autoConnect    *widget.Check
-	keepAlive      *widget.Check
+	// The row that appears and disappears with the chosen auth method, in its
+	// own container so hiding it reclaims its space as well as its label (see
+	// row).
+	authNoteRow *fyne.Container
+	autoConnect *widget.Check
+	keepAlive   *widget.Check
+
+	// IPsec auth fields (Connection section). ipsecSecretDirty/ipsecSecretValue
+	// track the PSK entry the same way the SSL password field would: the value
+	// never round-trips from credstore back into the widget (loadProfile always
+	// blanks it), so "dirty" is the only signal Save has that there is
+	// something new to write.
+	ipsecAuthSelect     *widget.Select
+	ipsecSecretEntry    *widget.Entry
+	ipsecSecretDirty    bool
+	ipsecSecretValue    string
+	ipsecCertPathLabel  *widget.Label
+	ipsecKeyPathLabel   *widget.Label
+	ipsecCertPathButton *widget.Button
+	ipsecKeyPathButton  *widget.Button
+	ipsecPSKRow         *fyne.Container
+	ipsecCertRow        *fyne.Container
+	ipsecKeyRow         *fyne.Container
 
 	// Advanced tab.
 	dualStack       *widget.Check
@@ -96,6 +112,14 @@ type Controller struct {
 	samlPortEntry   *widget.Entry
 	openconnectPath *widget.Entry
 	helperPath      *widget.Entry
+
+	// IPsec proposal/identity fields (Advanced tab). Always visible regardless
+	// of Backend, like every other forward-designed-but-inactive field in this
+	// tab — inert for an SSL profile.
+	ikeProposalEntry *widget.Entry
+	espProposalEntry *widget.Entry
+	localIDEntry     *widget.Entry
+	remoteIDEntry    *widget.Entry
 
 	statusText *canvas.Text
 	// reconnectBtn is "Save & Reconnect", enabled only while a tunnel is up.
@@ -330,19 +354,60 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 			return
 		}
 		c.work.Profiles[c.sel].Backend = backendFromLabel(label)
-		c.updateBackendNote()
+		c.updateIPsecAuthVisibility()
 	})
-	c.backendNote = widget.NewLabel("")
-	c.backendNote.Importance = widget.WarningImportance
 
-	// Auth/backend sub-fields. Only SSL+SAML is wired into the runtime; these are
-	// shown so the roadmap is visible but kept disabled (updateAuthNote and
-	// updateBackendNote toggle them), and Save refuses to activate an
-	// unsupported backend or auth method. They still round-trip to the config so
-	// the shape is forward-designed.
+	// Auth sub-field. Only SAML is wired into the runtime; this is shown so the
+	// roadmap is visible but kept disabled (updateAuthNote toggles it), and Save
+	// refuses to activate an unsupported auth method. It still round-trips to
+	// the config so the shape is forward-designed.
 
 	c.authNoteRow = c.row("", c.authNote)
-	c.backendNoteRow = c.row("", c.backendNote)
+
+	c.ipsecAuthSelect = widget.NewSelect(ipsecAuthLabels, func(label string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].IPsec.AuthMethod = ipsecAuthFromLabel(label)
+		c.updateIPsecAuthVisibility()
+	})
+
+	c.ipsecSecretEntry = widget.NewPasswordEntry()
+	c.ipsecSecretEntry.OnChanged = func(v string) {
+		if c.loading {
+			return
+		}
+		c.ipsecSecretDirty = true
+		c.ipsecSecretValue = v
+	}
+
+	c.ipsecCertPathLabel = widget.NewLabel("")
+	c.ipsecCertPathButton = widget.NewButton("Choose certificate…", func() {
+		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
+			if err != nil || f == nil {
+				return
+			}
+			defer f.Close()
+			c.work.Profiles[c.sel].IPsec.CertPath = f.URI().Path()
+			c.ipsecCertPathLabel.SetText(f.URI().Path())
+		}, c.win)
+	})
+
+	c.ipsecKeyPathLabel = widget.NewLabel("")
+	c.ipsecKeyPathButton = widget.NewButton("Choose private key…", func() {
+		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
+			if err != nil || f == nil {
+				return
+			}
+			defer f.Close()
+			c.work.Profiles[c.sel].IPsec.KeyPath = f.URI().Path()
+			c.ipsecKeyPathLabel.SetText(f.URI().Path())
+		}, c.win)
+	})
+
+	c.ipsecPSKRow = c.row("Pre-shared key", c.ipsecSecretEntry)
+	c.ipsecCertRow = c.row("Certificate", container.NewHBox(c.ipsecCertPathButton, c.ipsecCertPathLabel))
+	c.ipsecKeyRow = c.row("Private key", container.NewHBox(c.ipsecKeyPathButton, c.ipsecKeyPathLabel))
 
 	c.autoConnect = widget.NewCheck("Auto-connect at login", func(on bool) {
 		if c.loading {
@@ -367,25 +432,29 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 	// reader no way to tell which fields belong together, and "Realm" next to
 	// "Auto-connect at login" implies a relationship that does not exist.
 	//
-	// Connection is built from group (not the section helper) so the IPsec note
-	// can sit right under Protocol, the control that triggers it, the same way
-	// Authentication already mixes a form with a conditional row below it. Using
-	// section here would only accept FormItems and force the note two rows away
-	// from the field it explains.
+	// Connection is built from group (not the section helper) so the IPsec
+	// auth/secret/cert rows can sit right under Protocol, the control that
+	// triggers them, the same way Authentication already mixes a form with a
+	// conditional row below it. Using section here would only accept FormItems
+	// and force those rows away from the field they explain.
 	connectionForm := widget.NewForm(
 		widget.NewFormItem("Profile name", c.nameEntry),
 		widget.NewFormItem("Gateway host", c.gatewayEntry),
 		widget.NewFormItem("Port", narrow(c.portEntry, 150)),
 		widget.NewFormItem("Protocol", c.backendSelect),
+		widget.NewFormItem("IPsec auth", c.ipsecAuthSelect),
 	)
 	c.forms = append(c.forms, connectionForm)
 
 	return sections(
 		c.group("Connection",
 			connectionForm,
-			// The note row sits outside that form, in its own container, so the
-			// group closes up under SSL instead of leaving a hole under Protocol.
-			c.backendNoteRow,
+			// These rows sit outside that form, each in its own container, so
+			// the group closes up under whichever IPsec auth fields do not
+			// apply instead of leaving a hole under IPsec auth.
+			c.ipsecPSKRow,
+			c.ipsecCertRow,
+			c.ipsecKeyRow,
 		),
 		c.group("Authentication",
 			c.row("Method", c.authSelect),
@@ -612,7 +681,8 @@ func (c *Controller) selectTab(tab string) {
 // accepts (an unconfigured profile is savable) — still shows as invalid. The
 // backend and auth controls are Selects with no error affordance, so they are
 // only focused; the banner carries the "choose SSL VPN" / "choose SAML / SSO"
-// instruction.
+// instruction. The IPsec cert/key fields are buttons, not entries, so they too
+// are only focused — the banner names the file to choose.
 func (c *Controller) markField(issue *Issue) {
 	var focus fyne.Focusable
 	switch issue.Field {
@@ -632,6 +702,15 @@ func (c *Controller) markField(issue *Issue) {
 	case FieldSplitDNS:
 		markEntryInvalid(c.splitDNS, "one domain per line, e.g. corp.example.com")
 		focus = c.splitDNS
+	case FieldIPsecAuth:
+		focus = c.ipsecAuthSelect
+	case FieldIPsecSecret:
+		markEntryInvalid(c.ipsecSecretEntry, "a pre-shared key is required")
+		focus = c.ipsecSecretEntry
+	case FieldIPsecCertPath:
+		focus = c.ipsecCertPathButton
+	case FieldIPsecKeyPath:
+		focus = c.ipsecKeyPathButton
 	}
 	if focus != nil {
 		c.win.Canvas().Focus(focus)
@@ -665,6 +744,15 @@ func (c *Controller) loadProfile(i int) {
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 	c.keepAlive.SetChecked(p.KeepAlive)
 
+	c.ipsecAuthSelect.SetSelected(ipsecAuthLabel(p.IPsec.AuthMethod))
+	c.ipsecCertPathLabel.SetText(p.IPsec.CertPath)
+	c.ipsecKeyPathLabel.SetText(p.IPsec.KeyPath)
+	// Never pre-fill a secret field with a stored value — same convention the
+	// SSL password field already follows (were it implemented). The PSK itself
+	// lives in credstore, not in the working copy, so there is nothing to show.
+	c.ipsecSecretDirty = false
+	c.ipsecSecretEntry.SetText("")
+
 	// Advanced tab.
 	c.dualStack.SetChecked(p.DualStack)
 	c.dtls.SetChecked(p.DTLS)
@@ -676,9 +764,13 @@ func (c *Controller) loadProfile(i int) {
 	c.samlPortEntry.SetText(itoa(effectiveSAMLPort(p.SAMLPort)))
 	c.openconnectPath.SetText(effectiveOpenconnectPath(c.work.OpenconnectPath))
 	c.helperPath.SetText(c.work.HelperPath)
+	c.ikeProposalEntry.SetText(p.IPsec.IKEProposal)
+	c.espProposalEntry.SetText(p.IPsec.ESPProposal)
+	c.localIDEntry.SetText(p.IPsec.LocalID)
+	c.remoteIDEntry.SetText(p.IPsec.RemoteID)
 
 	c.loading = false
-	c.updateBackendNote()
+	c.updateIPsecAuthVisibility()
 	c.updateAuthNote()
 }
 
@@ -694,15 +786,18 @@ func (c *Controller) updateAuthNote() {
 	c.relayout()
 }
 
-// updateBackendNote refreshes the IPsec warning shown next to the Protocol
-// select. This is only the visual affordance shown before the user even tries
-// to Save; the real gate is validateBackendSupported, which Save and Connect
-// both run regardless of what this note says.
-func (c *Controller) updateBackendNote() {
+// updateIPsecAuthVisibility shows the PSK row XOR the cert+key rows based on
+// the working copy's chosen IPsec auth method, and hides all three entirely
+// when the active profile is not an IPsec profile — an SSL profile has no
+// reason to show any IPsec field. Called from the backendSelect and
+// ipsecAuthSelect callbacks, and from loadProfile.
+func (c *Controller) updateIPsecAuthVisibility() {
 	p := c.work.Profiles[c.sel]
-	text := backendNoteText(p.Backend)
-	c.backendNote.SetText(text)
-	show(c.backendNoteRow, text != "")
+	isIPsec := p.Backend == config.BackendIPsec
+	isCert := p.IPsec.AuthMethod == config.IPsecAuthCert
+	show(c.ipsecPSKRow, isIPsec && !isCert)
+	show(c.ipsecCertRow, isIPsec && isCert)
+	show(c.ipsecKeyRow, isIPsec && isCert)
 	c.relayout()
 }
 
@@ -803,6 +898,40 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 	rememberNote := widget.NewLabel("Skips the browser login while the session is valid; off never stores it.")
 	rememberNote.Wrapping = fyne.TextWrapWord
 
+	// IPsec proposal/identity fields. Bound the same way the tab's other
+	// advanced text fields already are. Always visible regardless of Backend —
+	// they're inert (never read) for an SSL profile, matching how every other
+	// forward-designed-but-inactive field in this app already behaves (e.g.
+	// Auth.CertPath for the not-yet-implemented AuthCert method).
+	c.ikeProposalEntry = widget.NewEntry()
+	c.ikeProposalEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].IPsec.IKEProposal = s
+	}
+	c.espProposalEntry = widget.NewEntry()
+	c.espProposalEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].IPsec.ESPProposal = s
+	}
+	c.localIDEntry = widget.NewEntry()
+	c.localIDEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].IPsec.LocalID = s
+	}
+	c.remoteIDEntry = widget.NewEntry()
+	c.remoteIDEntry.OnChanged = func(s string) {
+		if c.loading {
+			return
+		}
+		c.work.Profiles[c.sel].IPsec.RemoteID = s
+	}
+
 	// Same rows, same order, grouped. The Paths group last on purpose: it is where
 	// the two fields live that break the app if they are wrong, so it should not be
 	// the first thing a browsing user reaches for.
@@ -824,6 +953,12 @@ func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
 		c.section("DNS",
 			widget.NewFormItem("Split-DNS domains", c.splitDNS),
 			widget.NewFormItem("", splitDNSNote),
+		),
+		c.section("IPsec",
+			widget.NewFormItem("IKE proposal", c.ikeProposalEntry),
+			widget.NewFormItem("ESP proposal", c.espProposalEntry),
+			widget.NewFormItem("Local ID", c.localIDEntry),
+			widget.NewFormItem("Remote ID", c.remoteIDEntry),
 		),
 		c.section("Paths",
 			widget.NewFormItem("SAML redirect port", narrow(c.samlPortEntry, 150)),
@@ -864,6 +999,17 @@ func (c *Controller) save(reconnect bool) {
 	if err := c.host.Commit(work); err != nil {
 		c.showBanner("Could not save: " + err.Error())
 		return
+	}
+	// Persist the IPsec PSK secret, if one was entered. Like the SSL
+	// password/cookie, it is never stored in config.json — only in credstore,
+	// keyed by gateway (config.IPsecPSKCredstoreKey).
+	profile := c.work.Profiles[c.sel]
+	if profile.Backend == config.BackendIPsec && profile.IPsec.AuthMethod == config.IPsecAuthPSK && c.ipsecSecretDirty {
+		if err := credstore.Set(config.IPsecPSKCredstoreKey(profile.Gateway), c.ipsecSecretValue); err != nil {
+			c.showBanner("Could not save the pre-shared key: " + err.Error())
+			return
+		}
+		c.ipsecSecretDirty = false
 	}
 	// Keep the visible working copy consistent with what was just persisted.
 	c.work = cloneConfig(work)

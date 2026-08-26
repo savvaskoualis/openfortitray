@@ -361,9 +361,19 @@ func TestFirstConnectIssue(t *testing.T) {
 			wantTab: TabBasic, wantField: FieldPort, wantMsgSub: "port",
 		},
 		{
-			name:    "unsupported ipsec backend routes to Basic backend",
-			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}},
-			wantTab: TabBasic, wantField: FieldBackend, wantMsgSub: "IPsec is not yet supported",
+			name:    "a ready ipsec profile with psk auth has no issue",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}},
+			wantNil: true,
+		},
+		{
+			name:    "ipsec cert auth without a certificate routes to Basic cert path",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthCert}},
+			wantTab: TabBasic, wantField: FieldIPsecCertPath, wantMsgSub: "certificate",
+		},
+		{
+			name:    "ipsec cert auth with a certificate but no key routes to Basic key path",
+			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthCert, CertPath: "/x.crt"}},
+			wantTab: TabBasic, wantField: FieldIPsecKeyPath, wantMsgSub: "private key",
 		},
 		{
 			name:    "unsupported password auth routes to Basic auth",
@@ -497,48 +507,17 @@ func TestValidateAuthGating(t *testing.T) {
 	}
 }
 
-// Save must refuse to activate a profile whose backend has no runtime, and
-// must accept an SSL active profile even if a non-active one is IPsec.
-func TestValidateBackendGating(t *testing.T) {
-	tests := []struct {
-		name    string
-		cfg     *config.Config
-		wantErr bool
-	}{
-		{
-			name: "active ssl profile passes",
-			cfg: &config.Config{
-				ActiveProfile: "Work", OpenconnectPath: "openconnect",
-				Profiles: []config.Profile{{Name: "Work", Backend: config.BackendSSL, Auth: config.AuthConfig{Method: config.AuthSAML}}},
-			},
-			wantErr: false,
-		},
-		{
-			name: "active ipsec profile is rejected",
-			cfg: &config.Config{
-				ActiveProfile: "Work", OpenconnectPath: "openconnect",
-				Profiles: []config.Profile{{Name: "Work", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}}},
-			},
-			wantErr: true,
-		},
-		{
-			name: "a non-active ipsec profile does not block Save",
-			cfg: &config.Config{
-				ActiveProfile: "Work", OpenconnectPath: "openconnect",
-				Profiles: []config.Profile{
-					{Name: "Work", Backend: config.BackendSSL, Auth: config.AuthConfig{Method: config.AuthSAML}},
-					{Name: "Lab", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}},
-				},
-			},
-			wantErr: false,
-		},
+// Save no longer refuses an IPsec profile at all — the strongSwan/native
+// Windows runtimes exist now, and validateBackendSupported (the old refusal)
+// is gone. An IPsec profile — even one incomplete for its chosen auth method
+// — still saves; FirstConnectIssue is what gates Connect on completeness.
+func TestValidateConfigAcceptsIPsecBackend(t *testing.T) {
+	cfg := &config.Config{
+		ActiveProfile: "Work", OpenconnectPath: "openconnect",
+		Profiles: []config.Profile{{Name: "Work", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}}},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := validateConfig(tc.cfg); (err != nil) != tc.wantErr {
-				t.Errorf("validateConfig err=%v, wantErr=%v", err, tc.wantErr)
-			}
-		})
+	if err := validateConfig(cfg); err != nil {
+		t.Errorf("validateConfig should accept an IPsec profile now, got err=%v", err)
 	}
 }
 
@@ -647,24 +626,6 @@ func TestAuthMethodNoteText(t *testing.T) {
 	}
 }
 
-func TestBackendNoteText(t *testing.T) {
-	tests := []struct {
-		name    string
-		backend config.Backend
-		want    string
-	}{
-		{"ssl is the only wired backend", config.BackendSSL, ""},
-		{"ipsec is not yet supported", config.BackendIPsec, "(IPsec is not yet supported)"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := backendNoteText(tc.backend); got != tc.want {
-				t.Errorf("backendNoteText(%v) = %q, want %q", tc.backend, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestBackendLabelRoundTrip(t *testing.T) {
 	for _, b := range []config.Backend{config.BackendSSL, config.BackendIPsec} {
 		if got := backendFromLabel(backendLabel(b)); got != b {
@@ -676,6 +637,38 @@ func TestBackendLabelRoundTrip(t *testing.T) {
 	}
 	if got := backendFromLabel("bogus label"); got != config.BackendSSL {
 		t.Errorf("unknown label should fall back to SSL backend, got %q", got)
+	}
+}
+
+func TestIPsecAuthLabelRoundTrip(t *testing.T) {
+	for _, m := range []config.IPsecAuthMethod{config.IPsecAuthPSK, config.IPsecAuthCert} {
+		if got := ipsecAuthFromLabel(ipsecAuthLabel(m)); got != m {
+			t.Errorf("round trip: %q -> %q -> %q", m, ipsecAuthLabel(m), got)
+		}
+	}
+}
+
+func TestValidateIPsecFieldsPresentPSKNeedsNothingHere(t *testing.T) {
+	field, msg := validateIPsecFieldsPresent(config.IPsecConfig{AuthMethod: config.IPsecAuthPSK})
+	if field != "" || msg != "" {
+		t.Errorf("PSK: got field=%q msg=%q, want both empty (secret lives in credstore, checked elsewhere)", field, msg)
+	}
+}
+
+func TestValidateIPsecFieldsPresentCertRequiresCertAndKey(t *testing.T) {
+	field, _ := validateIPsecFieldsPresent(config.IPsecConfig{AuthMethod: config.IPsecAuthCert})
+	if field != FieldIPsecCertPath {
+		t.Errorf("no cert/key set: field = %q, want %q", field, FieldIPsecCertPath)
+	}
+	field, _ = validateIPsecFieldsPresent(config.IPsecConfig{
+		AuthMethod: config.IPsecAuthCert, CertPath: "/x.crt"})
+	if field != FieldIPsecKeyPath {
+		t.Errorf("cert set, no key: field = %q, want %q", field, FieldIPsecKeyPath)
+	}
+	field, _ = validateIPsecFieldsPresent(config.IPsecConfig{
+		AuthMethod: config.IPsecAuthCert, CertPath: "/x.crt", KeyPath: "/x.key"})
+	if field != "" {
+		t.Errorf("both set: field = %q, want empty", field)
 	}
 }
 
