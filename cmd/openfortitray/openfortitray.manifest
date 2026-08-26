@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Windows application manifest for openfortitray.
+
+  Why this exists: on Windows there is NO privileged helper. The app runs
+  openconnect directly, and openconnect needs Administrator rights to create the
+  wintun virtual adapter. Without elevation the SAML auth succeeds but the tunnel
+  never comes up. Elevation used to arrive only from the login scheduled task
+  (schtasks ... /RL HIGHEST), so any launch from the Start-menu shortcut — or any
+  manual launch — ran non-elevated and failed to bring the link up.
+
+  requireAdministrator makes EVERY launch elevated: Windows shows a UAC prompt on
+  a manual/Start-menu launch, and runs elevated with no prompt when started by the
+  pre-authorized /RL HIGHEST login task. The Windows shell uses the "runas" verb.
+
+  This manifest is compiled into a *.syso resource at build time (see the Makefile
+  and .github/workflows) and auto-linked by the Go toolchain for the windows
+  target only. It has no effect on macOS or Linux builds.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="OpenFortiTray"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
