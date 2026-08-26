@@ -43,6 +43,10 @@ func attachNativeGlass(ctx any) {
 		log.Print("glass: RunNative returned a zero HWND, skipping")
 		return
 	}
+	if err := procDwmSetWindowAttribute.Find(); err != nil {
+		log.Printf("glass: DwmSetWindowAttribute unavailable: %v", err)
+		return
+	}
 	backdrop := int32(dwmsbtTransientWindow)
 	hr, _, _ := procDwmSetWindowAttribute.Call(
 		wc.HWND,

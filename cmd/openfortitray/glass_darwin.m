@@ -18,8 +18,22 @@ void oft_attach_glass(uintptr_t nswindowPtr) {
     return;
   }
 
+  static NSString *const oftGlassIdentifier = @"oft-glass";
+
+  for (NSView *existing in contentView.subviews) {
+    if ([existing.identifier isEqualToString:oftGlassIdentifier]) {
+      // Already attached to this content view: just keep it sized to match
+      // (the window may have been resized since), and skip allocating a
+      // second one. Reveal() calls this on every window show, so without
+      // this check each reveal would stack another full-bounds view.
+      existing.frame = contentView.bounds;
+      return;
+    }
+  }
+
   NSVisualEffectView *glass =
       [[NSVisualEffectView alloc] initWithFrame:contentView.bounds];
+  glass.identifier = oftGlassIdentifier;
   glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   glass.blendingMode = NSVisualEffectBlendingModeBehindWindow;
   glass.material = NSVisualEffectMaterialMenu;
