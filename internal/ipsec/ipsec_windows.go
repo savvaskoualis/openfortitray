@@ -42,22 +42,49 @@ func parseVpnConnectionStatus(s string) vpnStatus {
 	}
 }
 
-// addVpnConnectionArgs builds Add-VpnConnection's argument list for p.
-// PSK/cert secrets are passed via a separate secured-string argument in
-// runPowerShell, never interpolated into this slice as plain text.
-func addVpnConnectionArgs(p config.Profile) []string {
-	authMethod := "PSK"
-	if p.IPsec.AuthMethod == config.IPsecAuthCert {
-		authMethod = "MachineCertificate"
+// vpnConnArg is one Add-VpnConnection flag and its value. Kept as a
+// flag/value pair — rather than a flat []string — specifically so the
+// flag token and its value are never confused when rendering the command
+// line: PowerShell only recognizes an UNQUOTED -Flag token as a parameter
+// designator; a quoted "-Flag" is parsed as a plain string literal and
+// falls through to positional binding instead. Blanket-quoting a flat
+// []string (as an earlier version of this file did) silently breaks
+// every Add-VpnConnection call for exactly this reason.
+type vpnConnArg struct {
+	flag  string
+	value string
+}
+
+// addVpnConnectionArgs builds Add-VpnConnection's flag/value pairs for p.
+// Windows IKEv2 in this app supports certificate authentication ONLY —
+// see NewWindowsRunFunc, which refuses PSK profiles before ever calling
+// here. Add-VpnConnection's -AuthenticationMethod ValidateSet is
+// Pap/Chap/MSChapv2/Eap/MachineCertificate (verified against Microsoft's
+// documented parameter reference): "PSK" is not a member under any
+// casing, and -L2tpPsk is documented for L2TP authentication only, not
+// IKEv2 — there is no supported Add-VpnConnection path for IKEv2+PSK, so
+// this always emits MachineCertificate.
+func addVpnConnectionArgs(p config.Profile) []vpnConnArg {
+	return []vpnConnArg{
+		{"-Name", vpnConnectionName},
+		{"-ServerAddress", p.Gateway},
+		{"-TunnelType", "IKEv2"},
+		{"-AuthenticationMethod", "MachineCertificate"},
+		{"-EncryptionLevel", "Required"},
 	}
-	return []string{
-		"-Name", vpnConnectionName,
-		"-ServerAddress", p.Gateway,
-		"-TunnelType", "IKEv2",
-		"-AuthenticationMethod", authMethod,
-		"-EncryptionLevel", "Required",
-		"-Force",
+}
+
+// renderAddVpnConnectionCmd renders args into an Add-VpnConnection
+// PowerShell command line: flag tokens are emitted bare and only values
+// are double-quoted, preserving the distinction vpnConnArg's doc comment
+// describes. -Force is a switch parameter (no value), appended bare.
+func renderAddVpnConnectionCmd(args []vpnConnArg) string {
+	parts := make([]string, 0, len(args)*2+2)
+	for _, a := range args {
+		parts = append(parts, a.flag, fmt.Sprintf("%q", a.value))
 	}
+	parts = append(parts, "-Force")
+	return "Add-VpnConnection " + strings.Join(parts, " ")
 }
 
 // runPowerShell runs a PowerShell command with args, returning combined
@@ -70,16 +97,23 @@ func runPowerShell(ctx context.Context, args ...string) (string, error) {
 }
 
 // NewWindowsRunFunc returns the RunFunc that drives Windows' native IKEv2
-// VPN stack for profile, using psk (ignored unless AuthMethod ==
-// IPsecAuthPSK).
+// VPN stack for profile. psk is accepted for interface parity with
+// NewStrongSwanRunFunc (Task 6 calls both platforms' constructors
+// uniformly) but is otherwise unused here: Windows IKEv2 in this app only
+// supports certificate authentication (see addVpnConnectionArgs), so a
+// PSK-auth profile is refused immediately below rather than attempted —
+// there is no documented Add-VpnConnection path for IKEv2+PSK, and
+// passing a secret as a plaintext PowerShell command-line argument would
+// also be visible via process enumeration / Security Event Log auditing.
 func NewWindowsRunFunc(p config.Profile, psk string) RunFunc {
+	_ = psk
 	return func(ctx context.Context, connected func(ip string)) error {
-		addArgs := addVpnConnectionArgs(p)
 		if p.IPsec.AuthMethod == config.IPsecAuthPSK {
-			addArgs = append(addArgs, "-L2tpPsk", psk)
+			return fmt.Errorf("ipsec: PSK auth is not supported for IPsec on Windows — use a certificate, or connect from macOS/Linux")
 		}
-		cmdline := fmt.Sprintf("Remove-VpnConnection -Name %q -Force -ErrorAction SilentlyContinue; Add-VpnConnection %s",
-			vpnConnectionName, strings.Join(quoteArgs(addArgs), " "))
+
+		cmdline := fmt.Sprintf("Remove-VpnConnection -Name %q -Force -ErrorAction SilentlyContinue; %s",
+			vpnConnectionName, renderAddVpnConnectionCmd(addVpnConnectionArgs(p)))
 		if out, err := runPowerShell(ctx, cmdline); err != nil {
 			return fmt.Errorf("ipsec: Add-VpnConnection: %w: %s", err, out)
 		}
@@ -107,6 +141,11 @@ func NewWindowsRunFunc(p config.Profile, psk string) RunFunc {
 				case vpnConnected:
 					if !reportedConnected {
 						reportedConnected = true
+						// ClientIPAddress is assumed, not confirmed: it does
+						// not appear in Microsoft's documented example
+						// Get-VpnConnection output. Best-effort — an error
+						// here still calls connected() with an empty ip
+						// rather than failing the whole connection.
 						ip, _ := runPowerShell(ctx, fmt.Sprintf(
 							"(Get-VpnConnection -Name %q).ClientIPAddress", vpnConnectionName))
 						connected(strings.TrimSpace(ip))
@@ -119,16 +158,4 @@ func NewWindowsRunFunc(p config.Profile, psk string) RunFunc {
 			}
 		}
 	}
-}
-
-// quoteArgs wraps each arg in double quotes for interpolation into a
-// PowerShell command line built via -Command; values here are either
-// fixed strings (see addVpnConnectionArgs) or the profile's own Gateway,
-// never raw user free-text that could break out of the quoting.
-func quoteArgs(args []string) []string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		out[i] = fmt.Sprintf("%q", a)
-	}
-	return out
 }
