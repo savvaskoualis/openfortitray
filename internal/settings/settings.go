@@ -195,6 +195,16 @@ func (c *Controller) Apply(e tunnel.Event) {
 func (c *Controller) reset() {
 	c.work = cloneConfig(c.host.Config())
 	c.sel = c.indexOf(c.work.ActiveProfile)
+	// ipsecSecretDirty/ipsecSecretValue hold in-memory-only edits (never
+	// committed until Save's credstore.Set), same as every field in c.work —
+	// discarding "any edits left from a previous session" means dropping
+	// these too, for every profile, not just the one about to be shown.
+	// Without this, a PSK typed and then abandoned via Cancel — or by
+	// reopening the window without saving — would reappear the next time
+	// that profile is viewed, echoing back a not-yet-saved secret the same
+	// way this app is careful never to echo back a stored one.
+	c.ipsecSecretDirty = map[int]bool{}
+	c.ipsecSecretValue = map[int]string{}
 	c.syncProfileBar()
 	c.loadProfile(c.sel)
 }

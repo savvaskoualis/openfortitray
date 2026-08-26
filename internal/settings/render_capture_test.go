@@ -88,3 +88,46 @@ func TestCaptureWindowRenders(t *testing.T) {
 		}
 	}
 }
+
+// TestResetClearsUnsavedIPsecSecret confirms reset() (called by both Show and
+// Cancel) discards a typed-but-unsaved IPsec PSK, matching its documented
+// contract of discarding "any edits left from a previous session" across the
+// whole working copy — not just the profile currently on screen. Before
+// ipsecSecretDirty/ipsecSecretValue became per-profile maps,
+// loadProfile unconditionally blanked the (then-flat) PSK field on every
+// call, so Cancel/Show got this "discard" behavior for free as a side effect
+// of the very bug that fix corrected; now that loadProfile reads from the
+// maps instead of blindly blanking, reset() has to clear them itself.
+func TestResetClearsUnsavedIPsecSecret(t *testing.T) {
+	test.NewApp()
+
+	work := config.NewProfile("Work")
+	work.Gateway = "vpn.example.com"
+	work.Backend = config.BackendIPsec
+	work.IPsec.AuthMethod = config.IPsecAuthPSK
+	cfg := &config.Config{ActiveProfile: "Work", Profiles: []config.Profile{work}}
+
+	w := test.NewWindow(nil)
+	defer w.Close()
+	c := New(&captureHost{cfg: cfg}, w)
+
+	c.ipsecSecretEntry.SetText("typed-but-not-saved")
+	if !c.ipsecSecretDirty[c.sel] {
+		t.Fatal("typing into the PSK entry should have marked it dirty")
+	}
+	if c.ipsecSecretValue[c.sel] != "typed-but-not-saved" {
+		t.Fatalf("ipsecSecretValue[%d] = %q, want the typed text", c.sel, c.ipsecSecretValue[c.sel])
+	}
+
+	c.reset() // what both Show and Cancel do
+
+	if c.ipsecSecretEntry.Text != "" {
+		t.Errorf("after reset, the PSK entry shows %q, want blank", c.ipsecSecretEntry.Text)
+	}
+	if c.ipsecSecretDirty[c.sel] {
+		t.Error("after reset, the PSK entry should no longer be marked dirty")
+	}
+	if v, ok := c.ipsecSecretValue[c.sel]; ok {
+		t.Errorf("after reset, ipsecSecretValue still holds %q for profile %d, want the map cleared", v, c.sel)
+	}
+}
