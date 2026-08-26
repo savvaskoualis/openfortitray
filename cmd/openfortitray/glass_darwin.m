@@ -32,7 +32,15 @@ void oft_attach_glass(uintptr_t nswindowPtr) {
     return;
   }
 
-  window.titlebarAppearsTransparent = YES;
+  // Deliberately NOT setting window.titlebarAppearsTransparent: the
+  // content view (and our glass view sized to match it) sits BELOW the
+  // titlebar, not behind it — a transparent titlebar with nothing drawn
+  // there just shows whatever's on the desktop behind the window, raw and
+  // unblurred, right above our actually-blurred content. That read as a
+  // glitchy mismatched strip in practice, not a unified look. The
+  // titlebar's own native (opaque) material — the same one every other
+  // vibrant macOS app's title bar uses above its blurred sidebar/content —
+  // is the correct, consistent choice here.
 
   // `current` here is Fyne's own GL-backed rendering view (GLFW installs it
   // directly as window.contentView) — NOT a plain container. Adding the
