@@ -58,11 +58,35 @@ type supervisor interface {
 
 // app adapts the packages to tray.App; it holds no logic of its own.
 type app struct {
-	cfg     *config.Config
-	cfgDir  string
-	sup     supervisor
-	events  chan tunnel.Event
-	logPath string
+	cfg    *config.Config
+	cfgDir string
+	// sup is the SSL/openconnect supervisor. Like ipsecSup, it is long-lived:
+	// constructed once (in main, via tunnel.New) and reused across every
+	// Connect/Disconnect of this backend via SetKeepAlive/Connect/Disconnect —
+	// never rebuilt per Connect.
+	sup supervisor
+	// ipsecSup is the IPsec supervisor, constructed lazily by startTunnel the
+	// first time an IPsec-backend profile is dialed and reused from then on,
+	// exactly like sup. Nil until that first IPsec Connect (including in every
+	// test that never dials IPsec).
+	ipsecSup supervisor
+	// ipsecTP is the snapshot of the active profile and PSK the IPsec tunnel
+	// dials, refreshed by startTunnel on every IPsec Connect — the IPsec
+	// counterpart of tp/snapshot()/setSnapshot() below, which do the same job
+	// for the SSL path. ipsecSup's RunFunc reads this fresh on every attempt
+	// (see ipsecRun) rather than closing over a profile/PSK fixed at
+	// construction time, which is what lets ipsecSup stay long-lived across a
+	// Save & Reconnect that edited the IPsec profile's gateway or PSK.
+	ipsecTP ipsecParams
+	// activeBackend records which backend startTunnel most recently started —
+	// config.BackendSSL (or the zero value, before any Connect) or
+	// config.BackendIPsec. Disconnect, shutdown and onSystemWake resolve
+	// "the currently active supervisor" through activeSup(), which reads this,
+	// rather than assuming a.sup: startTunnel may have most recently started
+	// a.ipsecSup instead.
+	activeBackend config.Backend
+	events        chan tunnel.Event
+	logPath       string
 
 	fyneApp  fyne.App
 	tray     *tray.Controller
@@ -175,6 +199,13 @@ type app struct {
 	// badge + menu item update every check; the dialog does not nag). Guarded by
 	// updateMu; consulted via shouldPromptUpdate.
 	lastPromptedTag string
+
+	// ipsecRunFunc builds the platform IPsec RunFunc for a profile/PSK — the
+	// package's newIPsecRunFunc (ipsecrun_unix.go / ipsecrun_windows.go) when
+	// nil, which is what production leaves it as. Tests substitute a fake here
+	// (see ipsecRun) so the IPsec path is exercised without shelling out to a
+	// real swanctl/strongSwan install or driving Windows' native IKEv2 stack.
+	ipsecRunFunc func(config.Profile, string) ipsec.RunFunc
 }
 
 // tunnelParams is the subset of config the tunnel dials with, snapshotted so the
@@ -196,6 +227,93 @@ func (a *app) setSnapshot(tp tunnelParams) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.tp = tp
+}
+
+// ipsecParams is the IPsec counterpart of tunnelParams: the profile and PSK
+// the IPsec tunnel actually dials, snapshotted so ipsecSup's RunFunc (which
+// runs on the supervisor's own goroutine) never reads the live *config.Config
+// the settings window may be rewriting on the UI goroutine.
+type ipsecParams struct {
+	prof config.Profile
+	psk  string
+}
+
+func (a *app) ipsecSnapshot() ipsecParams {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ipsecTP
+}
+
+func (a *app) setIPsecSnapshot(tp ipsecParams) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ipsecTP = tp
+}
+
+// activeSup returns whichever supervisor backend actually last started a
+// tunnel — a.ipsecSup once startTunnel has dialed an IPsec-backend profile,
+// a.sup otherwise (including before any Connect, when activeBackend is still
+// its zero value). Disconnect, shutdown and onSystemWake must resolve through
+// this rather than assuming a.sup, or they operate on a stale/wrong
+// supervisor once the active backend has changed.
+func (a *app) activeSup() supervisor {
+	if a.activeBackend == config.BackendIPsec && a.ipsecSup != nil {
+		return a.ipsecSup
+	}
+	return a.sup
+}
+
+// teardownOtherBackend disconnects and bounds-waits whichever backend's
+// supervisor is NOT about to be used for a Connect to want, so switching
+// backends (SSL profile ↔ IPsec profile, or a Protocol edit on the same
+// profile) never leaves the previous backend's tunnel running and
+// unreachable — the orphaned-tunnel half of the bug this fixes, alongside
+// activeBackend fixing the "stuck on the wrong supervisor forever" half.
+//
+// Disconnect() is synchronous and cheap (it only cancels the loop's context),
+// so it runs inline. Wait() is NOT run inline: startTunnel runs on the UI
+// goroutine (see its doc comment), and Wait can block for the backend's full
+// teardown budget (shutdownWait — up to ~32s on the SSL/helper path, per
+// shutdown's doc comment), which would freeze the tray/window for a routine
+// backend switch. Wait instead runs on its own goroutine, still bounded by
+// shutdownWait and logged if it overruns — mirroring shutdown's own pattern —
+// so the old backend's teardown is still guaranteed to complete, just off the
+// UI goroutine.
+//
+// Idempotent and safe to call unconditionally on every startTunnel: a
+// supervisor that was never started, or is already stopped, no-ops both
+// Disconnect and Wait.
+func (a *app) teardownOtherBackend(want config.Backend) {
+	other := a.sup
+	if want != config.BackendIPsec {
+		other = a.ipsecSup
+	}
+	if other == nil {
+		return
+	}
+	other.Disconnect()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+		defer cancel()
+		other.Wait(ctx)
+		if ctx.Err() != nil {
+			log.Printf("openfortitray: previous backend did not stop within %s while switching backends", shutdownWait)
+		}
+	}()
+}
+
+// ipsecRun is ipsecSup's RunFunc. Like the SSL path's runFn (see main), it
+// reads a.ipsecSnapshot() fresh on every attempt rather than closing over a
+// profile/PSK fixed when ipsecSup was constructed, which is what lets
+// ipsecSup stay long-lived (constructed once, reused) across a Save &
+// Reconnect that edited the gateway or PSK.
+func (a *app) ipsecRun(ctx context.Context, connected func(ip string)) error {
+	tp := a.ipsecSnapshot()
+	build := a.ipsecRunFunc
+	if build == nil {
+		build = newIPsecRunFunc
+	}
+	return build(tp.prof, tp.psk)(ctx, connected)
 }
 
 // Connect starts the tunnel, unless the active profile has a blocking config
@@ -240,18 +358,34 @@ func (a *app) Connect() {
 // caller reaches it there); the supervisor's goroutines read only the snapshot.
 func (a *app) startTunnel() {
 	prof := *a.cfg.Active()
+	a.wantConnected.Store(true)
+	// Switching backend since the last Connect (SSL ↔ IPsec, via either a
+	// different active profile or a Protocol edit on this one) — tear the
+	// other backend's supervisor down first so it is never left running and
+	// unreachable. A no-op when the backend has not changed. See
+	// teardownOtherBackend's doc comment.
+	a.teardownOtherBackend(prof.Backend)
+
 	if prof.Backend == config.BackendIPsec {
-		psk, err := credstore.Get(config.IPsecPSKCredstoreKey(prof.Gateway))
+		// credstore.ErrBusy (the OS secret store not yet unlocked — e.g. an
+		// autostart-at-login launch racing the macOS login keychain) must not
+		// read as "no PSK stored": retry through it the same way
+		// cookieGetWithRetry already does for the SSL cookie.
+		psk, err := a.cookieGetWithRetry(context.Background(), config.IPsecPSKCredstoreKey(prof.Gateway))
 		if err != nil {
 			log.Printf("ipsec: reading PSK from credstore: %v", err)
 		}
-		ipsecSup := ipsec.New(newIPsecRunFunc(prof, psk), a.events)
-		ipsecSup.SetKeepAlive(prof.KeepAlive)
-		a.sup = ipsecSup
-		a.wantConnected.Store(true)
-		a.sup.Connect()
+		a.setIPsecSnapshot(ipsecParams{prof: prof, psk: psk})
+		if a.ipsecSup == nil {
+			a.ipsecSup = ipsec.New(a.ipsecRun, a.events)
+		}
+		a.activeBackend = config.BackendIPsec
+		a.ipsecSup.SetKeepAlive(prof.KeepAlive)
+		a.ipsecSup.Connect()
 		return
 	}
+
+	a.activeBackend = config.BackendSSL
 	a.setSnapshot(tunnelParams{
 		prof:            prof,
 		openconnectPath: resolveOpenconnectPath(a.cfg.OpenconnectPath),
@@ -262,7 +396,6 @@ func (a *app) startTunnel() {
 	// supervisor's first authFn call reads it. A later re-mint within this same
 	// Connect (gateway rejected the stored cookie) finds the flag set and runs SAML.
 	a.storedCookieTried.Store(false)
-	a.wantConnected.Store(true)
 	a.sup.SetKeepAlive(prof.KeepAlive)
 	a.sup.Connect()
 }
@@ -453,7 +586,7 @@ func resolveBundledOpenconnect(configured, exeDir string, exists func(string) bo
 
 func (a *app) Disconnect() {
 	a.wantConnected.Store(false)
-	a.sup.Disconnect()
+	a.activeSup().Disconnect()
 }
 func (a *app) AutostartEnabled() bool { return autostart.IsEnabled() }
 func (a *app) LogPath() string        { return a.logPath }
@@ -544,6 +677,7 @@ func (a *app) Commit(c *config.Config) error {
 	// few edits make an existing one useless or unwanted, so delete it here —
 	// while a.cfg still holds the OLD profiles to compare against.
 	a.reconcileStoredCookies(a.cfg, c)
+	a.reconcileStoredIPsecPSKs(a.cfg, c)
 	*a.cfg = *c
 	return nil
 }
@@ -580,6 +714,74 @@ func (a *app) reconcileStoredCookies(old, new *config.Config) {
 					log.Printf("auth: could not delete stored session cookie: %v", err)
 				}
 			}
+		}
+	}
+}
+
+// reconcileStoredIPsecPSKs deletes stored IPsec pre-shared keys that the edit
+// from old to new makes unreachable through this app — the IPsec counterpart
+// of reconcileStoredCookies for the SSL cookie, keyed by gateway
+// (config.IPsecPSKCredstoreKey) rather than by profile name. It runs on the
+// UI goroutine (from Commit, alongside reconcileStoredCookies); deletion is
+// best-effort and only logged.
+//
+// Two triggers — deliberately one more than reconcileStoredCookies needs,
+// because a PSK key is not reachable at all once its profile is gone the way
+// a cookie's still is (nothing else in this app derives a gateway from a
+// deleted profile to delete a cookie by, so that gap exists there too but is
+// out of scope here):
+//
+//   - a profile matched by name whose gateway changed: the OLD gateway's PSK
+//     is deleted (a PSK for the new gateway must be entered/saved fresh under
+//     the new key anyway — see Important #4's per-profile PSK map).
+//   - a profile present in old with no same-named counterpart in new (deleted
+//     — or renamed, which matching by name cannot tell apart from a delete;
+//     but since the PSK key is the GATEWAY, not the name, a plain rename never
+//     orphans anything, because the key is unchanged).
+//
+// Both triggers skip the delete when some OTHER profile in new still uses the
+// same gateway: two profiles may legitimately point at the same IPsec gateway
+// and share its PSK, and deleting it out from under the survivor would be
+// worse than leaving a stale key at rest.
+func (a *app) reconcileStoredIPsecPSKs(old, new *config.Config) {
+	if a.cookieDelete == nil {
+		return
+	}
+	gatewayStillUsed := func(gw string) bool {
+		if gw == "" {
+			return false
+		}
+		for _, p := range new.Profiles {
+			if p.Backend == config.BackendIPsec && p.Gateway == gw {
+				return true
+			}
+		}
+		return false
+	}
+	deleteFor := func(gw string) {
+		if gw == "" || gatewayStillUsed(gw) {
+			return
+		}
+		if err := a.cookieDelete(config.IPsecPSKCredstoreKey(gw)); err != nil {
+			log.Printf("ipsec: could not delete stored PSK: %v", err)
+		}
+	}
+
+	newByName := make(map[string]config.Profile, len(new.Profiles))
+	for _, p := range new.Profiles {
+		newByName[p.Name] = p
+	}
+	for _, op := range old.Profiles {
+		if op.Backend != config.BackendIPsec {
+			continue
+		}
+		np, ok := newByName[op.Name]
+		if !ok {
+			deleteFor(op.Gateway) // deleted (or renamed; see doc comment)
+			continue
+		}
+		if np.Gateway != op.Gateway {
+			deleteFor(op.Gateway)
 		}
 	}
 }
@@ -999,10 +1201,21 @@ func (a *app) shutdown(done func()) {
 			// keeps the process alive for exactly this work) can never wait out its
 			// full timeout on a teardown that already finished or panicked.
 			defer close(a.shutdownDone)
-			a.sup.Disconnect()
+			// Tear down BOTH supervisors, not just activeSup(): teardownOtherBackend
+			// already stops the inactive one on every backend switch, so normally
+			// only activeSup() has anything to do, but Disconnect/Wait are idempotent
+			// no-ops on a supervisor that was never started or is already stopped —
+			// so doing both here is free and guarantees a clean quit can never leave
+			// EITHER backend's process orphaned, even if that invariant is ever
+			// violated elsewhere.
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
 			defer cancel()
+			a.sup.Disconnect()
 			a.sup.Wait(ctx)
+			if a.ipsecSup != nil {
+				a.ipsecSup.Disconnect()
+				a.ipsecSup.Wait(ctx)
+			}
 			if ctx.Err() != nil {
 				log.Printf("openfortitray: backend did not stop within %s", shutdownWait)
 			}

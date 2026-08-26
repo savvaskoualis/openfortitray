@@ -46,12 +46,34 @@ func newTestApp(t *testing.T, gateway, cfgDir string) (*app, chan struct{}) {
 		cfgDir: cfgDir,
 		sup:    tunnel.New(authFn, runFn, events),
 		events: events,
+		// The credstore seam: an empty in-memory fake, so a test that switches the
+		// active profile to an IPsec backend (startTunnel then reads the PSK
+		// through this) never touches the real keychain, and a fast bounded retry
+		// window so cookieGetWithRetry's ErrBusy loop does not actually sleep in
+		// tests that never hit it.
+		cookieGet:           credstore.NewMemory().Get,
+		cookieRetryInterval: time.Millisecond,
+		cookieRetryWindow:   10 * time.Millisecond,
+		// A fake IPsec RunFunc, so a test that switches the active profile to an
+		// IPsec backend never shells out to a real swanctl/strongSwan install (or,
+		// on Windows, the native IKEv2 stack): it just blocks until ctx is
+		// cancelled, mirroring the SSL runFn fake above.
+		ipsecRunFunc: func(config.Profile, string) ipsec.RunFunc {
+			return func(ctx context.Context, connected func(ip string)) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		},
 	}
 	t.Cleanup(func() {
-		a.sup.Disconnect()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		a.sup.Disconnect()
 		a.sup.Wait(ctx)
+		if a.ipsecSup != nil {
+			a.ipsecSup.Disconnect()
+			a.ipsecSup.Wait(ctx)
+		}
 	})
 	return a, authCalled
 }
@@ -154,16 +176,131 @@ func TestStartTunnelThreadsKeepAliveToSupervisor(t *testing.T) {
 	}
 }
 
-// An IPsec-backend profile must dial through an *ipsec.Supervisor, not the
-// SSL/openconnect *tunnel.Supervisor a.sup starts out holding.
+// An IPsec-backend profile must dial through an *ipsec.Supervisor — a.ipsecSup,
+// resolved via activeSup() — not the SSL/openconnect *tunnel.Supervisor a.sup
+// holds. a.sup itself must be left untouched: it is long-lived and reused
+// across backend switches (Critical #1), not reconstructed.
 func TestStartTunnelUsesIPsecSupervisorForIPsecBackend(t *testing.T) {
 	a, _ := newTestApp(t, "vpn.example.com", t.TempDir())
+	sslSup := a.sup
 	a.cfg.Profiles[0].Backend = config.BackendIPsec
 	a.startTunnel()
-	defer a.sup.Disconnect()
 
-	if _, ok := a.sup.(*ipsec.Supervisor); !ok {
-		t.Errorf("a.sup is %T, want *ipsec.Supervisor for an IPsec-backend profile", a.sup)
+	if _, ok := a.ipsecSup.(*ipsec.Supervisor); !ok {
+		t.Errorf("a.ipsecSup is %T, want *ipsec.Supervisor for an IPsec-backend profile", a.ipsecSup)
+	}
+	if _, ok := a.activeSup().(*ipsec.Supervisor); !ok {
+		t.Errorf("a.activeSup() is %T, want *ipsec.Supervisor once an IPsec-backend profile has connected", a.activeSup())
+	}
+	if a.sup != sslSup {
+		t.Error("a.sup must be left untouched by an IPsec-backend startTunnel — it is the long-lived SSL supervisor, not reconstructed per call")
+	}
+}
+
+// The reverse direction of Critical #1: connecting with an IPsec-backend
+// profile and then switching to (or reconnecting with) an SSL-backend profile
+// must make the SSL supervisor active again — a.sup, resolved via
+// activeSup() — not leave the app stuck on the stale IPsec supervisor with
+// its now-wrong gateway/PSK baked into ipsecRun's snapshot. It must also
+// disconnect the now-inactive IPsec supervisor rather than orphaning it.
+func TestStartTunnelSwitchesBackToSSLSupervisorAfterIPsec(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	// A fake IPsec RunFunc that signals (via tornDown) exactly when it actually
+	// observes ctx cancellation, so the test can prove teardownOtherBackend's
+	// Disconnect really reached the running loop rather than merely asserting
+	// something that could pass on a no-op.
+	tornDown := make(chan struct{})
+	a.ipsecRunFunc = func(config.Profile, string) ipsec.RunFunc {
+		return func(ctx context.Context, connected func(ip string)) error {
+			<-ctx.Done()
+			close(tornDown)
+			return ctx.Err()
+		}
+	}
+
+	// Connect on IPsec first.
+	a.cfg.Profiles[0].Backend = config.BackendIPsec
+	a.startTunnel()
+	if _, ok := a.ipsecSup.(*ipsec.Supervisor); !ok {
+		t.Fatalf("a.ipsecSup is %T, want *ipsec.Supervisor", a.ipsecSup)
+	}
+	if _, ok := a.activeSup().(*ipsec.Supervisor); !ok {
+		t.Fatalf("a.activeSup() is %T after an IPsec Connect, want *ipsec.Supervisor", a.activeSup())
+	}
+
+	// Switch the active profile back to SSL and reconnect.
+	a.cfg.Profiles[0].Backend = config.BackendSSL
+	a.startTunnel()
+
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("switching back to an SSL-backend profile must dial through the SSL supervisor")
+	}
+	if a.activeSup() != a.sup {
+		t.Errorf("a.activeSup() = %T after switching back to SSL, want the original a.sup", a.activeSup())
+	}
+
+	// The now-inactive IPsec supervisor must have been disconnected, not left
+	// running and unreachable (the orphaned-tunnel half of Critical #1).
+	select {
+	case <-tornDown:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the outgoing IPsec supervisor was never disconnected when switching back to SSL — an orphaned tunnel")
+	}
+}
+
+// startTunnel's IPsec PSK read must retry through credstore.ErrBusy (the OS
+// secret store not yet unlocked, e.g. an autostart-at-login launch racing the
+// macOS login keychain) rather than dialing with an empty PSK — collapsing
+// ErrBusy to "no PSK stored" would silently break a connect that should have
+// succeeded (Important #3, the startTunnel half; validateIPsecPSKPresent in
+// internal/settings covers the other call site).
+func TestStartTunnelRetriesIPsecPSKReadOnBusyStore(t *testing.T) {
+	a, _ := newTestApp(t, "vpn.example.com", t.TempDir())
+	a.cookieRetryInterval = time.Millisecond
+	a.cookieRetryWindow = time.Second
+
+	mem := credstore.NewMemory()
+	key := config.IPsecPSKCredstoreKey("vpn.example.com")
+	if err := mem.Set(key, "REAL-PSK"); err != nil {
+		t.Fatalf("mem.Set: %v", err)
+	}
+	var calls int
+	a.cookieGet = func(k string) (string, error) {
+		calls++
+		if calls < 3 {
+			return "", credstore.ErrBusy
+		}
+		return mem.Get(k)
+	}
+
+	sawPSK := make(chan string, 1)
+	a.ipsecRunFunc = func(p config.Profile, psk string) ipsec.RunFunc {
+		return func(ctx context.Context, connected func(ip string)) error {
+			select {
+			case sawPSK <- psk:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+
+	a.cfg.Profiles[0].Backend = config.BackendIPsec
+	a.startTunnel()
+
+	select {
+	case psk := <-sawPSK:
+		if psk != "REAL-PSK" {
+			t.Errorf("PSK reaching the IPsec RunFunc = %q, want the stored REAL-PSK (a busy-then-valid store must not be treated as empty)", psk)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("IPsec RunFunc never ran")
+	}
+	if calls < 3 {
+		t.Errorf("cookieGet called %d times, want at least 3 (two busy + one success)", calls)
 	}
 }
 
@@ -588,6 +725,57 @@ func TestReconcileStoredCookies(t *testing.T) {
 			a.reconcileStoredCookies(cfg(base), cfg(tc.new))
 
 			stored, _ := mem.Get(cookieKey("g1.example.com"))
+			deleted := stored == ""
+			if deleted != tc.wantDelete {
+				t.Errorf("deleted = %v, want %v (stored=%q)", deleted, tc.wantDelete, stored)
+			}
+		})
+	}
+}
+
+// reconcileStoredIPsecPSKs deletes the stored PSK exactly when an edit or a
+// profile deletion makes it unreachable through this app — Important #5.
+func TestReconcileStoredIPsecPSKs(t *testing.T) {
+	base := config.Profile{Name: "P", Gateway: "g1.example.com", Backend: config.BackendIPsec,
+		IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}}
+	cfg := func(profs ...config.Profile) *config.Config {
+		return &config.Config{ActiveProfile: "P", Profiles: profs}
+	}
+	mut := func(f func(*config.Profile)) config.Profile {
+		p := base
+		f(&p)
+		return p
+	}
+
+	tests := []struct {
+		name       string
+		newProfs   []config.Profile
+		wantDelete bool
+	}{
+		{"unchanged keeps PSK", []config.Profile{base}, false},
+		{"gateway change deletes the old gateway's PSK",
+			[]config.Profile{mut(func(p *config.Profile) { p.Gateway = "g2.example.com" })}, true},
+		{"unrelated edit keeps PSK",
+			[]config.Profile{mut(func(p *config.Profile) { p.KeepAlive = true })}, false},
+		{"profile deleted (no same-named counterpart) deletes its PSK",
+			[]config.Profile{{Name: "Other", Gateway: "g9.example.com"}}, true},
+		{"gateway change but another profile still uses the old gateway keeps it",
+			[]config.Profile{
+				mut(func(p *config.Profile) { p.Gateway = "g2.example.com" }),
+				{Name: "Shares old gateway", Gateway: "g1.example.com", Backend: config.BackendIPsec,
+					IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}},
+			}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := credstore.NewMemory()
+			key := config.IPsecPSKCredstoreKey("g1.example.com")
+			mem.Set(key, "PSK")
+			a := &app{cookieDelete: mem.Delete}
+
+			a.reconcileStoredIPsecPSKs(cfg(base), cfg(tc.newProfs...))
+
+			stored, _ := mem.Get(key)
 			deleted := stored == ""
 			if deleted != tc.wantDelete {
 				t.Errorf("deleted = %v, want %v (stored=%q)", deleted, tc.wantDelete, stored)
