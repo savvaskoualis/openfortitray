@@ -8,6 +8,23 @@ tags. Dates are the release date.
 
 _Nothing yet._
 
+## [0.1.39] — 2026-08-26
+
+### Added
+- **Every window now shows a real translucent backdrop.** True native
+  vibrancy on macOS, a native Acrylic backdrop on Windows, and native
+  compositor blur on KDE/X11 Linux — everywhere else, a simulated
+  translucent look with no live blur. Buttons, form fields, and detail rows
+  stay on solid backing, so nothing loses legibility over whatever happens
+  to be behind the window.
+
+### Fixed
+- **The tray icon could go dark after the laptop woke from sleep.** The app
+  stayed alive and working — VPN, reconnect, everything — but the menu-bar
+  icon itself could silently disappear, leaving no way to reach it short of
+  quitting and relaunching. Waking from sleep now re-asserts the icon and
+  menu, the same way the app already does once at launch.
+
 ## [0.1.38] — 2026-08-25
 
 ### Added
