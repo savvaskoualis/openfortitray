@@ -85,14 +85,20 @@ type Controller struct {
 	keepAlive   *widget.Check
 
 	// IPsec auth fields (Connection section). ipsecSecretDirty/ipsecSecretValue
-	// track the PSK entry the same way the SSL password field would: the value
-	// never round-trips from credstore back into the widget (loadProfile always
-	// blanks it), so "dirty" is the only signal Save has that there is
-	// something new to write.
+	// track the PSK entry, keyed by profile index (c.sel) — mirroring how
+	// every other field writes straight into c.work.Profiles[c.sel] — so an
+	// unsaved PSK typed for one profile survives switching the profile
+	// dropdown to another and back, exactly like every other in-memory edit,
+	// instead of silently evaporating. deleteProfile reindexes both maps when
+	// a profile is removed. The value never round-trips from a stored
+	// credstore secret back into the widget — the maps only ever hold what
+	// was typed this session (loadProfile reads them, never credstore); an
+	// unset index is the zero value (false / ""), which is exactly "nothing
+	// typed yet for this profile".
 	ipsecAuthSelect     *widget.Select
 	ipsecSecretEntry    *widget.Entry
-	ipsecSecretDirty    bool
-	ipsecSecretValue    string
+	ipsecSecretDirty    map[int]bool
+	ipsecSecretValue    map[int]string
 	ipsecCertPathLabel  *widget.Label
 	ipsecKeyPathLabel   *widget.Label
 	ipsecCertPathButton *widget.Button
@@ -140,7 +146,12 @@ type Controller struct {
 // New builds the settings window on the given (not-yet-shown) window and wires
 // it to host. The window is left hidden; the tray's Settings… item calls Show.
 func New(host Host, win fyne.Window) *Controller {
-	c := &Controller{host: host, win: win}
+	c := &Controller{
+		host:             host,
+		win:              win,
+		ipsecSecretDirty: map[int]bool{},
+		ipsecSecretValue: map[int]string{},
+	}
 	// Populate the working copy before build: SetContent renders the Form, which
 	// runs the entry validators immediately, and the name validator reads
 	// c.work. reset() then repaints list + form with the loaded values.
@@ -377,8 +388,8 @@ func (c *Controller) buildBasicTab() fyne.CanvasObject {
 		if c.loading {
 			return
 		}
-		c.ipsecSecretDirty = true
-		c.ipsecSecretValue = v
+		c.ipsecSecretDirty[c.sel] = true
+		c.ipsecSecretValue[c.sel] = v
 	}
 
 	c.ipsecCertPathLabel = widget.NewLabel("")
@@ -748,10 +759,12 @@ func (c *Controller) loadProfile(i int) {
 	c.ipsecCertPathLabel.SetText(p.IPsec.CertPath)
 	c.ipsecKeyPathLabel.SetText(p.IPsec.KeyPath)
 	// Never pre-fill a secret field with a stored value — same convention the
-	// SSL password field already follows (were it implemented). The PSK itself
-	// lives in credstore, not in the working copy, so there is nothing to show.
-	c.ipsecSecretDirty = false
-	c.ipsecSecretEntry.SetText("")
+	// SSL password field already follows (were it implemented). The PSK
+	// itself lives in credstore, not in the working copy; what this shows is
+	// only ever a not-yet-saved edit typed earlier this session for this
+	// exact profile (map miss = ""), so browsing away and back does not lose
+	// it, and a fresh/never-touched profile still shows blank.
+	c.ipsecSecretEntry.SetText(c.ipsecSecretValue[i])
 
 	// Advanced tab.
 	c.dualStack.SetChecked(p.DualStack)
@@ -1000,16 +1013,21 @@ func (c *Controller) save(reconnect bool) {
 		c.showBanner("Could not save: " + err.Error())
 		return
 	}
-	// Persist the IPsec PSK secret, if one was entered. Like the SSL
-	// password/cookie, it is never stored in config.json — only in credstore,
-	// keyed by gateway (config.IPsecPSKCredstoreKey).
+	// Persist the IPsec PSK secret, if one was entered for the profile
+	// currently shown in the form. Like the SSL password/cookie, it is never
+	// stored in config.json — only in credstore, keyed by gateway
+	// (config.IPsecPSKCredstoreKey). ipsecSecretDirty/ipsecSecretValue are
+	// keyed by profile index, so this reads c.sel's entry specifically.
 	profile := c.work.Profiles[c.sel]
-	if profile.Backend == config.BackendIPsec && profile.IPsec.AuthMethod == config.IPsecAuthPSK && c.ipsecSecretDirty {
-		if err := credstore.Set(config.IPsecPSKCredstoreKey(profile.Gateway), c.ipsecSecretValue); err != nil {
+	if profile.Backend == config.BackendIPsec && profile.IPsec.AuthMethod == config.IPsecAuthPSK && c.ipsecSecretDirty[c.sel] {
+		if err := credstore.Set(config.IPsecPSKCredstoreKey(profile.Gateway), c.ipsecSecretValue[c.sel]); err != nil {
 			c.showBanner("Could not save the pre-shared key: " + err.Error())
 			return
 		}
-		c.ipsecSecretDirty = false
+		// Persisted: drop the plaintext from memory rather than leaving it
+		// sitting in the map for the life of the window.
+		delete(c.ipsecSecretDirty, c.sel)
+		delete(c.ipsecSecretValue, c.sel)
 	}
 	// Keep the visible working copy consistent with what was just persisted.
 	c.work = cloneConfig(work)
@@ -1082,7 +1100,9 @@ func (c *Controller) deleteProfile() {
 			if !ok {
 				return
 			}
+			removed := c.sel
 			c.work.Profiles = append(c.work.Profiles[:c.sel], c.work.Profiles[c.sel+1:]...)
+			c.reindexIPsecSecrets(removed)
 			// If the active profile was removed, fall back to the first one.
 			if c.work.ActiveProfile == victim.Name {
 				c.work.ActiveProfile = c.work.Profiles[0].Name
@@ -1093,6 +1113,42 @@ func (c *Controller) deleteProfile() {
 			c.syncProfileBar()
 			c.loadProfile(c.sel)
 		}, c.win)
+}
+
+// reindexIPsecSecrets drops the not-yet-saved PSK edit (if any) for the
+// profile at index removed, and shifts every later index down by one, so
+// ipsecSecretDirty/ipsecSecretValue — keyed by profile index — stay aligned
+// with c.work.Profiles after deleteProfile shifts everything after removed
+// left by one. There is no other per-profile state indexed this way in
+// Controller to mirror; this keeps the map correct rather than merely
+// crash-safe — an un-reindexed map would otherwise silently attach one
+// profile's typed-but-unsaved secret to a different, unrelated profile the
+// next time that index is loaded.
+func (c *Controller) reindexIPsecSecrets(removed int) {
+	dirty := map[int]bool{}
+	value := map[int]string{}
+	for idx, v := range c.ipsecSecretDirty {
+		switch {
+		case idx == removed:
+			continue
+		case idx > removed:
+			dirty[idx-1] = v
+		default:
+			dirty[idx] = v
+		}
+	}
+	for idx, v := range c.ipsecSecretValue {
+		switch {
+		case idx == removed:
+			continue
+		case idx > removed:
+			value[idx-1] = v
+		default:
+			value[idx] = v
+		}
+	}
+	c.ipsecSecretDirty = dirty
+	c.ipsecSecretValue = value
 }
 
 func (c *Controller) setActive() {

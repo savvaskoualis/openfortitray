@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 
@@ -179,12 +180,29 @@ func validateIPsecFieldsPresent(ic config.IPsecConfig) (field, message string) {
 	return "", ""
 }
 
+// validateIPsecPSKPresent reports whether an IPsec PSK-auth profile has a
+// stored secret in credstore. Only meaningful when Backend == BackendIPsec
+// and IPsec.AuthMethod == IPsecAuthPSK; the caller gates on that.
+//
+// Unlike validateIPsecFieldsPresent, this does real I/O (a credstore read),
+// so it is deliberately kept as its own function rather than folded into
+// that one, which stays pure and needs no widget tree or credstore backend
+// to test. Tests swap credstore.SetBackend(credstore.NewMemory()) to avoid
+// touching the real OS keychain.
+func validateIPsecPSKPresent(gateway string) error {
+	secret, err := credstore.Get(config.IPsecPSKCredstoreKey(gateway))
+	if err != nil || secret == "" {
+		return errors.New("no PSK stored")
+	}
+	return nil
+}
+
 // authMethodNoteText returns the warning text for a profile's auth method, or
-// "" when the method is the one wired into the runtime (SAML). Like
-// backendNoteText, this is only the visual affordance shown next to the
-// Method select before the user even tries to Save; the actual gate is
-// validateAuthSupported, which Save and Connect both run regardless of what
-// this text says. Pure, so it is testable without a widget tree.
+// "" when the method is the one wired into the runtime (SAML). This is only
+// the visual affordance shown next to the Method select before the user even
+// tries to Save; the actual gate is validateAuthSupported, which Save and
+// Connect both run regardless of what this text says. Pure, so it is
+// testable without a widget tree.
 func authMethodNoteText(method config.AuthMethod) string {
 	switch method {
 	case config.AuthPassword:
@@ -572,9 +590,13 @@ type Issue struct {
 // active profile from dialing, or nil when it is ready to connect. It inspects
 // only the active profile — the one Connect dials — and reuses the same
 // validators Save runs (validateHost, validatePortValue,
-// validateAuthSupported, validateFingerprint, validateDomain,
-// validateIPsecFieldsPresent), so the Connect path and Save can never
-// disagree about what "valid" means.
+// validateAuthSupported, validateFingerprint, validateDomain), so the Connect
+// path and Save can never disagree about what "valid" means for those
+// fields. It additionally runs validateIPsecFieldsPresent and
+// validateIPsecPSKPresent, which Save deliberately does not: an IPsec
+// profile that is incomplete for its chosen auth method, or a PSK with
+// nothing yet stored in credstore, still saves — only Connect refuses it,
+// the same way an empty gateway is savable but not connectable.
 //
 // Issues are returned in a fixed, user-facing order so the guidance always
 // points at the most fundamental fix first — gateway, then port, then auth
@@ -613,6 +635,12 @@ func FirstConnectIssue(cfg *config.Config) *Issue {
 	if prof.Backend == config.BackendIPsec {
 		if field, msg := validateIPsecFieldsPresent(prof.IPsec); field != "" {
 			return &Issue{name, TabBasic, field, msg}
+		}
+		if prof.IPsec.AuthMethod == config.IPsecAuthPSK {
+			if validateIPsecPSKPresent(prof.Gateway) != nil {
+				return &Issue{name, TabBasic, FieldIPsecSecret,
+					"Enter a pre-shared key in Basic ▸ Pre-shared key."}
+			}
 		}
 	}
 

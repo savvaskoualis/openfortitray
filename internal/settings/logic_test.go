@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
@@ -361,9 +362,16 @@ func TestFirstConnectIssue(t *testing.T) {
 			wantTab: TabBasic, wantField: FieldPort, wantMsgSub: "port",
 		},
 		{
+			// credstore is seeded with a PSK for this exact gateway below, before
+			// the loop runs.
 			name:    "a ready ipsec profile with psk auth has no issue",
-			profile: config.Profile{Name: "Work", Gateway: "vpn.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}},
+			profile: config.Profile{Name: "Work", Gateway: "vpn-psk-stored.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}},
 			wantNil: true,
+		},
+		{
+			name:    "ipsec psk profile with no stored secret routes to Basic pre-shared key",
+			profile: config.Profile{Name: "Work", Gateway: "vpn-psk-missing.example.com", Backend: config.BackendIPsec, Auth: config.AuthConfig{Method: config.AuthSAML}, IPsec: config.IPsecConfig{AuthMethod: config.IPsecAuthPSK}},
+			wantTab: TabBasic, wantField: FieldIPsecSecret, wantMsgSub: "pre-shared key",
 		},
 		{
 			name:    "ipsec cert auth without a certificate routes to Basic cert path",
@@ -391,6 +399,16 @@ func TestFirstConnectIssue(t *testing.T) {
 			wantTab: TabAdvanced, wantField: FieldSplitDNS, wantMsgSub: "split-DNS",
 		},
 	}
+
+	// validateIPsecPSKPresent reads credstore; swap in an in-memory fake so this
+	// test never touches the real OS keychain, and seed the one gateway the
+	// "ready" ipsec/psk case above expects to already have a secret.
+	restore := credstore.SetBackend(credstore.NewMemory())
+	defer restore()
+	if err := credstore.Set(config.IPsecPSKCredstoreKey("vpn-psk-stored.example.com"), "s3cr3t"); err != nil {
+		t.Fatalf("seeding credstore: %v", err)
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{ActiveProfile: tc.profile.Name, Profiles: []config.Profile{tc.profile}}
@@ -669,6 +687,79 @@ func TestValidateIPsecFieldsPresentCertRequiresCertAndKey(t *testing.T) {
 		AuthMethod: config.IPsecAuthCert, CertPath: "/x.crt", KeyPath: "/x.key"})
 	if field != "" {
 		t.Errorf("both set: field = %q, want empty", field)
+	}
+}
+
+// validateIPsecPSKPresent does real I/O (a credstore read), so it is tested
+// against an in-memory fake backend rather than the real OS keychain.
+func TestValidateIPsecPSKPresent(t *testing.T) {
+	restore := credstore.SetBackend(credstore.NewMemory())
+	defer restore()
+
+	if err := validateIPsecPSKPresent("vpn.example.com"); err == nil {
+		t.Error("no secret stored: want an error, got nil")
+	}
+	if err := credstore.Set(config.IPsecPSKCredstoreKey("vpn.example.com"), ""); err != nil {
+		t.Fatalf("credstore.Set: %v", err)
+	}
+	if err := validateIPsecPSKPresent("vpn.example.com"); err == nil {
+		t.Error("empty secret stored: want an error, got nil")
+	}
+	if err := credstore.Set(config.IPsecPSKCredstoreKey("vpn.example.com"), "s3cr3t"); err != nil {
+		t.Fatalf("credstore.Set: %v", err)
+	}
+	if err := validateIPsecPSKPresent("vpn.example.com"); err != nil {
+		t.Errorf("secret stored: want nil, got %v", err)
+	}
+	// A different gateway's PSK must not satisfy this one — keys are
+	// namespaced per-gateway.
+	if err := validateIPsecPSKPresent("other.example.com"); err == nil {
+		t.Error("different gateway, no secret stored for it: want an error, got nil")
+	}
+}
+
+// reindexIPsecSecrets keeps ipsecSecretDirty/ipsecSecretValue — keyed by
+// profile index — aligned with c.work.Profiles after deleteProfile removes
+// one element and every later profile shifts left by one. Exercised directly
+// against a bare Controller: it only touches these two maps, so it needs no
+// host, window, or built widget tree.
+func TestReindexIPsecSecretsAfterDelete(t *testing.T) {
+	c := &Controller{
+		ipsecSecretDirty: map[int]bool{0: true, 1: true, 2: true},
+		ipsecSecretValue: map[int]string{0: "a", 1: "b", 2: "c"},
+	}
+	// Removing the profile that was at index 1 ("b") must drop its own
+	// entry, and shift index 2 ("c") down to 1 so it still lines up with
+	// its profile's new position; index 0 ("a") is untouched.
+	c.reindexIPsecSecrets(1)
+
+	wantValue := map[int]string{0: "a", 1: "c"}
+	if !reflect.DeepEqual(c.ipsecSecretValue, wantValue) {
+		t.Errorf("ipsecSecretValue = %v, want %v", c.ipsecSecretValue, wantValue)
+	}
+	wantDirty := map[int]bool{0: true, 1: true}
+	if !reflect.DeepEqual(c.ipsecSecretDirty, wantDirty) {
+		t.Errorf("ipsecSecretDirty = %v, want %v", c.ipsecSecretDirty, wantDirty)
+	}
+}
+
+// Removing index 0 (the first profile) must not leave a stale/duplicated
+// entry at 0 — every later index shifts down by one and nothing points past
+// the new end of the (now shorter) profile list.
+func TestReindexIPsecSecretsAfterDeleteFirst(t *testing.T) {
+	c := &Controller{
+		ipsecSecretDirty: map[int]bool{0: true, 1: true},
+		ipsecSecretValue: map[int]string{0: "a", 1: "b"},
+	}
+	c.reindexIPsecSecrets(0)
+
+	wantValue := map[int]string{0: "b"}
+	if !reflect.DeepEqual(c.ipsecSecretValue, wantValue) {
+		t.Errorf("ipsecSecretValue = %v, want %v", c.ipsecSecretValue, wantValue)
+	}
+	wantDirty := map[int]bool{0: true}
+	if !reflect.DeepEqual(c.ipsecSecretDirty, wantDirty) {
+		t.Errorf("ipsecSecretDirty = %v, want %v", c.ipsecSecretDirty, wantDirty)
 	}
 }
 
