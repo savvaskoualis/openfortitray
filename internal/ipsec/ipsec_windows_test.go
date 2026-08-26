@@ -4,10 +4,12 @@ package ipsec
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 func TestParseVpnConnectionStatusRecognizesEachState(t *testing.T) {
@@ -100,6 +102,13 @@ func TestNewWindowsRunFuncRefusesPSKWithoutCallingPowerShell(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "PSK") || !strings.Contains(err.Error(), "certificate") {
 		t.Errorf("error %q should clearly mention both PSK and certificate", err.Error())
+	}
+	// Deterministic: switching to PSK auth on Windows can never succeed by
+	// retrying (Add-VpnConnection has no IKEv2+PSK path at all), and PSK is
+	// the default IPsecAuthMethod for a new profile, so this must be wrapped
+	// as tunnel.ErrPermanent (Important #2) rather than retried forever.
+	if !errors.Is(err, tunnel.ErrPermanent) {
+		t.Errorf("PSK-refusal error %v must wrap tunnel.ErrPermanent", err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,7 +15,29 @@ import (
 	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
+
+// swanctlInstallHint leads the detail of a "swanctl not found" permanent
+// failure — the one strongSwan-side case retrying can never fix, since the
+// binary genuinely is not on PATH.
+const swanctlInstallHint = "strongSwan's swanctl was not found on PATH — install strongSwan (e.g. `brew install strongswan` on macOS, or your distro's strongswan/strongswan-swanctl package on Linux)."
+
+// classifySwanctlLoadAllErr wraps a `swanctl --load-all` failure as
+// tunnel.ErrPermanent when swanctl itself was not found on PATH — the one
+// case retrying can never fix, since the binary genuinely is not there.
+// Every other --load-all failure (charon not up yet, a config syntax error,
+// a transient permission issue, ...) is left unwrapped, so the Supervisor's
+// normal backoff/retry still applies exactly as before. Split out from
+// NewStrongSwanRunFunc so it is directly unit-testable with a synthetic
+// error, without shelling out to a real (or deliberately absent) swanctl.
+func classifySwanctlLoadAllErr(err error, out []byte) error {
+	if errors.Is(err, exec.ErrNotFound) {
+		return fmt.Errorf("%w: %s\nipsec: swanctl --load-all: %v: %s",
+			tunnel.ErrPermanent, swanctlInstallHint, err, out)
+	}
+	return fmt.Errorf("ipsec: swanctl --load-all: %w: %s", err, out)
+}
 
 // connName is the swanctl connection name this app always uses, so a
 // previous run's fragment is cleanly replaced rather than accumulating
@@ -170,7 +193,7 @@ func NewStrongSwanRunFunc(p config.Profile, psk string) RunFunc {
 		defer os.Remove(secretsPath)
 
 		if out, err := exec.CommandContext(ctx, "swanctl", "--load-all").CombinedOutput(); err != nil {
-			return fmt.Errorf("ipsec: swanctl --load-all: %w: %s", err, out)
+			return classifySwanctlLoadAllErr(err, out)
 		}
 
 		initCtx, cancelInit := context.WithCancel(ctx)

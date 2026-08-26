@@ -3,10 +3,13 @@
 package ipsec
 
 import (
+	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 func TestParseCharonLineExtractsAssignedIP(t *testing.T) {
@@ -54,6 +57,36 @@ func TestSwanctlConnFragmentIncludesProfileFields(t *testing.T) {
 		if !containsString(frag, want) {
 			t.Errorf("swanctl fragment missing %q:\n%s", want, frag)
 		}
+	}
+}
+
+// swanctl missing from PATH is deterministic — installing it is the only
+// fix — so it must be wrapped as tunnel.ErrPermanent, distinct from every
+// other --load-all failure (Important #2).
+func TestClassifySwanctlLoadAllErrWrapsNotFoundAsPermanent(t *testing.T) {
+	err := classifySwanctlLoadAllErr(exec.ErrNotFound, []byte("exec: \"swanctl\": executable file not found in $PATH"))
+	if !errors.Is(err, tunnel.ErrPermanent) {
+		t.Errorf("classifySwanctlLoadAllErr(exec.ErrNotFound) = %v, want it to wrap tunnel.ErrPermanent", err)
+	}
+}
+
+// A real *exec.Error from a failed LookPath (what os/exec actually returns,
+// not just the bare sentinel) must classify the same way.
+func TestClassifySwanctlLoadAllErrWrapsExecErrorAsPermanent(t *testing.T) {
+	execErr := &exec.Error{Name: "swanctl", Err: exec.ErrNotFound}
+	err := classifySwanctlLoadAllErr(execErr, nil)
+	if !errors.Is(err, tunnel.ErrPermanent) {
+		t.Errorf("classifySwanctlLoadAllErr(*exec.Error wrapping ErrNotFound) = %v, want it to wrap tunnel.ErrPermanent", err)
+	}
+}
+
+// Every other swanctl failure — charon not running yet, a transient network
+// issue, a config error — must retry normally, not be classified as
+// permanent.
+func TestClassifySwanctlLoadAllErrLeavesOtherFailuresRetryable(t *testing.T) {
+	err := classifySwanctlLoadAllErr(errors.New("swanctl: no response from charon"), []byte("no response"))
+	if errors.Is(err, tunnel.ErrPermanent) {
+		t.Errorf("classifySwanctlLoadAllErr(transient error) = %v, must NOT wrap tunnel.ErrPermanent", err)
 	}
 }
 

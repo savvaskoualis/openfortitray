@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 // vpnConnectionName is the Windows VPN connection profile name this app
@@ -109,7 +110,12 @@ func NewWindowsRunFunc(p config.Profile, psk string) RunFunc {
 	_ = psk
 	return func(ctx context.Context, connected func(ip string)) error {
 		if p.IPsec.AuthMethod == config.IPsecAuthPSK {
-			return fmt.Errorf("ipsec: PSK auth is not supported for IPsec on Windows — use a certificate, or connect from macOS/Linux")
+			// Deterministic: no Add-VpnConnection call this file could make would
+			// ever accept PSK, so retrying is pointless — see addVpnConnectionArgs.
+			// PSK is also the default IPsecAuthMethod for a new profile, so this is
+			// a common way to reach here, not an edge case.
+			return fmt.Errorf("%w: PSK auth is not supported for IPsec on Windows — use a certificate, or connect from macOS/Linux",
+				tunnel.ErrPermanent)
 		}
 
 		cmdline := fmt.Sprintf("Remove-VpnConnection -Name %q -Force -ErrorAction SilentlyContinue; %s",
