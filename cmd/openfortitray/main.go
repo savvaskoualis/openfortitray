@@ -451,6 +451,127 @@ func (a *app) onScreenWake() {
 	})
 }
 
+// freezePingInterval, freezePingTimeout and freezeMaxMisses tune
+// watchMainThreadFreeze: how often it checks, how long one check waits, and
+// how many consecutive misses it takes before declaring the app frozen.
+// Diagnosed live: Fyne's own glfw.PollEvents() can block forever on this
+// app's single macOS event loop after a display sleep/wake cycle (Fyne's own
+// source comment already admits it can block during a window resize — this
+// project traced a second, permanent trigger tied to display power-cycling).
+// Once it blocks, EVERY fyne.Do/DoAndWait queued after it — including a
+// normal Quit — never runs again; nothing on that thread can recover itself.
+// freezeMaxMisses*freezePingInterval (here, 3*20s = 60s) is deliberately not
+// aggressive: a real user resize can legitimately block PollEvents for a few
+// seconds, and this must never mistake that for a permanent freeze.
+const (
+	freezePingInterval = 20 * time.Second
+	freezePingTimeout  = 10 * time.Second
+	freezeMaxMisses    = 3
+)
+
+// mainThreadResponsive reports whether the UI goroutine processes a queued
+// fyne.Do call within timeout. It never itself blocks on the UI goroutine —
+// fyne.Do only enqueues — so this is safe to call even when the UI goroutine
+// is genuinely wedged forever; unlike fyne.DoAndWait, which would wedge the
+// caller too.
+func (a *app) mainThreadResponsive(timeout time.Duration) bool {
+	done := make(chan struct{}, 1)
+	fyne.Do(func() {
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	})
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// watchMainThreadFreeze pings the UI goroutine on its own schedule and, after
+// freezeMaxMisses consecutive misses, calls recoverFromFreeze. Runs for the
+// life of the process; exits early once a normal shutdown has already begun
+// (a.quitting), so it never fights a clean quit that just happens to be
+// taking a while.
+func (a *app) watchMainThreadFreeze() {
+	misses := 0
+	for {
+		time.Sleep(freezePingInterval)
+		if a.quitting.Load() {
+			return
+		}
+		if a.mainThreadResponsive(freezePingTimeout) {
+			misses = 0
+			continue
+		}
+		misses++
+		log.Printf("openfortitray: main thread unresponsive (%d/%d)", misses, freezeMaxMisses)
+		if misses >= freezeMaxMisses {
+			a.recoverFromFreeze()
+			return
+		}
+	}
+}
+
+// recoverFromFreeze is the last resort when the UI goroutine is confirmed
+// wedged: nothing running ON that goroutine can ever fix it, so this runs
+// entirely on the watchdog's own goroutine, tears the tunnel down the same
+// way a normal shutdown does (Supervisor.Disconnect/Wait do not depend on the
+// UI goroutine at all), leaves the same resume marker an update-triggered
+// restart already uses so the fresh process reconnects automatically, starts
+// a fresh copy of the app, and force-exits this one — os.Exit needs no
+// cooperation from the frozen thread, and terminating the process is what
+// actually releases the single-instance lock the new copy is waiting on.
+func (a *app) recoverFromFreeze() {
+	log.Print("openfortitray: main thread frozen; restarting")
+	if a.wantConnected.Load() {
+		if err := writeResumeMarker(a.cfgDir); err != nil {
+			log.Printf("openfortitray: could not write resume marker before a freeze restart: %v", err)
+		}
+	}
+
+	// Reuses shutdown's existing teardown exactly as a signal would, just
+	// with a no-op done: there is no UI left to hand off to, and the fresh
+	// copy about to be started is this launch's replacement, not this
+	// process continuing.
+	a.shutdown(func() {})
+	select {
+	case <-a.shutdownDone:
+	case <-time.After(shutdownWait + 5*time.Second):
+		log.Print("openfortitray: teardown did not finish before a freeze restart; continuing anyway")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("openfortitray: could not find my own executable to restart: %v", err)
+		os.Exit(1)
+	}
+	if err := relaunchSelf(os.Getpid(), exe); err != nil {
+		log.Printf("openfortitray: could not start a fresh copy: %v", err)
+	}
+	os.Exit(1)
+}
+
+// relaunchSelf spawns a detached helper that waits for pid to actually exit —
+// releasing the single-instance lock is what a fresh launch is waiting on —
+// then starts exe fresh. It never waits itself; the helper outlives this
+// process. Mirrors internal/update's own "wait for the old PID, then
+// relaunch" scripts (see apply.go's buildBrewScript/buildWindowsScript) —
+// same problem, same shape of fix, kept local here since recoverFromFreeze
+// has no update in progress and nothing else to do first.
+func relaunchSelf(pid int, exe string) error {
+	cmd, err := relaunchCommand(pid, exe)
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
 // cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
 // profiles/gateways keep independent cookies.
 func cookieKey(gateway string) string { return "openfortitray:" + gateway }
@@ -1790,6 +1911,10 @@ func main() {
 	// Display-only sleep/wake: see onScreenWake's doc comment for why this is
 	// a separate hook from watchSystemSleep, not a duplicate of it.
 	watchScreenWake(a.onScreenWake)
+	// Last-resort recovery from a permanently wedged UI goroutine (see
+	// watchMainThreadFreeze's own doc comment) — a real, reproducible
+	// failure mode on macOS, diagnosed live via a native debugger attach.
+	go a.watchMainThreadFreeze()
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a

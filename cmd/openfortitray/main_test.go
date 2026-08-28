@@ -377,6 +377,22 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	}
 }
 
+// mainThreadResponsive must report true when the UI goroutine actually
+// services the queued fyne.Do call — the ordinary case. The genuine-timeout
+// path (a wedged UI goroutine that never runs the closure) is not
+// practically testable here: fyne's own test driver runs DoFromGoroutine's
+// function immediately, synchronously, regardless of the wait flag ("our
+// threading is simple" — see fyne.io/fyne/v2/test/driver.go), so a fake
+// "never responds" case cannot be constructed without a real GLFW driver.
+func TestMainThreadResponsiveTruePath(t *testing.T) {
+	test.NewApp()
+	a := &app{}
+
+	if !a.mainThreadResponsive(time.Second) {
+		t.Error("mainThreadResponsive reported false for a UI goroutine that services its queue normally")
+	}
+}
+
 // The update dialog must surface only ONCE per distinct version: the badge and
 // menu item update on every 6-hourly check (cheap), but re-prompting the same
 // version every 6h would nag. shouldPromptUpdate is the pure decision behind the
