@@ -433,6 +433,22 @@ func (a *app) onSystemWake() {
 	})
 }
 
+// onScreenWake re-asserts the tray icon and menu every time the display
+// wakes, independent of onSystemWake and of wantConnected — a display sleep
+// alone never drops the network, so this never touches the tunnel, only the
+// tray. It exists because a Mac that never fully suspends (see
+// watchScreenWake's doc comment) still cycles its display constantly, and
+// each cycle is a real opportunity for the NSStatusItem to silently drop —
+// the same class of issue ReassertTray's OnStarted and onSystemWake calls
+// already guard against, just on a much more frequent trigger.
+func (a *app) onScreenWake() {
+	fyne.DoAndWait(func() {
+		if a.tray != nil {
+			a.tray.ReassertTray()
+		}
+	})
+}
+
 // cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
 // profiles/gateways keep independent cookies.
 func cookieKey(gateway string) string { return "openfortitray:" + gateway }
@@ -1769,6 +1785,9 @@ func main() {
 	// macOS, PowerRegisterSuspendResumeNotification on Windows, logind's
 	// PrepareForSleep over D-Bus on Linux); onSystemWake decides whether to act.
 	watchSystemSleep(a.onSystemWake)
+	// Display-only sleep/wake: see onScreenWake's doc comment for why this is
+	// a separate hook from watchSystemSleep, not a duplicate of it.
+	watchScreenWake(a.onScreenWake)
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a

@@ -346,6 +346,37 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 	}
 }
 
+// A display wake must never touch the tunnel — it exists purely to
+// re-assert the tray icon (a.tray stays nil in this test setup, so there's
+// nothing to observe there beyond "does not panic"), unlike onSystemWake,
+// which forces a reconnect. Connected before a screen wake, still connected
+// after, with no extra auth attempt.
+func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
+	test.NewApp()
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+	// Drain any buffered signal so a false positive below can't be blamed on
+	// Connect's own initial attempt.
+	select {
+	case <-authCalled:
+	default:
+	}
+
+	a.onScreenWake()
+
+	select {
+	case <-authCalled:
+		t.Error("onScreenWake dialed the tunnel; a display wake must never do that")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // The update dialog must surface only ONCE per distinct version: the badge and
 // menu item update on every 6-hourly check (cheap), but re-prompting the same
 // version every 6h would nag. shouldPromptUpdate is the pure decision behind the
