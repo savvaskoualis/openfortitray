@@ -442,10 +442,12 @@ func (a *app) onSystemWake() {
 // the same class of issue ReassertTray's OnStarted and onSystemWake calls
 // already guard against, just on a much more frequent trigger.
 func (a *app) onScreenWake() {
+	log.Print("openfortitray: display woke; re-asserting tray")
 	fyne.DoAndWait(func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
+		log.Print("openfortitray: tray re-assert after display wake done")
 	})
 }
 
