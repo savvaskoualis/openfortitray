@@ -12,15 +12,15 @@ import "fmt"
 // tok.TextSize() rather than a bare package-level constant grab-bag.
 type Tokens struct{}
 
-func (Tokens) TextSize() float64        { return 13 }
-func (Tokens) CaptionTextSize() float64 { return 11 }
+func (Tokens) TextSize() float64           { return 13 }
+func (Tokens) CaptionTextSize() float64    { return 11 }
 func (Tokens) SubHeadingTextSize() float64 { return 15 }
-func (Tokens) HeadingTextSize() float64 { return 20 }
-func (Tokens) Padding() float64         { return 5 }
-func (Tokens) InnerPadding() float64    { return 10 }
-func (Tokens) CardRadius() float64      { return 8 }
-func (Tokens) ButtonRadius() float64    { return 6 }
-func (Tokens) InputRadius() float64     { return 6 }
+func (Tokens) HeadingTextSize() float64    { return 20 }
+func (Tokens) Padding() float64            { return 5 }
+func (Tokens) InnerPadding() float64       { return 10 }
+func (Tokens) CardRadius() float64         { return 8 }
+func (Tokens) ButtonRadius() float64       { return 6 }
+func (Tokens) InputRadius() float64        { return 6 }
 func (Tokens) SeparatorThickness() float64 { return 1 }
 
 type palette struct {
@@ -34,46 +34,46 @@ type palette struct {
 
 var light = palette{
 	background:          "#F6F7F9",
-	backgroundAlpha:      0x40,
-	headerBackground:     "#FFFFFF",
-	menuBackground:       "#FFFFFF",
-	overlayBackground:    "#FFFFFF",
-	foreground:           "#171A1F",
-	placeholder:          "#5C6470",
-	disabled:             "#5C6470",
-	separator:            "#E2E5EA",
-	inputBorder:          "#E2E5EA",
-	primary:              "#2F6FEB",
-	foregroundOnPrimary:  "#FFFFFF",
-	inputBackground:      "#FFFFFF",
-	button:               "#FFFFFF",
-	success:              "#2E9E5B",
-	warning:              "#B87514",
-	error_:               "#C4362F",
-	hover:                "#000000",
-	hoverAlpha:           0x10,
+	backgroundAlpha:     0x40,
+	headerBackground:    "#FFFFFF",
+	menuBackground:      "#FFFFFF",
+	overlayBackground:   "#FFFFFF",
+	foreground:          "#171A1F",
+	placeholder:         "#5C6470",
+	disabled:            "#5C6470",
+	separator:           "#E2E5EA",
+	inputBorder:         "#E2E5EA",
+	primary:             "#2F6FEB",
+	foregroundOnPrimary: "#FFFFFF",
+	inputBackground:     "#FFFFFF",
+	button:              "#FFFFFF",
+	success:             "#2E9E5B",
+	warning:             "#B87514",
+	error_:              "#C4362F",
+	hover:               "#000000",
+	hoverAlpha:          0x10,
 }
 
 var dark = palette{
 	background:          "#16181C",
-	backgroundAlpha:      0x40,
-	headerBackground:     "#1E2128",
-	menuBackground:       "#1E2128",
-	overlayBackground:    "#1E2128",
-	foreground:           "#EDEFF2",
-	placeholder:          "#9AA2AE",
-	disabled:             "#9AA2AE",
-	separator:            "#2C313A",
-	inputBorder:          "#2C313A",
-	primary:              "#5B93F5",
-	foregroundOnPrimary:  "#0E1013",
-	inputBackground:      "#22262E",
-	button:               "#22262E",
-	success:              "#41BE77",
-	warning:              "#E0A140",
-	error_:               "#E86A62",
-	hover:                "#FFFFFF",
-	hoverAlpha:           0x12,
+	backgroundAlpha:     0x40,
+	headerBackground:    "#1E2128",
+	menuBackground:      "#1E2128",
+	overlayBackground:   "#1E2128",
+	foreground:          "#EDEFF2",
+	placeholder:         "#9AA2AE",
+	disabled:            "#9AA2AE",
+	separator:           "#2C313A",
+	inputBorder:         "#2C313A",
+	primary:             "#5B93F5",
+	foregroundOnPrimary: "#0E1013",
+	inputBackground:     "#22262E",
+	button:              "#22262E",
+	success:             "#41BE77",
+	warning:             "#E0A140",
+	error_:              "#E86A62",
+	hover:               "#FFFFFF",
+	hoverAlpha:          0x12,
 }
 
 // BackgroundColor returns the alpha-bearing background token as separate
