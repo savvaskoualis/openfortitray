@@ -310,9 +310,15 @@ jobs:
       # platform plugin (platforms\qwindows.dll) next to the exe, into the
       # same dist\ layout the Mesa DLL bundling above already uses, so the
       # exe is turnkey without a separately-installed matching Qt6.
+      #
+      # This step runs under bash (defaults.run.shell: bash), so the target
+      # path uses forward slashes like every other dist/... path in this
+      # file (the go build -o line above, the test -s checks) — an unquoted
+      # backslash path here would be corrupted by bash's escape handling
+      # (`dist\openfortitray...` becomes `distopenfortitray...`).
       - name: Bundle Qt6 runtime DLLs
         run: |
-          "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\windeployqt6.exe" --release --no-translations dist\openfortitray-windows-amd64.exe
+          "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\windeployqt6.exe" --release --no-translations dist/openfortitray-windows-amd64.exe
 
       # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
       # the app so Windows is turnkey. There is no reliable way to install
