@@ -103,7 +103,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Disconnected},
 			wantState:   "Disconnected",
 			wantSubHas:  "vpn.example.com:10443",
-			wantRole:    "",
+			wantRole:    "caption",
 			wantPrimary: "Connect",
 			wantIP:      "—",
 		},

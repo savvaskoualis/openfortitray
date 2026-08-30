@@ -416,7 +416,14 @@ func (a *app) startTunnel() {
 // goroutine) — never the pump.
 func (a *app) onSystemWake() {
 	wantConnected := a.wantConnected.Load()
-	a.dispatch.PostAndWait(func() {
+	// Post, not PostAndWait: this callback is invoked by NSWorkspace's
+	// notification center on the main queue (see wake_darwin.m), which is
+	// the SAME thread Drain runs on via the dispatch-drain QTimer. Waiting
+	// here would block forever, since Drain can never run while this
+	// function has not yet returned control to that thread's event loop —
+	// there is nothing in this handler that needs the mutation to be
+	// visibly complete before returning to the OS.
+	a.dispatch.Post(func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
@@ -439,7 +446,10 @@ func (a *app) onSystemWake() {
 // already guard against, just on a much more frequent trigger.
 func (a *app) onScreenWake() {
 	log.Print("openfortitray: display woke; re-asserting tray")
-	a.dispatch.PostAndWait(func() {
+	// Post, not PostAndWait — same reasoning as onSystemWake: this callback
+	// already runs on the main queue/thread that Drain itself runs on, so
+	// waiting for Drain to run it would deadlock forever.
+	a.dispatch.Post(func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
@@ -1249,21 +1259,23 @@ func (a *app) shutdown(done func()) {
 // awaitShutdown blocks until the tunnel teardown has finished, starting it if
 // nothing has yet.
 //
-// It exists because fyne installs its OWN SIGINT/SIGTERM handler
-// (gLDriver.catchTerm) which calls Quit as soon as a signal arrives. Go delivers a
-// signal to every registered channel, so a SIGTERM reaches both handlers at once:
-// ours begins the graceful teardown on a goroutine, while fyne's ends the run
-// loop. main then returned and the process died mid-teardown — openconnect never
-// got to send its clean logout, so the FortiGate kept the session and refused
-// every new cookie (for minutes) until it timed the session out server-side. That
-// looked exactly like "we get logged out a lot" and like a connect that will not
-// connect. The observable symptom in the log was a "tearing down" line with no
-// matching "tunnel: exited" or "exiting" line after it.
+// It exists because shutdown() itself does not block: it launches the actual
+// teardown — concurrently Disconnect()+Wait()ing BOTH supervisors (SSL and
+// IPsec) via a shared WaitGroup, bounded by one shutdownWait deadline (see
+// shutdown's own doc comment) — on a worker goroutine and returns immediately,
+// so the run loop is never blocked waiting for openconnect to exit. Something
+// still has to keep the PROCESS alive for that worker to finish, or main would
+// return and the process would die mid-teardown: openconnect would never get
+// to send its clean logout, so the FortiGate would keep the session and refuse
+// every new cookie (for minutes) until it timed the session out server-side —
+// indistinguishable from "we get logged out a lot" and a connect that will not
+// connect. awaitShutdown is that wait, called after Run/Exec returns so the
+// process outlives the UI by as long as the teardown needs.
 //
-// Called after Run returns, so the process outlives the UI by as long as the
-// teardown needs. shutdown is once-guarded, so calling it here is safe whether
-// the exit came from the tray's Quit, a signal, or fyne's own handler; the done
-// callback is a no-op because the run loop has already ended.
+// shutdown is once-guarded, so calling it here is always safe, whether the
+// exit came from the tray's Quit, a signal (watchSignals), or (defensively)
+// neither; the done callback is a no-op here because the run loop has already
+// ended.
 func (a *app) awaitShutdown() {
 	a.shutdown(func() {})
 	select {
@@ -1758,6 +1770,12 @@ func main() {
 	// Qt main thread — the one piece with no fyne.Do-era counterpart. 30ms is
 	// frequent enough that a posted UI mutation renders as though synchronous
 	// to a human, while staying cheap when idle.
+	// drain is intentionally never freed (no DeleteLater/GoGC call anywhere)
+	// — it lives for the whole process, ticking until qt.QCoreApplication_Quit()
+	// stops the event loop below. Freeing it while Exec's loop is still
+	// running would risk a use-after-free the next time the loop tries to
+	// fire its already-registered timeout, for no benefit: the process is
+	// exiting either way once Exec returns.
 	drain := qt.NewQTimer2(nil)
 	drain.SetInterval(30)
 	drain.OnTimeout(a.dispatch.Drain)

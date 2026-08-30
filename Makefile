@@ -59,9 +59,8 @@ test:
 	CGO_CXXFLAGS=-std=c++17 go vet ./...
 	CGO_CXXFLAGS=-std=c++17 go test -race ./...
 
-# Size trim for release builds. fyne statically links the GL bindings, a font
-# shaper and the default theme/font, so a release binary is ~15-30 MB heavier
-# than the old systray one; -s -w (strip symbol table + DWARF) claws some back.
+# Size trim for release builds: -s -w (strip symbol table + DWARF) trims the
+# release binary.
 LDFLAGS_TRIM := -s -w
 
 # Stamp the build version into main.version (shown in the tray header). VERSION
@@ -69,14 +68,14 @@ LDFLAGS_TRIM := -s -w
 # the tag in CI via `make ... VERSION=$GITHUB_REF_NAME`).
 LDFLAGS_VER := -X main.version=$(VERSION)
 
-# Build/CI reality since the fyne v2 migration: fyne renders via OpenGL/GLFW, so
-# cmd/openfortitray is a cgo build on EVERY OS. That kills the old pure
-# cross-compile model (CGO_ENABLED=0 for linux/windows from any host). Each OS
-# must now build on its own native toolchain:
+# Build/CI reality: the UI is Qt6 via miqt, so cmd/openfortitray is a cgo
+# build on EVERY OS. That kills the old pure cross-compile model
+# (CGO_ENABLED=0 for linux/windows from any host). Each OS must now build on
+# its own native toolchain:
 #   - darwin: cgo via the Xcode CLT. The amd64 slice still cross-builds from an
 #     Apple Silicon mac because the macOS SDK is a fat SDK; if a future SDK
 #     drops x86_64, delete that line — it only serves pre-2020 Intel macs.
-#   - linux: cgo needs gcc + GL/X11 dev headers (libgl1-mesa-dev xorg-dev).
+#   - linux: cgo needs gcc + the Qt6 dev headers (qt6-base-dev).
 #   - windows: cgo needs a MinGW gcc; -H=windowsgui suppresses the console
 #     window. Cannot be cross-built from a non-windows host without a MinGW
 #     cross-toolchain.
@@ -104,7 +103,7 @@ else
 endif
 	@ls -l $(DIST)
 
-# app assembles a hand-rolled macOS .app bundle (Task 10). A fyne menu-bar app
+# app assembles a hand-rolled macOS .app bundle (Task 10). A menu-bar app
 # needs a real bundle with LSUIElement=1 for the status item to render reliably
 # and to keep the process off the Dock. Idempotent: the bundle is rebuilt from
 # scratch each time. macOS only (iconutil/sips and the Cocoa systray are Darwin).

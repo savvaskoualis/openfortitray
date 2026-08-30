@@ -40,6 +40,15 @@ type Shell struct {
 	stack   *qt.QStackedWidget
 	navBtns [3]*qt.QPushButton
 	current Section
+
+	// profileBar and footer are the settings-only chrome placed around the
+	// stack; they are hidden on SectionStatus and shown otherwise (see
+	// Select). banner is never touched by Select — it is shown/hidden only
+	// by whoever owns it (settings.go's ShowIssue/hideBanner), Select just
+	// guarantees it is actually placed somewhere so that visibility takes
+	// effect. Any of the three may be nil (e.g. in tests that don't wire
+	// settings chrome), so every use is nil-guarded.
+	profileBar, banner, footer *qt.QWidget
 }
 
 // railWidth matches the approved mock.
@@ -89,8 +98,34 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 	s.stack.AddWidget(p.Connection)
 	s.stack.AddWidget(p.Advanced)
 
+	s.profileBar = p.ProfileBar
+	s.banner = p.Banner
+	s.footer = p.Footer
+
+	// The content column stacks the settings-only chrome around the
+	// QStackedWidget: ProfileBar and Banner above it, Footer below. Select
+	// shows/hides ProfileBar/Footer based on section; Banner's visibility is
+	// never forced here — only ShowIssue/hideBanner in settings.go toggle
+	// it — this layout just gives it somewhere to actually render once they
+	// do.
+	content := qt.NewQWidget(nil)
+	contentLayout := qt.NewQVBoxLayout2()
+	contentLayout.SetContentsMargins(0, 0, 0, 0)
+	contentLayout.SetSpacing(0)
+	if s.profileBar != nil {
+		contentLayout.AddWidget(s.profileBar)
+	}
+	if s.banner != nil {
+		contentLayout.AddWidget(s.banner)
+	}
+	contentLayout.AddWidget(s.stack.QWidget)
+	if s.footer != nil {
+		contentLayout.AddWidget(s.footer)
+	}
+	content.SetLayout(contentLayout.QLayout)
+
 	rootLayout.AddWidget(rail)
-	rootLayout.AddWidget(s.stack.QWidget)
+	rootLayout.AddWidget(content)
 	root.SetLayout(rootLayout.QLayout)
 
 	win.SetCentralWidget(root)
@@ -99,12 +134,24 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 }
 
 // Select switches the visible content-pane section and updates the rail's
-// selected-button styling.
+// selected-button styling. ProfileBar and Footer are settings-specific chrome
+// (profile picker, Save/Cancel) shown only around the Connection/Advanced
+// sections — Status is self-contained and doesn't need them. Banner's
+// visibility is deliberately untouched here: it is shown on-demand by
+// settings.go's ShowIssue and dismissed by hideBanner/a successful Save, not
+// by navigation.
 func (s *Shell) Select(sec Section) {
 	s.current = sec
 	s.stack.SetCurrentIndex(int(sec))
 	for i, btn := range s.navBtns {
 		btn.SetChecked(Section(i) == sec)
+	}
+	showChrome := sec != SectionStatus
+	if s.profileBar != nil {
+		s.profileBar.SetVisible(showChrome)
+	}
+	if s.footer != nil {
+		s.footer.SetVisible(showChrome)
 	}
 }
 

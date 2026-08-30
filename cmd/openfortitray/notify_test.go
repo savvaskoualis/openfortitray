@@ -199,8 +199,9 @@ func TestNoNotificationOnUserDisconnect(t *testing.T) {
 	}
 }
 
-// notify is nil until the fyne app exists (and in most tests); notifyFor must
-// tolerate that rather than panic in the pump.
+// notify is nil until main() wires it to tray.ShowMessage after tray.Setup
+// (and in most tests, which never call main()); notifyFor must tolerate that
+// rather than panic in the pump.
 func TestNotifyForNilSeam(t *testing.T) {
 	a := &app{}
 	a.notifyFor(tunnel.Event{State: tunnel.Connected}) // must not panic

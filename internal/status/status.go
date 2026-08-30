@@ -457,9 +457,10 @@ func (c *Controller) toggleActivity() {
 
 // dotRole maps a view's severity onto uitheme's semantic QSS roles. These are the
 // ONLY place those tokens are used in this window, which is what keeps "the
-// tunnel is up" from competing with the accent. KindIdle has no themed role of its
-// own in the current stylesheet (there is no "disabled" text-colour selector), so
-// it clears the property and falls back to the default foreground colour.
+// tunnel is up" from competing with the accent. KindIdle has no dedicated
+// role of its own, so it reuses uitheme's "caption" role — the same muted
+// color already used for secondary text — rather than the default foreground
+// color, since "not connected" is a de-emphasized, disabled-looking state.
 func dotRole(k uistate.Kind) string {
 	switch k {
 	case uistate.KindOK:
@@ -469,7 +470,7 @@ func dotRole(k uistate.Kind) string {
 	case uistate.KindBad:
 		return "error"
 	default:
-		return ""
+		return "caption"
 	}
 }
 

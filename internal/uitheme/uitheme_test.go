@@ -34,6 +34,32 @@ func TestStyleSheetDiffersBetweenLightAndDark(t *testing.T) {
 	}
 }
 
+// TestStyleSheetHasCheckedButtonRule guards against the nav rail's selected
+// button being invisible: once a bare QPushButton rule exists (it does, for
+// background/border-radius/padding), Qt's stylesheet engine suppresses the
+// native checked-state rendering entirely unless the stylesheet supplies its
+// own QPushButton:checked rule.
+func TestStyleSheetHasCheckedButtonRule(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		ss := StyleSheet(dark)
+		if !strings.Contains(ss, "QPushButton:checked") {
+			t.Errorf("StyleSheet(dark=%v) missing a QPushButton:checked rule", dark)
+		}
+	}
+}
+
+// TestStyleSheetSeparatorUsesMinMaxHeight guards against Qt's stylesheet
+// engine silently ignoring a bare `height` property (unsupported on
+// QWidget-based selectors) — only min-height/max-height are honored.
+func TestStyleSheetSeparatorUsesMinMaxHeight(t *testing.T) {
+	for _, dark := range []bool{false, true} {
+		ss := StyleSheet(dark)
+		if !strings.Contains(ss, "min-height:") || !strings.Contains(ss, "max-height:") {
+			t.Errorf("StyleSheet(dark=%v) separator rule missing min-height/max-height", dark)
+		}
+	}
+}
+
 func TestTokensSizesMatchFyneOriginal(t *testing.T) {
 	tok := Tokens{}
 	if tok.TextSize() != 13 || tok.CaptionTextSize() != 11 || tok.HeadingTextSize() != 20 {

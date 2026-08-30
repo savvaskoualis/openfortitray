@@ -3,12 +3,11 @@ name: Release
 # Fires on version tags only (v1.2.3, v0.1.0-rc1, ...). Build flags below mirror
 # the Makefile `release` target's per-OS builds — if you change one, change both.
 #
-# Since the fyne v2 tray migration, cmd/openfortitray is a cgo + OpenGL/GLFW
-# build on every OS, so the old "cross-build linux + windows from one ubuntu
-# host with CGO_ENABLED=0" model is dead. Each OS is now built on its own
-# native runner with CGO_ENABLED=1. macOS additionally ships a real .app
-# bundle (fyne menu-bar apps need one) inside a drag-to-/Applications .dmg,
-# the primary macOS download.
+# cmd/openfortitray is a cgo + Qt6 (miqt) build on every OS, so the old
+# "cross-build linux + windows from one ubuntu host with CGO_ENABLED=0" model
+# is dead. Each OS is now built on its own native runner with CGO_ENABLED=1.
+# macOS additionally ships a real .app bundle (a menu-bar/LSUIElement app
+# needs one) inside a drag-to-/Applications .dmg, the primary macOS download.
 on:
   push:
     tags:
@@ -29,8 +28,8 @@ defaults:
     shell: bash
 
 jobs:
-  # darwin needs cgo (fyne drives the Cocoa status bar and renders via OpenGL),
-  # so both slices must be built on a macOS runner. macos-14 is Apple Silicon:
+  # darwin needs cgo (Qt6/miqt drives the Cocoa status bar and window), so
+  # both slices must be built on a macOS runner. macos-14 is Apple Silicon:
   # arm64 is native and the amd64 slice cross-builds because the macOS SDK is a
   # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
   # guard — it only serves pre-2020 Intel macs.
@@ -75,8 +74,7 @@ jobs:
       # pkg-config's default search path must not resolve the wrong one for
       # either leg.
       - name: Build darwin binaries
-        # -s -w strips the symbol table and DWARF to claw back some of fyne's
-        # size (a fyne binary is ~15-30 MB heavier than the old systray one).
+        # -s -w strips the symbol table and DWARF to trim the binary's size.
         run: |
           mkdir -p dist
           PKG_CONFIG_PATH="$(/opt/homebrew/bin/brew --prefix qt)/lib/pkgconfig" \
@@ -93,8 +91,8 @@ jobs:
           file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
           file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
 
-      # A fyne menu-bar app needs a real .app bundle (Info.plist + LSUIElement)
-      # to host the status item reliably and stay off the Dock. `make dmg`
+      # A menu-bar app needs a real .app bundle (Info.plist + LSUIElement) to
+      # host the status item reliably and stay off the Dock. `make dmg`
       # depends on `make app` (which rebuilds the host-arch arm64 binary and
       # assembles the bundle with the hand-rolled Info.plist + generated .icns),
       # then wraps it in a double-click, drag-to-/Applications disk image — the
@@ -134,11 +132,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # linux is now a cgo build (fyne -> GLFW -> OpenGL), so it must build on a
-  # linux runner with the GL + X11 dev headers, not cross-compiled with cgo
-  # off. Consequence: the linux binary now carries a glibc version floor from
-  # ubuntu-latest (it no longer runs on arbitrarily old glibc). Runtime still
-  # needs an SNI-capable panel (unchanged) plus a working GL stack.
+  # linux is a cgo build (Qt6/miqt), so it must build on a linux runner with
+  # the Qt6 dev headers, not cross-compiled with cgo off. Consequence: the
+  # linux binary carries a glibc version floor from ubuntu-latest (it no
+  # longer runs on arbitrarily old glibc). Runtime still needs an
+  # SNI-capable panel (unchanged).
   build-linux:
     name: Build linux (amd64)
     runs-on: ubuntu-latest
@@ -155,20 +153,16 @@ jobs:
           go-version: stable
           cache: true
 
-      # Every package still imports fyne (tray, status, settings, shell,
-      # uitheme, main.go — Fyne is only removed in Task 11), so building
-      # ./cmd/openfortitray below still needs fyne's GL/X11 build deps, on top
-      # of the Qt6 dev headers/pkg-config files (qt6-base-dev) the miqt
-      # migration now also needs (see cmd/openfortitray/qtapp.go). Both sets
-      # are required together until Task 11 deletes fyne, at which point the
-      # GL/X11 packages become removable.
-      - name: Install Fyne + Qt6 build deps
+      # cmd/openfortitray links against Qt6 (miqt migration; see
+      # cmd/openfortitray/qtapp.go), which needs the Qt6 dev headers/
+      # pkg-config files (qt6-base-dev) to build.
+      - name: Install Qt6 build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc pkg-config qt6-base-dev libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+          sudo apt-get install -y gcc pkg-config qt6-base-dev
 
       - name: Build linux binary
-        # -s -w trims fyne's size. Ships the bare binary: there is no
+        # -s -w trims the binary's size. Ships the bare binary: there is no
         # linux/.desktop asset in the repo, so no .tar.xz is assembled here.
         run: |
           mkdir -p dist
@@ -267,8 +261,12 @@ jobs:
 
       # Bundle Mesa's llvmpipe software OpenGL next to the exe so the tray runs
       # on GPU-less Windows — VMs, RDP sessions, minimal/Server installs — where
-      # there is no GL driver and fyne/GLFW otherwise dies at launch with
-      # "APIUnavailable: WGL: The driver does not appear to support OpenGL".
+      # there is no GL driver. This guarded against a hard crash on the old
+      # Fyne/GLFW build ("APIUnavailable: WGL: The driver does not appear to
+      # support OpenGL"); Qt6/miqt's own GPU-less-Windows behavior has not been
+      # separately reverified (see main.go's func main() comment on
+      # GALLIUM_DRIVER), so this bundling is kept as a cheap, defensive
+      # carry-over rather than removed on an unverified assumption.
       # Windows resolves an application-directory opengl32.dll before the system
       # one (per-process), so placing Mesa's opengl32.dll here makes THIS process
       # render in software; a light tray + settings window is fine in llvmpipe.

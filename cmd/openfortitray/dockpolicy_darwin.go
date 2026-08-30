@@ -29,16 +29,20 @@ func oftDockActivated() {
 // activation policy to Regular.
 //
 // It has to be asserted at runtime rather than left to Info.plist because
-// fyne/glfw sets its own policy while initializing NSApp at Run(). It must
-// therefore run after that and on the main/UI thread — fyne's Lifecycle
-// OnStarted hook satisfies both.
+// Qt's own Cocoa platform integration sets its own policy while initializing
+// NSApp — constructed synchronously inside the QApplication constructor (see
+// main.go's newQApplication call), unlike the old fyne/glfw build, which
+// deferred that to Run() behind an OnStarted-style lifecycle hook. This must
+// therefore run after the QApplication is constructed and on the main/UI
+// thread; main() calls it directly, right after that constructor returns —
+// no lifecycle callback needed today.
 func setDockActivationPolicy() {
 	C.oft_set_regular_policy()
 }
 
 // watchDockActivation makes fn run whenever the app is activated, which is the
-// only way to give a Dock icon any effect: fyne does not implement the reopen
-// delegate method, so without this the icon is inert.
+// only way to give a Dock icon any effect: Qt does not implement the reopen
+// delegate method either, so without this the icon is inert.
 func watchDockActivation(fn func()) {
 	onDockActivate = fn
 	C.oft_watch_activation()

@@ -19,11 +19,15 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
 )
 
-// drainDispatchAsync runs fn — an onSystemWake/onScreenWake-style call that
-// blocks on a.dispatch.PostAndWait, the Qt replacement for fyne's synchronous
-// test driver — on its own goroutine, proves it actually blocked on a.dispatch
-// (rather than running its closure inline), drains the queue once, and waits
-// for fn to return.
+// drainDispatchAsync runs fn — an onSystemWake/onScreenWake-style callback —
+// and asserts it returns immediately, WITHOUT blocking the caller: in
+// production, both callbacks are invoked by the OS on the very same thread
+// that drains a.dispatch (see onSystemWake/onScreenWake's doc comments), so
+// they must only Post their work, never PostAndWait — PostAndWait there
+// would deadlock forever, since Drain can never run while the calling thread
+// is stuck waiting inside the callback it is supposed to be draining for.
+// Once fn has returned, a.dispatch.Drain() actually runs the posted work so
+// callers can assert on its effects.
 func drainDispatchAsync(t *testing.T, a *app, fn func()) {
 	t.Helper()
 	done := make(chan struct{})
@@ -33,15 +37,10 @@ func drainDispatchAsync(t *testing.T, a *app, fn func()) {
 	}()
 	select {
 	case <-done:
-		t.Fatal("fn returned before a.dispatch was drained — it must block on PostAndWait")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("fn blocked instead of returning immediately — it must only Post its work (never PostAndWait), since in production it runs on the very thread that drains the queue")
 	}
 	a.dispatch.Drain()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("fn did not complete after a.dispatch was drained")
-	}
 }
 
 // newTestApp builds an app whose supervisor records whether it was ever asked to
@@ -390,9 +389,10 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	default:
 	}
 
-	// Proves onScreenWake actually posted its tray-reassert work to a.dispatch
-	// (rather than touching the tunnel directly): it must block until the
-	// queue is drained, and once drained, no auth attempt fired.
+	// Proves onScreenWake actually posted its tray-reassert work to
+	// a.dispatch (rather than touching the tunnel directly): it must return
+	// immediately without blocking, and once the queue is drained, no auth
+	// attempt fired.
 	drainDispatchAsync(t, a, a.onScreenWake)
 
 	select {

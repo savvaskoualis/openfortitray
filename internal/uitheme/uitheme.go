@@ -122,6 +122,13 @@ QPushButton {
 QPushButton:disabled {
 	color: %[6]s;
 }
+QPushButton:checked {
+	background: %[15]s;
+	color: %[16]s;
+}
+QPushButton:hover {
+	background: rgba(%[17]s);
+}
 QLineEdit, QComboBox {
 	background: %[7]s;
 	border: 1px solid %[8]s;
@@ -143,7 +150,8 @@ QLabel[role="overlayBackground"] {
 }
 QLabel[role="separator"] {
 	background: %[14]s;
-	height: %[20]vpx;
+	min-height: %[20]vpx;
+	max-height: %[20]vpx;
 }
 QLabel[role="primary"] {
 	color: %[15]s;
