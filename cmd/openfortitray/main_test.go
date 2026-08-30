@@ -11,14 +11,38 @@ import (
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2/test"
-
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
 )
+
+// drainDispatchAsync runs fn — an onSystemWake/onScreenWake-style call that
+// blocks on a.dispatch.PostAndWait, the Qt replacement for fyne's synchronous
+// test driver — on its own goroutine, proves it actually blocked on a.dispatch
+// (rather than running its closure inline), drains the queue once, and waits
+// for fn to return.
+func drainDispatchAsync(t *testing.T, a *app, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("fn returned before a.dispatch was drained — it must block on PostAndWait")
+	case <-time.After(50 * time.Millisecond):
+	}
+	a.dispatch.Drain()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fn did not complete after a.dispatch was drained")
+	}
+}
 
 // newTestApp builds an app whose supervisor records whether it was ever asked to
 // authenticate — i.e. whether a connection attempt actually started.
@@ -43,9 +67,10 @@ func newTestApp(t *testing.T, gateway, cfgDir string) (*app, chan struct{}) {
 			ActiveProfile: "Default",
 			Profiles:      []config.Profile{{Name: "Default", Gateway: gateway, Port: 10443}},
 		},
-		cfgDir: cfgDir,
-		sup:    tunnel.New(authFn, runFn, events),
-		events: events,
+		cfgDir:   cfgDir,
+		sup:      tunnel.New(authFn, runFn, events),
+		events:   events,
+		dispatch: uidispatch.New(),
 		// The credstore seam: an empty in-memory fake, so a test that switches the
 		// active profile to an IPsec backend (startTunnel then reads the PSK
 		// through this) never touches the real keychain, and a fast bounded retry
@@ -308,10 +333,9 @@ func TestStartTunnelRetriesIPsecPSKReadOnBusyStore(t *testing.T) {
 // not dial — a wake notification arriving while the user is deliberately
 // disconnected must never surprise them with a connection attempt.
 func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
-	a.onSystemWake()
+	drainDispatchAsync(t, a, a.onSystemWake)
 
 	select {
 	case <-authCalled:
@@ -324,7 +348,6 @@ func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
 // Disconnect+Connect rather than trust a tunnel that may have died silently
 // while the machine slept.
 func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.Connect()
@@ -334,7 +357,7 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 		t.Fatal("supervisor never started authenticating")
 	}
 
-	a.onSystemWake()
+	drainDispatchAsync(t, a, a.onSystemWake)
 
 	select {
 	case <-authCalled:
@@ -352,7 +375,6 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 // which forces a reconnect. Connected before a screen wake, still connected
 // after, with no extra auth attempt.
 func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.Connect()
@@ -368,7 +390,10 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	default:
 	}
 
-	a.onScreenWake()
+	// Proves onScreenWake actually posted its tray-reassert work to a.dispatch
+	// (rather than touching the tunnel directly): it must block until the
+	// queue is drained, and once drained, no auth attempt fired.
+	drainDispatchAsync(t, a, a.onScreenWake)
 
 	select {
 	case <-authCalled:
@@ -377,26 +402,10 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	}
 }
 
-// mainThreadResponsive must report true when the UI goroutine actually
-// services the queued fyne.Do call — the ordinary case. The genuine-timeout
-// path (a wedged UI goroutine that never runs the closure) is not
-// practically testable here: fyne's own test driver runs DoFromGoroutine's
-// function immediately, synchronously, regardless of the wait flag ("our
-// threading is simple" — see fyne.io/fyne/v2/test/driver.go), so a fake
-// "never responds" case cannot be constructed without a real GLFW driver.
-func TestMainThreadResponsiveTruePath(t *testing.T) {
-	test.NewApp()
-	a := &app{}
-
-	if !a.mainThreadResponsive(time.Second) {
-		t.Error("mainThreadResponsive reported false for a UI goroutine that services its queue normally")
-	}
-}
-
 // The update dialog must surface only ONCE per distinct version: the badge and
 // menu item update on every 6-hourly check (cheap), but re-prompting the same
 // version every 6h would nag. shouldPromptUpdate is the pure decision behind the
-// thin promptUpdate wrapper (a headless fyne dialog is impractical to drive in a
+// thin promptUpdate wrapper (a real update dialog is impractical to drive in a
 // test); this pins its once-per-version contract.
 func TestShouldPromptUpdateOncePerVersion(t *testing.T) {
 	a := &app{}

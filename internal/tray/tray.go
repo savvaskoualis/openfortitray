@@ -140,6 +140,17 @@ func SetTooltip(text string) {
 	}
 }
 
+// ShowMessage posts a desktop notification via the tray icon's native
+// balloon/banner (QSystemTrayIcon::showMessage). Like SetTooltip, it is a
+// no-op before the tray exists — cmd/openfortitray wires this as the app's
+// notify seam (app.notify), which is nil-checked by every caller, so this
+// guard only matters for a call arriving in the narrow window before Setup.
+func ShowMessage(title, body string) {
+	if trayIcon != nil {
+		trayIcon.ShowMessage2(title, body)
+	}
+}
+
 // buildMenu builds the menu items and installs them on c.menu. It touches no
 // QSystemTrayIcon, so it is exercised directly by tests that only care about
 // the menu's wiring.
