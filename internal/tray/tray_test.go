@@ -144,6 +144,12 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// The offscreen platform plugin is Qt's own documented mechanism for
+	// headless test/CI environments — GitHub Actions runners have no logged-in
+	// GUI session, so constructing real native windows without it risks a
+	// crash during teardown (reproduced directly on two machines before this
+	// was added).
+	os.Setenv("QT_QPA_PLATFORM", "offscreen")
 	qt.NewQApplication(os.Args)
 
 	// TestSetupSucceeds

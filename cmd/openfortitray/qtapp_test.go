@@ -28,6 +28,12 @@ var qApplicationOK bool
 // pinned by init(), rather than in a Test function — see init() for why a
 // Test function is the wrong place for this call on macOS.
 func TestMain(m *testing.M) {
+	// The offscreen platform plugin is Qt's own documented mechanism for
+	// headless test/CI environments — GitHub Actions runners have no logged-in
+	// GUI session, so constructing real native windows without it risks a
+	// crash during teardown (reproduced directly on two machines before this
+	// was added).
+	os.Setenv("QT_QPA_PLATFORM", "offscreen")
 	qApplicationOK = newQApplication(os.Args) != nil
 	os.Exit(m.Run())
 }
