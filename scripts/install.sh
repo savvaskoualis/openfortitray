@@ -423,9 +423,15 @@ install_openconnect() {
 		brew install openconnect
 		;;
 	Linux)
-		if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y openconnect
-		elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y openconnect
-		elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --noconfirm openconnect
+		# qt6-base-dev/qt6-qtbase-devel/qt6-base also installs the Qt6 runtime
+		# libraries this binary now links against (miqt migration; see
+		# cmd/openfortitray/qtapp.go) — there is no separate minimal
+		# runtime-only package on most of these distros, and qt6-base-dev
+		# matches what CI already installs to build the binary, so
+		# build-time and install-time Qt6 are less likely to mismatch.
+		if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y openconnect qt6-base-dev
+		elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y openconnect qt6-qtbase-devel
+		elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --noconfirm openconnect qt6-base
 		else die "no supported package manager found; install openconnect manually"
 		fi
 		;;

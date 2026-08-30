@@ -54,6 +54,16 @@
   #define MyMesaDir "..\dist"
 #endif
 
+; Directory holding the Qt6 runtime DLLs + platform plugin that CI's "Bundle
+; Qt6 runtime DLLs" step (windeployqt6) drops next to the exe (miqt
+; migration; the exe now links Qt6 at runtime, unlike the old static-binary
+; fyne build). windeployqt6 places the Qt*.dll files flat in this directory
+; and the platform plugin (qwindows.dll) in a platforms\ subdirectory below
+; it. Override with /DMyQtDir if it lives elsewhere.
+#ifndef MyQtDir
+  #define MyQtDir "..\dist"
+#endif
+
 ; Directory holding the bundled openconnect binary, its full transitive DLL
 ; closure, and wintun.dll. CI's "Bundle openconnect + DLL closure + wintun" step
 ; collects them into dist/openconnect/ before ISCC runs. Override with /DMyOcDir.
@@ -112,6 +122,13 @@ Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: i
 ; (Inno tracks [Files] it installs). Mesa is MIT-style — see THIRD_PARTY_LICENSES.
 Source: "{#MyMesaDir}\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyMesaDir}\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Bundled Qt6 runtime (miqt migration): windeployqt6 drops the Qt*.dll files
+; flat beside the exe and the platform plugin (qwindows.dll) into a
+; platforms\ subdirectory. Both are required at runtime now that the exe
+; links Qt6 (see cmd/openfortitray/qtapp.go). Tracked by Inno, so uninstall
+; removes them.
+Source: "{#MyQtDir}\Qt6*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyQtDir}\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion
 ; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
 ; installed into {app}\openconnect. The tray resolves this path at runtime
 ; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config
