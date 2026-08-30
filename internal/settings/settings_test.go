@@ -336,3 +336,101 @@ func TestPSKSecretPersistedThroughCredstoreOnSave(t *testing.T) {
 		t.Fatal("a persisted PSK edit must be cleared from the dirty map")
 	}
 }
+
+// TestResetClearsUnsavedIPsecSecret confirms reset() (called by both Show and
+// Cancel) discards a typed-but-unsaved IPsec PSK, matching its documented
+// contract of discarding "any edits left from a previous session" across the
+// whole working copy — not just the profile currently on screen. Before
+// ipsecSecretDirty/ipsecSecretValue became per-profile maps, loadProfile
+// unconditionally blanked the (then-flat) PSK field on every call, so
+// Cancel/Show got this "discard" behavior for free as a side effect of the
+// very bug that fix corrected; now that loadProfile reads from the maps
+// instead of blindly blanking, reset() has to clear them itself. Ported from
+// the pre-migration Fyne render_capture_test.go onto the new Qt Controller.
+func TestResetClearsUnsavedIPsecSecret(t *testing.T) {
+	restore := credstore.SetBackend(credstore.NewMemory())
+	t.Cleanup(restore)
+
+	work := config.NewProfile("Work")
+	work.Gateway = "vpn.example.com"
+	work.Backend = config.BackendIPsec
+	work.IPsec.AuthMethod = config.IPsecAuthPSK
+	cfg := &config.Config{ActiveProfile: "Work", Profiles: []config.Profile{work}}
+
+	c := New(&fakeHost{cfg: cfg}, qt.NewQMainWindow2())
+
+	c.ipsecSecretEntry.SetText("typed-but-not-saved")
+	if !c.ipsecSecretDirty[c.sel] {
+		t.Fatal("typing into the PSK entry should have marked it dirty")
+	}
+	if c.ipsecSecretValue[c.sel] != "typed-but-not-saved" {
+		t.Fatalf("ipsecSecretValue[%d] = %q, want the typed text", c.sel, c.ipsecSecretValue[c.sel])
+	}
+
+	c.reset() // what both Show and Cancel do
+
+	if got := c.ipsecSecretEntry.Text(); got != "" {
+		t.Errorf("after reset, the PSK entry shows %q, want blank", got)
+	}
+	if c.ipsecSecretDirty[c.sel] {
+		t.Error("after reset, the PSK entry should no longer be marked dirty")
+	}
+	if v, ok := c.ipsecSecretValue[c.sel]; ok {
+		t.Errorf("after reset, ipsecSecretValue still holds %q for profile %d, want the map cleared", v, c.sel)
+	}
+}
+
+// TestSavePersistsAllDirtyIPsecPSKsNotJustSelected: typing a PSK for profile
+// A, switching to profile B (which — per ipsecSecretDirty/ipsecSecretValue
+// being per-profile maps — must NOT lose A's unsaved edit), typing a
+// different PSK for B, then hitting Save must persist BOTH profiles' PSKs to
+// their own credstore keys, not just the one shown in the form when Save was
+// clicked. Ported from the pre-migration Fyne render_capture_test.go onto
+// the new Qt Controller.
+func TestSavePersistsAllDirtyIPsecPSKsNotJustSelected(t *testing.T) {
+	restore := credstore.SetBackend(credstore.NewMemory())
+	t.Cleanup(restore)
+
+	profA := config.NewProfile("A")
+	profA.Gateway = "a.example.com"
+	profA.Backend = config.BackendIPsec
+	profA.IPsec.AuthMethod = config.IPsecAuthPSK
+
+	profB := config.NewProfile("B")
+	profB.Gateway = "b.example.com"
+	profB.Backend = config.BackendIPsec
+	profB.IPsec.AuthMethod = config.IPsecAuthPSK
+
+	cfg := &config.Config{ActiveProfile: "A", Profiles: []config.Profile{profA, profB}}
+
+	c := New(&fakeHost{cfg: cfg}, qt.NewQMainWindow2())
+
+	// Type A's PSK (profile A is shown first, matching ActiveProfile), switch
+	// to B, and type a different PSK there.
+	c.ipsecSecretEntry.SetText("psk-for-A")
+	c.loadProfile(1)
+	c.ipsecSecretEntry.SetText("psk-for-B")
+
+	c.save(false)
+
+	gotA, err := credstore.Get(config.IPsecPSKCredstoreKey("a.example.com"))
+	if err != nil {
+		t.Fatalf("credstore.Get(A): %v", err)
+	}
+	if gotA != "psk-for-A" {
+		t.Errorf("profile A's PSK = %q, want %q — an edit made before switching to B must survive Save", gotA, "psk-for-A")
+	}
+	gotB, err := credstore.Get(config.IPsecPSKCredstoreKey("b.example.com"))
+	if err != nil {
+		t.Fatalf("credstore.Get(B): %v", err)
+	}
+	if gotB != "psk-for-B" {
+		t.Errorf("profile B's PSK = %q, want %q", gotB, "psk-for-B")
+	}
+	if len(c.ipsecSecretDirty) != 0 {
+		t.Errorf("ipsecSecretDirty has %d leftover entries after Save, want all cleared: %v", len(c.ipsecSecretDirty), c.ipsecSecretDirty)
+	}
+	if len(c.ipsecSecretValue) != 0 {
+		t.Errorf("ipsecSecretValue has %d leftover entries after Save, want the plaintext dropped from memory: %v", len(c.ipsecSecretValue), c.ipsecSecretValue)
+	}
+}
