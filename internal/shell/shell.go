@@ -65,7 +65,12 @@ var navLabels = [3]string{"Status", "Connection", "Advanced"}
 func New(win *qt.QMainWindow, p Parts) *Shell {
 	s := &Shell{win: win}
 
+	// Fusion (unlike the native macOS style it replaced) strictly enforces
+	// WA_StyledBackground for plain QWidgets — without it, this widget's
+	// QSS `background: rgba(...)` silently doesn't paint, leaving the
+	// window fully see-through and looking like nothing opened at all.
 	root := qt.NewQWidget(nil)
+	root.SetAttribute2(qt.WA_StyledBackground, true)
 	rootLayout := qt.NewQHBoxLayout2()
 	rootLayout.SetContentsMargins(0, 0, 0, 0)
 	rootLayout.SetSpacing(0)
@@ -75,6 +80,7 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 	// semantics and a scrollbar for no benefit, and buttons make the
 	// current section's emphasis explicit.
 	rail := qt.NewQWidget(nil)
+	rail.SetAttribute2(qt.WA_StyledBackground, true)
 	rail.SetFixedWidth(railWidth)
 	railLayout := qt.NewQVBoxLayout2()
 	railLayout.SetContentsMargins(10, 18, 10, 18)
@@ -113,6 +119,7 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 	// it — this layout just gives it somewhere to actually render once they
 	// do.
 	content := qt.NewQWidget(nil)
+	content.SetAttribute2(qt.WA_StyledBackground, true)
 	contentLayout := qt.NewQVBoxLayout2()
 	contentLayout.SetContentsMargins(0, 0, 0, 0)
 	contentLayout.SetSpacing(0)
