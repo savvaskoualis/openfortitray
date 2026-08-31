@@ -62,6 +62,11 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 	s := &Shell{win: win}
 
 	root := qt.NewQWidget(nil)
+	// Named so uitheme's stylesheet can scope the translucent background
+	// wash to this ONE widget instead of the generic QWidget selector,
+	// which would otherwise cascade to every descendant and stack opacity
+	// layer over layer until the vibrancy behind it is fully obscured.
+	root.SetObjectName(*qt.NewQAnyStringView3("oftRoot"))
 	rootLayout := qt.NewQHBoxLayout2()
 	rootLayout.SetContentsMargins(0, 0, 0, 0)
 	rootLayout.SetSpacing(0)

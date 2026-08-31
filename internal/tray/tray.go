@@ -296,7 +296,14 @@ func iconFor(k uistate.Kind) []byte {
 // decode failure is not expected; LoadFromDataWithData's bool result is
 // intentionally not checked for the same reason composeBadge's fallback exists
 // — this is a construction-time helper for known-good bytes.
+//
+// Padded to square first (see padToSquare) since the base assets are 45x32
+// and Qt's tray renders a QIcon at its native aspect ratio, unlike Fyne's
+// tray which apparently normalized this itself.
 func iconFromPNG(png []byte) *qt.QIcon {
+	if squared, err := padToSquare(png); err == nil {
+		png = squared
+	}
 	pixmap := qt.NewQPixmap()
 	pixmap.LoadFromDataWithData(png)
 	return qt.NewQIcon2(pixmap)

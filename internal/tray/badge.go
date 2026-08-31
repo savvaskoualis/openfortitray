@@ -64,3 +64,32 @@ func composeBadge(base []byte) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// padToSquare centers src on a transparent square canvas sized to its
+// longer side and re-encodes as PNG. The embedded base icons are 45x32 —
+// fine under Fyne's tray, which apparently normalized this itself, but
+// Qt's QSystemTrayIcon renders a QIcon's native aspect ratio scaled to the
+// menu bar's fixed height, so a landscape source icon shows up as a
+// visibly widened rectangle instead of the usual square tray glyph.
+// Padding to square here, once, at construction time, fixes that without
+// touching the artwork or composeBadge's badge-placement math (which
+// already sizes relative to the shorter side and is unaffected by the
+// added transparent margin).
+func padToSquare(src []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, err
+	}
+	b := img.Bounds()
+	side := max(b.Dx(), b.Dy())
+	dst := image.NewRGBA(image.Rect(0, 0, side, side))
+	offX := (side - b.Dx()) / 2
+	offY := (side - b.Dy()) / 2
+	draw.Draw(dst, image.Rect(offX, offY, offX+b.Dx(), offY+b.Dy()), img, b.Min, draw.Src)
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, dst); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}

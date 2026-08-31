@@ -101,17 +101,25 @@ func hexToRGB(hex string) (r, g, b uint8) {
 	return uint8(ri), uint8(gi), uint8(bi)
 }
 
-// StyleSheet renders the full QSS the app applies once at startup via
-// (*qt.QWidget).SetStyleSheet on the central widget — Qt propagates it to
-// every descendant widget unless overridden locally.
+// StyleSheet renders the full QSS the app applies once at startup at the
+// QApplication level. The translucent Background token is scoped to
+// QMainWindow and the widget named "oftRoot" (the shell's central widget)
+// only — a bare `QWidget { background: rgba(...) }` rule would cascade to
+// every descendant and stack its alpha layer over layer, which reads as a
+// flat opaque wash rather than a single translucent pane over native
+// vibrancy. Every other QWidget gets an explicit transparent background so
+// the one translucent layer at the root is all that ever paints.
 func StyleSheet(dark bool) string {
 	p := paletteFor(dark)
 	t := Tokens{}
 	return fmt.Sprintf(`
 QWidget {
-	background: rgba(%[1]s);
+	background: transparent;
 	color: %[2]s;
 	font-size: %[3]vpx;
+}
+QMainWindow, QWidget#oftRoot {
+	background: rgba(%[1]s);
 }
 QPushButton {
 	background: %[4]s;
