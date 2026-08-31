@@ -1607,13 +1607,14 @@ func main() {
 	// re-laid out. Qt propagates a QApplication-level stylesheet to every
 	// widget unless overridden locally.
 	//
-	// dark is hardcoded false: this miqt version (v0.14.0) exposes
-	// QGuiApplication_StyleHints() but its *QStyleHints has no ColorScheme
-	// accessor to query the OS light/dark setting (verified against
-	// gen_qstylehints.go — no such method exists in this binding). Tracking
-	// the OS setting is a gap versus the old fyne theme, which resolved it
-	// automatically; see the Task 10 report.
-	dark := false
+	// miqt v0.14.0's QStyleHints has no ColorScheme accessor (verified
+	// against gen_qstylehints.go), so isDarkMode reads the OS setting
+	// directly (NSUserDefaults on macOS; always false elsewhere — see
+	// darkmode_other.go). This matters in practice, not just cosmetically:
+	// rendering the light palette under a dark system vibrancy material
+	// (or vice versa) produces near-invisible text and a muddy, flat
+	// appearance rather than merely "the wrong colors".
+	dark := isDarkMode()
 	qtApp.SetStyleSheet(uitheme.StyleSheet(dark))
 
 	ctrl, err := tray.Setup(a)
