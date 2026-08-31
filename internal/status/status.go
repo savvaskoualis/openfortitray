@@ -82,8 +82,15 @@ type Controller struct {
 	spinnerFrame []*qt.QPixmap
 	spinnerTimer *qt.QTimer
 	spinnerIdx   int
-	stateText    *qt.QLabel
-	subText      *qt.QLabel
+	// pulse replaces dot while connected (uistate.KindOK): a solid dot with
+	// an outer ring that expands and fades, looping — a static "connected"
+	// dot reads as inert exactly in the one state that's actually live.
+	pulse      *qt.QLabel
+	pulseFrame []*qt.QPixmap
+	pulseTimer *qt.QTimer
+	pulseIdx   int
+	stateText  *qt.QLabel
+	subText    *qt.QLabel
 	// timerText is the session clock, on its own line in the monospace face so a
 	// ticking second does not shift the gateway name above it.
 	timerText *qt.QLabel
@@ -188,6 +195,22 @@ func (c *Controller) build() {
 		c.spinner.SetPixmap(c.spinnerFrame[c.spinnerIdx])
 	})
 
+	// Apple's systemGreen — matches every other "live" indicator on the
+	// platform (recording dot, screen-sharing menu bar icon, etc.).
+	pulseGreen := color.RGBA{R: 52, G: 199, B: 89, A: 255}
+	c.pulseFrame = renderPulseFrames(pulseGreen, d, d*2)
+	c.pulse = qt.NewQLabel2()
+	c.pulse.SetFixedSize2(d*2, d*2)
+	c.pulse.SetAlignment(qt.AlignCenter)
+	c.pulse.SetPixmap(c.pulseFrame[0])
+	c.pulse.SetVisible(false)
+	c.pulseTimer = qt.NewQTimer2(nil)
+	c.pulseTimer.SetInterval(pulseTickMS)
+	c.pulseTimer.OnTimeout(func() {
+		c.pulseIdx = (c.pulseIdx + 1) % len(c.pulseFrame)
+		c.pulse.SetPixmap(c.pulseFrame[c.pulseIdx])
+	})
+
 	// The state is the largest thing on screen; the gateway and the clock sit
 	// under it in the muted foreground.
 	c.stateText = centeredLabel(20, true)
@@ -199,6 +222,7 @@ func (c *Controller) build() {
 	heroLayout.SetSpacing(2)
 	heroLayout.AddWidget3(c.dot.QWidget, 0, qt.AlignHCenter)
 	heroLayout.AddWidget3(c.spinner.QWidget, 0, qt.AlignHCenter)
+	heroLayout.AddWidget3(c.pulse.QWidget, 0, qt.AlignHCenter)
 	heroLayout.AddWidget(c.stateText.QWidget)
 	heroLayout.AddWidget(c.subText.QWidget)
 	heroLayout.AddWidget(c.timerText.QWidget)
@@ -358,12 +382,19 @@ func (c *Controller) render(v uistate.View) {
 	}
 
 	setRole(c.dot.QWidget, dotRole(v.Kind))
-	c.dot.SetVisible(!v.Busy())
+	connected := !v.Busy() && v.Kind == uistate.KindOK
+	c.dot.SetVisible(!v.Busy() && !connected)
 	c.spinner.SetVisible(v.Busy())
+	c.pulse.SetVisible(connected)
 	if v.Busy() {
 		c.spinnerTimer.Start(spinnerTickMS)
 	} else {
 		c.spinnerTimer.Stop()
+	}
+	if connected {
+		c.pulseTimer.Start(pulseTickMS)
+	} else {
+		c.pulseTimer.Stop()
 	}
 
 	c.stateText.SetText(v.Title)
