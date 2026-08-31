@@ -1602,6 +1602,13 @@ func main() {
 	qt.QCoreApplication_SetOrganizationName("io.github.savvaskoualis")
 	qt.QCoreApplication_SetApplicationName("OpenFortiTray")
 
+	// Fusion replaces Qt's native macOS widget style, which paints its own
+	// chrome (focus rings, combo box arrows, control edges) underneath QSS
+	// and only partially honors it — the reason heavy styling still read as
+	// "native" rather than "designed". Fusion is a pure-QSS style with no
+	// native painting to fight, giving uitheme.StyleSheet full control.
+	qt.QApplication_SetStyleWithStyle("Fusion")
+
 	// The app theme, applied once at the QApplication level before any window
 	// is built so nothing is ever laid out against an unstyled widget and then
 	// re-laid out. Qt propagates a QApplication-level stylesheet to every
@@ -1651,6 +1658,15 @@ func main() {
 	win := qt.NewQMainWindow2()
 	win.SetAttribute2(qt.WA_TranslucentBackground, true)
 	a.win = win
+	// Hide rather than quit on close — mirrors newUpdateFlow's dlg.OnCloseEvent.
+	// Without this, Qt's default quitOnLastWindowClosed behavior tears the whole
+	// app down when the user clicks the window's close button, contradicting the
+	// "shell intercepts its close to Hide" comment below and killing an active
+	// tunnel's tray icon along with it.
+	win.OnCloseEvent(func(_ func(event *qt.QCloseEvent), event *qt.QCloseEvent) {
+		event.Ignore()
+		win.Hide()
+	})
 	a.settings = settings.New(a, win)
 	a.status = status.New(a, win)
 

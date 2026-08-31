@@ -237,6 +237,7 @@ func (c *Controller) build() {
 			c.primaryAction()
 		}
 	})
+	uitheme.Elevate(c.primary.QWidget)
 	rootLayout.AddWidget3(c.primary.QWidget, 0, qt.AlignHCenter)
 
 	// Details, deliberately quiet: a muted two-column form under the hero. No
@@ -257,6 +258,7 @@ func (c *Controller) build() {
 	// exactly the "flat text on a card" complaint this role exists to fix.
 	details.SetAttribute2(qt.WA_StyledBackground, true)
 	setRole(details, "card")
+	uitheme.Elevate(details)
 	details.SetLayout(detailsLayout.QLayout)
 	rootLayout.AddWidget(details)
 

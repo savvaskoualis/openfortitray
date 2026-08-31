@@ -6,7 +6,11 @@
 // color.
 package uitheme
 
-import "fmt"
+import (
+	"fmt"
+
+	qt "github.com/mappu/miqt/qt6"
+)
 
 // Tokens exposes size constants as methods so call sites read like
 // tok.TextSize() rather than a bare package-level constant grab-bag.
@@ -18,9 +22,9 @@ func (Tokens) SubHeadingTextSize() float64 { return 15 }
 func (Tokens) HeadingTextSize() float64    { return 20 }
 func (Tokens) Padding() float64            { return 5 }
 func (Tokens) InnerPadding() float64       { return 10 }
-func (Tokens) CardRadius() float64         { return 8 }
-func (Tokens) ButtonRadius() float64       { return 6 }
-func (Tokens) InputRadius() float64        { return 6 }
+func (Tokens) CardRadius() float64         { return 14 }
+func (Tokens) ButtonRadius() float64       { return 10 }
+func (Tokens) InputRadius() float64        { return 10 }
 func (Tokens) SeparatorThickness() float64 { return 1 }
 func (Tokens) StatusDotDiameter() float64  { return 22 }
 func (Tokens) FieldMinHeight() float64     { return 20 }
@@ -298,6 +302,21 @@ QProgressBar::chunk {
 // state badge widget — exported so that widget and this package's QSS
 // border-radius rule can never drift out of sync with each other.
 func StatusDotDiameter() float64 { return Tokens{}.StatusDotDiameter() }
+
+// Elevate gives w a soft drop shadow — the "lifted off the background" look
+// Material/Fyne-style designs use for cards and primary actions. QSS has no
+// box-shadow property, so this is the one piece of the modern look that has
+// to be a real QGraphicsEffect rather than a stylesheet rule.
+func Elevate(w *qt.QWidget) {
+	shadow := qt.NewQGraphicsDropShadowEffect()
+	shadow.SetBlurRadius(28)
+	shadow.SetOffset2(0, 6)
+	shadowColor := qt.NewQColor()
+	shadowColor.SetRgb(0, 0, 0)
+	shadowColor.SetAlpha(70)
+	shadow.SetColor(shadowColor)
+	w.SetGraphicsEffect(shadow.QGraphicsEffect)
+}
 
 func rgbaCSS(hex string, alpha uint8) string {
 	r, g, b := hexToRGB(hex)
