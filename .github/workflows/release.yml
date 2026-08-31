@@ -319,23 +319,31 @@ jobs:
       # same dist\ layout the Mesa DLL bundling above already uses, so the
       # exe is turnkey without a separately-installed matching Qt6.
       #
-      # --compiler-runtime is required, not optional: windeployqt6 does NOT
-      # bundle the MinGW compiler runtime (libgcc_s_seh-1.dll, libstdc++-6.dll,
-      # libwinpthread-1.dll) by default. Both cgo's own object code and the Qt6
-      # UCRT64 DLLs are MinGW-built and need them; a stock Windows machine has
-      # none of the three. Without this flag the exe fails to launch off this
-      # build's runner with "The code execution cannot proceed because
-      # libgcc_s_seh-1.dll was not found" — confirmed live on a real Windows
-      # machine running v0.2.1.
+      # --compiler-runtime was tried first (Qt's documented flag for exactly this
+      # gap) but verified NOT to copy anything on this UCRT64 setup — the flag is
+      # passed anyway in case a future Qt/MinGW combination honors it, but the
+      # three MinGW runtime DLLs (libgcc_s_seh-1.dll, libstdc++-6.dll,
+      # libwinpthread-1.dll) are copied explicitly below instead, the same way
+      # this job already hand-bundles Mesa and openconnect. Both cgo's own
+      # object code and the Qt6 UCRT64 DLLs are MinGW-built and need them; a
+      # stock Windows machine has none of the three. Missing them is exactly
+      # "The code execution cannot proceed because libgcc_s_seh-1.dll was not
+      # found" — confirmed live on a real Windows machine running v0.2.1.
       #
-      # This step runs under bash (defaults.run.shell: bash), so the target
-      # path uses forward slashes like every other dist/... path in this
-      # file (the go build -o line above, the test -s checks) — an unquoted
-      # backslash path here would be corrupted by bash's escape handling
+      # This step runs under bash (defaults.run.shell: bash), so every path
+      # uses forward slashes like every other dist/... path in this file (the
+      # go build -o line above, the test -s checks) — an unquoted backslash
+      # path here would be corrupted by bash's escape handling
       # (`dist\openfortitray...` becomes `distopenfortitray...`).
       - name: Bundle Qt6 runtime DLLs
         run: |
           "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\windeployqt6.exe" --release --no-translations --compiler-runtime dist/openfortitray-windows-amd64.exe
+          cp "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\libgcc_s_seh-1.dll" dist/
+          cp "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\libstdc++-6.dll" dist/
+          cp "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\libwinpthread-1.dll" dist/
+          test -s dist/libgcc_s_seh-1.dll
+          test -s dist/libstdc++-6.dll
+          test -s dist/libwinpthread-1.dll
 
       # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
       # the app so Windows is turnkey. There is no reliable way to install

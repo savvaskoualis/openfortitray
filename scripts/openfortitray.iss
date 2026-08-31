@@ -129,6 +129,15 @@ Source: "{#MyMesaDir}\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversio
 ; removes them.
 Source: "{#MyQtDir}\Qt6*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyQtDir}\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion
+; The MinGW/UCRT64 compiler runtime both cgo's own object code and the
+; MinGW-built Qt6 DLLs above need at load time. windeployqt6 does not bundle
+; these (verified: its --compiler-runtime flag copies nothing on this UCRT64
+; setup), so CI's "Bundle Qt6 runtime DLLs" step copies them next to the exe
+; explicitly, the same as the Qt DLLs above. Without them: "The code
+; execution cannot proceed because libgcc_s_seh-1.dll was not found."
+Source: "{#MyQtDir}\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyQtDir}\libstdc++-6.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyQtDir}\libwinpthread-1.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
 ; installed into {app}\openconnect. The tray resolves this path at runtime
 ; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config
