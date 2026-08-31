@@ -16,6 +16,7 @@ package status
 
 import (
 	"fmt"
+	"image/color"
 	"time"
 
 	qt "github.com/mappu/miqt/qt6"
@@ -72,11 +73,17 @@ type Controller struct {
 	// selectors). It is the only saturated colour in the window when idle.
 	// spinner replaces it while v.Busy() (authenticating/connecting/
 	// reconnecting) — a static dot reads as inert exactly when something
-	// really is happening; only one of the two is ever visible.
-	dot       *qt.QLabel
-	spinner   *qt.QProgressBar
-	stateText *qt.QLabel
-	subText   *qt.QLabel
+	// really is happening; only one of the two is ever visible. It is a
+	// real rotating ring of pre-rendered frames (see spinner.go), not a
+	// generic QProgressBar — a stock indeterminate bar reads as a loading
+	// bar, not a status spinner.
+	dot          *qt.QLabel
+	spinner      *qt.QLabel
+	spinnerFrame []*qt.QPixmap
+	spinnerTimer *qt.QTimer
+	spinnerIdx   int
+	stateText    *qt.QLabel
+	subText      *qt.QLabel
 	// timerText is the session clock, on its own line in the monospace face so a
 	// ticking second does not shift the gateway name above it.
 	timerText *qt.QLabel
@@ -164,16 +171,22 @@ func (c *Controller) build() {
 	d := int(uitheme.StatusDotDiameter())
 	c.dot.SetFixedSize2(d, d)
 
-	// Indeterminate (SetRange(0, 0) — Qt's documented way to get a
-	// continuously-animating "busy" bar, no fake percentage), the same
-	// technique cmd/openfortitray/updateflow.go already uses for its own
-	// "preparing" state. Hidden until a Busy view actually needs it.
-	c.spinner = qt.NewQProgressBar2()
-	c.spinner.SetRange(0, 0)
-	c.spinner.SetTextVisible(false)
-	c.spinner.SetFixedWidth(120)
-	c.spinner.SetFixedHeight(d)
+	// A neutral, theme-independent tint (macOS's own spinner stays
+	// achromatic across light/dark too) — internal/status has no dark-mode
+	// flag threaded into it, and a spinner's motion is what reads as
+	// "busy", not its exact hue matching the current palette variant.
+	c.spinnerFrame = renderSpinnerFrames(color.RGBA{R: 210, G: 210, B: 210, A: 255}, d*2)
+	c.spinner = qt.NewQLabel2()
+	c.spinner.SetFixedSize2(d*2, d*2)
+	c.spinner.SetAlignment(qt.AlignCenter)
+	c.spinner.SetPixmap(c.spinnerFrame[0])
 	c.spinner.SetVisible(false)
+	c.spinnerTimer = qt.NewQTimer2(nil)
+	c.spinnerTimer.SetInterval(spinnerTickMS)
+	c.spinnerTimer.OnTimeout(func() {
+		c.spinnerIdx = (c.spinnerIdx + 1) % len(c.spinnerFrame)
+		c.spinner.SetPixmap(c.spinnerFrame[c.spinnerIdx])
+	})
 
 	// The state is the largest thing on screen; the gateway and the clock sit
 	// under it in the muted foreground.
@@ -347,6 +360,11 @@ func (c *Controller) render(v uistate.View) {
 	setRole(c.dot.QWidget, dotRole(v.Kind))
 	c.dot.SetVisible(!v.Busy())
 	c.spinner.SetVisible(v.Busy())
+	if v.Busy() {
+		c.spinnerTimer.Start(spinnerTickMS)
+	} else {
+		c.spinnerTimer.Stop()
+	}
 
 	c.stateText.SetText(v.Title)
 

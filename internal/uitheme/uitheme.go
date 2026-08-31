@@ -203,6 +203,39 @@ QLineEdit, QComboBox {
 	padding: 8px 10px;
 	font-size: %[28]vpx;
 }
+QLineEdit:focus, QComboBox:focus {
+	border: 1px solid %[15]s;
+}
+QComboBox:hover {
+	border: 1px solid %[15]s;
+}
+QComboBox::drop-down {
+	border: none;
+	width: 24px;
+}
+QComboBox::down-arrow {
+	image: none;
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+	border-top: 5px solid %[6]s;
+	width: 0;
+	height: 0;
+	margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+	background: %[7]s;
+	border: 1px solid %[8]s;
+	border-radius: %[9]vpx;
+	outline: none;
+	padding: 4px;
+	selection-background-color: %[15]s;
+	selection-color: %[16]s;
+}
+QComboBox QAbstractItemView::item {
+	min-height: %[27]vpx;
+	padding: 4px 8px;
+	border-radius: %[5]vpx;
+}
 QProgressBar {
 	background: %[7]s;
 	border: none;
