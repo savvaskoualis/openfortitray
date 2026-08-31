@@ -51,8 +51,12 @@ type Shell struct {
 	profileBar, banner, footer *qt.QWidget
 }
 
-// railWidth matches the approved mock.
-const railWidth = 150
+// railWidth, windowWidth and windowHeight match the approved mock's scale.
+const (
+	railWidth    = 150
+	windowWidth  = 820
+	windowHeight = 680
+)
 
 var navLabels = [3]string{"Status", "Connection", "Advanced"}
 
@@ -129,6 +133,11 @@ func New(win *qt.QMainWindow, p Parts) *Shell {
 	root.SetLayout(rootLayout.QLayout)
 
 	win.SetCentralWidget(root)
+	// Matches the approved mock's scale. Without an explicit size, Qt sizes
+	// the window to its layout's minimum size hint — noticeably smaller
+	// than intended, since nothing else in this migration ever ported the
+	// original design's window dimensions forward.
+	win.Resize(windowWidth, windowHeight)
 	s.Select(SectionStatus)
 	return s
 }
