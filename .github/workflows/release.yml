@@ -64,6 +64,16 @@ jobs:
       - name: Install Qt6 (arm64 + x86_64, for both build legs)
         run: |
           brew install qt pkg-config
+          # macos-14 (Apple Silicon) runners do not ship a working x86_64
+          # Homebrew at /usr/local — confirmed live (v0.2.0's first release
+          # attempt failed here with "arch: /usr/local/bin/brew isn't
+          # executable"). Bootstrap one fresh under Rosetta if it's not
+          # already a real executable, matching Homebrew's own documented
+          # x86_64-on-Apple-Silicon install path.
+          softwareupdate --install-rosetta --agree-to-license || true
+          if [ ! -x /usr/local/bin/brew ]; then
+            arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
           arch -x86_64 /usr/local/bin/brew install qt pkg-config
 
       # The build version is stamped into main.version (shown in the tray header)
