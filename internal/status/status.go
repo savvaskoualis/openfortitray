@@ -437,12 +437,16 @@ func (c *Controller) setActivityTitle(n int) {
 	}
 }
 
-// toggleActivity shows or hides the history and resizes the window to fit,
-// so the list appears in space made for it rather than getting clipped at the
-// bottom edge. Task 4 dropped the shell-side RequestHeight callback entirely:
-// Qt's layout system recomputes a QMainWindow's size hint from its visible
-// children on its own, so asking the window itself to adjust is enough — there is
-// no longer a shell to ask.
+// toggleActivity shows or hides the history. It deliberately does NOT resize
+// the shared app window: an earlier version called win.AdjustSize() here,
+// but c.win is the ONE window the whole shell (nav rail, Connection,
+// Advanced, this Status page) lives in, hosted inside a QStackedWidget.
+// AdjustSize() recomputes size from the window's overall layout, not just
+// this page's content, and in practice collapsed the entire window instead
+// of growing it to fit the newly-visible activity list — confirmed live,
+// not just a theoretical risk the final review had flagged as unverified.
+// activityScroll already has a fixed height (activityHeight), so it simply
+// takes its place in the existing layout without needing a window resize.
 func (c *Controller) toggleActivity() {
 	c.activityOpen = !c.activityOpen
 	if c.activityOpen {
@@ -452,7 +456,6 @@ func (c *Controller) toggleActivity() {
 		c.activityScroll.SetVisible(false)
 		c.activityToggle.SetArrowType(qt.RightArrow)
 	}
-	c.win.AdjustSize()
 }
 
 // dotRole maps a view's severity onto uitheme's semantic QSS roles. These are the
