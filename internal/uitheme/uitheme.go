@@ -129,6 +129,10 @@ QPushButton:checked {
 QPushButton:hover {
 	background: rgba(%[17]s);
 }
+QPushButton:pressed {
+	background: rgba(%[17]s);
+	color: %[2]s;
+}
 QLineEdit, QComboBox {
 	background: %[7]s;
 	border: 1px solid %[8]s;
