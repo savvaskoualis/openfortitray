@@ -119,8 +119,10 @@ QWidget {
 QPushButton {
 	background: %[4]s;
 	color: %[2]s;
+	border: 1px solid rgba(%[30]s);
 	border-radius: %[5]vpx;
-	padding: 6px 12px;
+	padding: 7px 14px;
+	font-weight: 600;
 }
 QPushButton:disabled {
 	color: %[6]s;
@@ -128,6 +130,7 @@ QPushButton:disabled {
 QPushButton:checked {
 	background: %[15]s;
 	color: %[16]s;
+	border: none;
 }
 QPushButton:hover {
 	background: rgba(%[17]s);
@@ -145,6 +148,15 @@ QLineEdit, QComboBox {
 QLabel[role="caption"] {
 	color: %[6]s;
 	font-size: %[10]vpx;
+}
+QLabel[role="sectionHeader"] {
+	color: %[15]s;
+	font-size: %[10]vpx;
+	font-weight: 700;
+	padding-top: 6px;
+	padding-bottom: 2px;
+	border-bottom: 1px solid rgba(%[29]s);
+	margin-bottom: 4px;
 }
 QLabel[role="headerBackground"] {
 	background: %[11]s;
@@ -174,12 +186,14 @@ QLabel[role="warning"] { color: %[19]s; }
 QLabel[role="error"] { color: %[21]s; }
 QWidget[role="card"] {
 	background: rgba(%[22]s);
+	border: 1px solid rgba(%[30]s);
 	border-radius: %[23]vpx;
 	padding: 12px 16px;
 }
 QPushButton[role="danger"] {
 	background: %[21]s;
 	color: %[16]s;
+	border: none;
 }
 QPushButton[role="danger"]:hover {
 	background: rgba(%[24]s);
@@ -187,6 +201,7 @@ QPushButton[role="danger"]:hover {
 QPushButton[role="success"] {
 	background: %[18]s;
 	color: %[16]s;
+	border: none;
 }
 QPushButton[role="success"]:hover {
 	background: rgba(%[25]s);
@@ -274,6 +289,8 @@ QProgressBar::chunk {
 		t.StatusDotDiameter()/2,                  // 26 — radius = half the widget's fixed diameter, for a true circle
 		t.FieldMinHeight(),                       // 27
 		t.FieldTextSize(),                        // 28
+		rgbaCSS(p.primary, 0x30),                 // 29 — sectionHeader's underline, a soft accent-tinted hairline
+		rgbaCSS(p.foreground, 0x16),              // 30 — a near-invisible hairline for card/button edge definition
 	)
 }
 

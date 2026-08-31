@@ -338,7 +338,7 @@ func setRole(w *qt.QLabel, role string) {
 // "caption" QSS role.
 func newCaption(text string) *qt.QLabel {
 	l := qt.NewQLabel3(strings.ToUpper(text))
-	setRole(l, "caption")
+	setRole(l, "sectionHeader")
 	return l
 }
 
