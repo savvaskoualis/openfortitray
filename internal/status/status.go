@@ -22,6 +22,7 @@ import (
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
+	"github.com/savvaskoualis/openfortitray/internal/uitheme"
 )
 
 // Host is everything the window needs from the application.
@@ -150,14 +151,14 @@ func (c *Controller) build() {
 	rootLayout.SetContentsMargins(18, 18, 18, 12)
 	rootLayout.SetSpacing(14)
 
-	// The state badge. A single coloured glyph rather than two canvas circles:
-	// Qt's stylesheet roles already give a themed colour for free, and painting a
-	// custom ring is complexity this window does not need.
-	c.dot = qt.NewQLabel3("●")
-	c.dot.SetAlignment(qt.AlignCenter)
-	dotFont := c.dot.Font()
-	dotFont.SetPointSize(28)
-	c.dot.SetFont(dotFont)
+	// The state badge: a real filled circle (fixed size + border-radius via
+	// QSS), not a text glyph. A Unicode "●" glyph renders inconsistently
+	// across fonts/sizes and reads small and thin next to the rest of the
+	// hero — a proper circle widget scales and looks the same everywhere.
+	c.dot = qt.NewQLabel2()
+	c.dot.SetObjectName(*qt.NewQAnyStringView3("statusDot"))
+	d := int(uitheme.StatusDotDiameter())
+	c.dot.SetFixedSize2(d, d)
 
 	// The state is the largest thing on screen; the gateway and the clock sit
 	// under it in the muted foreground.

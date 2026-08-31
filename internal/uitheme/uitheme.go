@@ -22,6 +22,9 @@ func (Tokens) CardRadius() float64         { return 8 }
 func (Tokens) ButtonRadius() float64       { return 6 }
 func (Tokens) InputRadius() float64        { return 6 }
 func (Tokens) SeparatorThickness() float64 { return 1 }
+func (Tokens) StatusDotDiameter() float64  { return 22 }
+func (Tokens) FieldMinHeight() float64     { return 20 }
+func (Tokens) FieldTextSize() float64      { return 14 }
 
 type palette struct {
 	background, headerBackground, menuBackground, overlayBackground string
@@ -188,6 +191,18 @@ QPushButton[role="success"] {
 QPushButton[role="success"]:hover {
 	background: rgba(%[25]s);
 }
+QLabel#statusDot {
+	border-radius: %[26]vpx;
+}
+QLabel#statusDot[role="success"] { background: %[18]s; }
+QLabel#statusDot[role="warning"] { background: %[19]s; }
+QLabel#statusDot[role="error"] { background: %[21]s; }
+QLabel#statusDot[role="caption"] { background: %[6]s; }
+QLineEdit, QComboBox {
+	min-height: %[27]vpx;
+	padding: 8px 10px;
+	font-size: %[28]vpx;
+}
 `,
 		rgbaCSS(p.background, p.backgroundAlpha), // 1
 		p.foreground,                             // 2
@@ -214,8 +229,16 @@ QPushButton[role="success"]:hover {
 		t.CardRadius(),                           // 23
 		rgbaCSS(p.error_, 0xE6),                  // 24 — danger button hover, slightly translucent
 		rgbaCSS(p.success, 0xE6),                 // 25 — success button hover, slightly translucent
+		t.StatusDotDiameter()/2,                  // 26 — radius = half the widget's fixed diameter, for a true circle
+		t.FieldMinHeight(),                       // 27
+		t.FieldTextSize(),                        // 28
 	)
 }
+
+// StatusDotDiameter is the fixed width/height internal/status sets on the
+// state badge widget — exported so that widget and this package's QSS
+// border-radius rule can never drift out of sync with each other.
+func StatusDotDiameter() float64 { return Tokens{}.StatusDotDiameter() }
 
 func rgbaCSS(hex string, alpha uint8) string {
 	r, g, b := hexToRGB(hex)
