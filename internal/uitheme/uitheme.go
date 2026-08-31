@@ -203,6 +203,15 @@ QLineEdit, QComboBox {
 	padding: 8px 10px;
 	font-size: %[28]vpx;
 }
+QProgressBar {
+	background: %[7]s;
+	border: none;
+	border-radius: %[26]vpx;
+}
+QProgressBar::chunk {
+	background: %[19]s;
+	border-radius: %[26]vpx;
+}
 `,
 		rgbaCSS(p.background, p.backgroundAlpha), // 1
 		p.foreground,                             // 2

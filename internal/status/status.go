@@ -67,10 +67,14 @@ type Controller struct {
 	host Host
 	win  *qt.QMainWindow
 
-	// dot is the state badge: a single glyph coloured by the current Kind via the
-	// "role" QSS property (see uitheme's [role="success"|"warning"|"error"]
-	// selectors). It is the only saturated colour in the window.
+	// dot is the state badge: a single circle coloured by the current Kind via
+	// the "role" QSS property (see uitheme's [role="success"|"warning"|"error"]
+	// selectors). It is the only saturated colour in the window when idle.
+	// spinner replaces it while v.Busy() (authenticating/connecting/
+	// reconnecting) — a static dot reads as inert exactly when something
+	// really is happening; only one of the two is ever visible.
 	dot       *qt.QLabel
+	spinner   *qt.QProgressBar
 	stateText *qt.QLabel
 	subText   *qt.QLabel
 	// timerText is the session clock, on its own line in the monospace face so a
@@ -160,6 +164,17 @@ func (c *Controller) build() {
 	d := int(uitheme.StatusDotDiameter())
 	c.dot.SetFixedSize2(d, d)
 
+	// Indeterminate (SetRange(0, 0) — Qt's documented way to get a
+	// continuously-animating "busy" bar, no fake percentage), the same
+	// technique cmd/openfortitray/updateflow.go already uses for its own
+	// "preparing" state. Hidden until a Busy view actually needs it.
+	c.spinner = qt.NewQProgressBar2()
+	c.spinner.SetRange(0, 0)
+	c.spinner.SetTextVisible(false)
+	c.spinner.SetFixedWidth(120)
+	c.spinner.SetFixedHeight(d)
+	c.spinner.SetVisible(false)
+
 	// The state is the largest thing on screen; the gateway and the clock sit
 	// under it in the muted foreground.
 	c.stateText = centeredLabel(20, true)
@@ -170,6 +185,7 @@ func (c *Controller) build() {
 	heroLayout := qt.NewQVBoxLayout2()
 	heroLayout.SetSpacing(2)
 	heroLayout.AddWidget3(c.dot.QWidget, 0, qt.AlignHCenter)
+	heroLayout.AddWidget3(c.spinner.QWidget, 0, qt.AlignHCenter)
 	heroLayout.AddWidget(c.stateText.QWidget)
 	heroLayout.AddWidget(c.subText.QWidget)
 	heroLayout.AddWidget(c.timerText.QWidget)
@@ -329,6 +345,8 @@ func (c *Controller) render(v uistate.View) {
 	}
 
 	setRole(c.dot.QWidget, dotRole(v.Kind))
+	c.dot.SetVisible(!v.Busy())
+	c.spinner.SetVisible(v.Busy())
 
 	c.stateText.SetText(v.Title)
 
