@@ -165,6 +165,25 @@ QLabel[role="hover"] {
 QLabel[role="success"] { color: %[18]s; }
 QLabel[role="warning"] { color: %[19]s; }
 QLabel[role="error"] { color: %[21]s; }
+QWidget[role="card"] {
+	background: rgba(%[22]s);
+	border-radius: %[23]vpx;
+	padding: 12px 16px;
+}
+QPushButton[role="danger"] {
+	background: %[21]s;
+	color: %[16]s;
+}
+QPushButton[role="danger"]:hover {
+	background: rgba(%[24]s);
+}
+QPushButton[role="success"] {
+	background: %[18]s;
+	color: %[16]s;
+}
+QPushButton[role="success"]:hover {
+	background: rgba(%[25]s);
+}
 `,
 		rgbaCSS(p.background, p.backgroundAlpha), // 1
 		p.foreground,                             // 2
@@ -187,6 +206,10 @@ QLabel[role="error"] { color: %[21]s; }
 		p.warning,                                // 19
 		t.SeparatorThickness(),                   // 20
 		p.error_,                                 // 21
+		rgbaCSS(p.overlayBackground, 0x33),       // 22 — card fill, a raised surface distinct from the ambient wash
+		t.CardRadius(),                           // 23
+		rgbaCSS(p.error_, 0xE6),                  // 24 — danger button hover, slightly translucent
+		rgbaCSS(p.success, 0xE6),                 // 25 — success button hover, slightly translucent
 	)
 }
 

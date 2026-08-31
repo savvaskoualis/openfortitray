@@ -197,6 +197,12 @@ func (c *Controller) build() {
 	detailsLayout.AddRow(cardKey("Assigned IP").QWidget, c.ipValue.QWidget)
 	detailsLayout.AddRow(cardKey("Protocol").QWidget, c.protoValue.QWidget)
 	detailsLayout.AddRow(cardKey("Connected since").QWidget, c.sinceValue.QWidget)
+	// A plain QWidget ignores QSS background/border/padding entirely unless
+	// WA_StyledBackground is set — without it, [role="card"]'s fill would be
+	// silently a no-op and this would stay invisible flat text, which is
+	// exactly the "flat text on a card" complaint this role exists to fix.
+	details.SetAttribute2(qt.WA_StyledBackground, true)
+	setRole(details, "card")
 	details.SetLayout(detailsLayout.QLayout)
 	rootLayout.AddWidget(details)
 
@@ -271,7 +277,7 @@ func monospace(l *qt.QLabel) {
 // happens to share the same muted colour token as a disabled control.
 func cardKey(text string) *qt.QLabel {
 	l := qt.NewQLabel3(text)
-	setRole(l, "caption")
+	setRole(l.QWidget, "caption")
 	return l
 }
 
@@ -293,11 +299,11 @@ func cardValue(mono bool) *qt.QLabel {
 // repolish a widget when an arbitrary dynamic property changes — only the
 // unpolish/polish pair below makes an attribute-selector style update take effect
 // after the widget has already been shown once.
-func setRole(w *qt.QLabel, role string) {
+func setRole(w *qt.QWidget, role string) {
 	w.SetProperty("role", qt.NewQVariant11(role))
 	if s := w.Style(); s != nil {
-		s.Unpolish(w.QWidget)
-		s.Polish(w.QWidget)
+		s.Unpolish(w)
+		s.Polish(w)
 	}
 }
 
@@ -321,7 +327,7 @@ func (c *Controller) render(v uistate.View) {
 		c.connectedAt = time.Time{}
 	}
 
-	setRole(c.dot, dotRole(v.Kind))
+	setRole(c.dot.QWidget, dotRole(v.Kind))
 
 	c.stateText.SetText(v.Title)
 
@@ -383,12 +389,15 @@ func (c *Controller) setPrimary(v uistate.View) {
 	case v.Busy():
 		c.primary.SetText("Cancel")
 		c.primaryAction = c.host.Disconnect
+		setRole(c.primary.QWidget, "danger")
 	case v.CanDisconnect:
 		c.primary.SetText("Disconnect")
 		c.primaryAction = c.host.Disconnect
+		setRole(c.primary.QWidget, "danger")
 	default:
 		c.primary.SetText("Connect")
 		c.primaryAction = c.host.Connect
+		setRole(c.primary.QWidget, "success")
 	}
 }
 
