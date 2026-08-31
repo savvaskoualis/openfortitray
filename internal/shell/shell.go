@@ -1,23 +1,10 @@
-// Package shell is the app's single window and the navigation inside it.
-//
-// It exists because Status and Settings used to be two separate windows. That
-// meant two things a user had to find, two things to arrange on screen, and — once
-// the app grew a Dock icon — an ambiguous answer to "bring this app up": which
-// window? One window with sections answers all three.
-//
-// The controllers it arranges own widgets, not windows. This package owns the
-// window: its content, its size, what its close button does, and which section is
-// on screen. Nothing else calls Show or Resize on it.
+// Package shell hosts the app's single window: a fixed nav rail on the
+// left (Status/Connection/Advanced) and a QStackedWidget content pane on
+// the right holding all three sections' widgets simultaneously, matching
+// the already-approved "one window, one level of navigation" design.
 package shell
 
-import (
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
-
-	"github.com/savvaskoualis/openfortitray/internal/status"
-)
+import qt "github.com/mappu/miqt/qt6"
 
 // Section is a destination in the window.
 type Section int
@@ -25,189 +12,171 @@ type Section int
 const (
 	// SectionStatus is the connection panel: what the tunnel is doing.
 	SectionStatus Section = iota
-	// SectionConnection and SectionAdvanced are the settings sections. They were
-	// tabs inside the old settings window; presenting them at the same level as
-	// Status keeps the whole app to ONE level of navigation, rather than a window
-	// containing a rail containing tabs.
+	// SectionConnection and SectionAdvanced are the settings sections. They
+	// were tabs inside the old settings window; presenting them at the same
+	// level as Status keeps the whole app to ONE level of navigation, rather
+	// than a window containing a rail containing tabs.
 	SectionConnection
 	SectionAdvanced
 )
 
 // Parts are the pieces the shell arranges, supplied by the controllers.
 type Parts struct {
-	Status     fyne.CanvasObject
-	Connection fyne.CanvasObject
-	Advanced   fyne.CanvasObject
+	Status, Connection, Advanced *qt.QWidget
 
-	// ProfileBar, Banner and Footer belong to the settings sections only. The shell
-	// hides them on Status, where a profile selector and a Save button would be
-	// controls with nothing to act on.
-	ProfileBar fyne.CanvasObject
-	Banner     fyne.CanvasObject
-	Footer     fyne.CanvasObject
+	// ProfileBar, Banner and Footer belong to the settings sections only.
+	ProfileBar, Banner, Footer *qt.QWidget
 }
-
-// Window sizing. Status is the shortest section, so the window is sized for it and
-// grown when a section (or the activity history) needs more: a single height that
-// fits the tallest section would leave the shortest one sitting in dead space,
-// which is the specific thing that made the old windows look unfinished.
-const (
-	width = 780
-	// heightStatus is status.WindowHeight, not a second guess: the two packages
-	// must agree on the Status section's base height, or toggling the activity
-	// history (which resizes relative to status.WindowHeight) and the shell's own
-	// resize() would disagree about where "closed" is.
-	heightStatus  = status.WindowHeight
-	heightSetting = 620
-)
 
 // Shell owns the window and the section switching.
 type Shell struct {
-	win   fyne.Window
-	parts Parts
+	// AttachGlass, when non-nil, is called every time Reveal shows the
+	// window — the app wires this to its platform glass-attach function.
+	// nil is a safe no-op default so shell package tests never need real
+	// native window plumbing.
+	AttachGlass func(win *qt.QMainWindow)
 
-	nav     map[Section]*widget.Button
+	win     *qt.QMainWindow
+	stack   *qt.QStackedWidget
+	navBtns [3]*qt.QPushButton
 	current Section
 
-	// stack holds all three sections; one is visible at a time.
-	stack *fyne.Container
-
-	// closeRequested is what the window's close button runs.
-	closeRequested func()
-
-	// AttachGlass, when non-nil, is called every time Reveal shows the
-	// window — the app wires this to its platform glass-attach function
-	// (cmd/openfortitray/glass.go). nil is a safe no-op default so shell
-	// package tests never need a real Fyne native window.
-	AttachGlass func(win fyne.Window)
-
-	// extraHeight is a section's request for more room (the activity history), kept
-	// so switching away and back does not forget it.
-	extraHeight float32
+	// profileBar and footer are the settings-only chrome placed around the
+	// stack; they are hidden on SectionStatus and shown otherwise (see
+	// Select). banner is never touched by Select — it is shown/hidden only
+	// by whoever owns it (settings.go's ShowIssue/hideBanner), Select just
+	// guarantees it is actually placed somewhere so that visibility takes
+	// effect. Any of the three may be nil (e.g. in tests that don't wire
+	// settings chrome), so every use is nil-guarded.
+	profileBar, banner, footer *qt.QWidget
 }
 
-// New builds the window's content and returns the shell with Status selected. The
-// window is left hidden; the tray reveals it.
-func New(win fyne.Window, p Parts) *Shell {
-	s := &Shell{win: win, parts: p, nav: map[Section]*widget.Button{}}
+// railWidth, windowWidth and windowHeight match the approved mock's scale.
+const (
+	railWidth    = 150
+	windowWidth  = 820
+	windowHeight = 680
+)
 
-	// Navigation is three buttons rather than a widget.List: a list of three fixed
-	// destinations carries selection machinery, keyboard semantics and a scrollbar
-	// for no benefit, and buttons make the current section's emphasis explicit.
-	navBox := container.NewVBox()
-	for _, item := range []struct {
-		sec   Section
-		label string
-		icon  fyne.Resource
-	}{
-		{SectionStatus, "Status", theme.InfoIcon()},
-		{SectionConnection, "Connection", theme.SettingsIcon()},
-		{SectionAdvanced, "Advanced", theme.StorageIcon()},
-	} {
-		sec := item.sec
-		b := widget.NewButtonWithIcon(item.label, item.icon, func() { s.Select(sec) })
-		b.Alignment = widget.ButtonAlignLeading
-		b.Importance = widget.LowImportance
-		s.nav[sec] = b
-		navBox.Add(b)
+var navLabels = [3]string{"Status", "Connection", "Advanced"}
+
+// New builds the window's content and returns the shell with Status
+// selected. The window is left hidden; the tray reveals it.
+func New(win *qt.QMainWindow, p Parts) *Shell {
+	s := &Shell{win: win}
+
+	root := qt.NewQWidget(nil)
+	rootLayout := qt.NewQHBoxLayout2()
+	rootLayout.SetContentsMargins(0, 0, 0, 0)
+	rootLayout.SetSpacing(0)
+
+	// Navigation is three buttons rather than a widget.List: a list of
+	// three fixed destinations carries selection machinery, keyboard
+	// semantics and a scrollbar for no benefit, and buttons make the
+	// current section's emphasis explicit.
+	rail := qt.NewQWidget(nil)
+	rail.SetFixedWidth(railWidth)
+	railLayout := qt.NewQVBoxLayout2()
+	railLayout.SetContentsMargins(10, 18, 10, 18)
+	railLayout.SetSpacing(4)
+
+	group := qt.NewQButtonGroup2(rail.QObject)
+	for i, label := range navLabels {
+		btn := qt.NewQPushButton3(label)
+		btn.SetCheckable(true)
+		sec := Section(i)
+		btn.OnPressed(func() { s.Select(sec) })
+		group.AddButton(btn.QAbstractButton)
+		railLayout.AddWidget(btn.QWidget)
+		s.navBtns[i] = btn
 	}
-	rail := container.NewBorder(container.NewPadded(navBox), nil, nil, nil, nil)
+	railLayout.AddStretch()
+	rail.SetLayout(railLayout.QLayout)
 
-	// One child of this stack is visible at a time. A Stack rather than swapping
-	// SetContent: the widgets keep their state (scroll position, focus, validation)
-	// across a navigation, which they would not if the tree were rebuilt.
-	s.stack = container.NewStack(p.Status, p.Connection, p.Advanced)
+	// One child of this stack is visible at a time. QStackedWidget keeps
+	// every section's widget alive and stateful (scroll position, focus,
+	// validation) across a navigation, showing only the current one —
+	// simpler than the Fyne era's manual Show/Hide-every-sibling.
+	s.stack = qt.NewQStackedWidget2()
+	s.stack.AddWidget(p.Status)
+	s.stack.AddWidget(p.Connection)
+	s.stack.AddWidget(p.Advanced)
 
-	top := container.NewVBox(p.Banner, p.ProfileBar)
-	body := container.NewBorder(top, p.Footer, nil, nil, s.stack)
+	s.profileBar = p.ProfileBar
+	s.banner = p.Banner
+	s.footer = p.Footer
 
-	content := container.NewBorder(nil, nil,
-		container.NewHBox(rail, widget.NewSeparator()), nil, body)
+	// The content column stacks the settings-only chrome around the
+	// QStackedWidget: ProfileBar and Banner above it, Footer below. Select
+	// shows/hides ProfileBar/Footer based on section; Banner's visibility is
+	// never forced here — only ShowIssue/hideBanner in settings.go toggle
+	// it — this layout just gives it somewhere to actually render once they
+	// do.
+	content := qt.NewQWidget(nil)
+	contentLayout := qt.NewQVBoxLayout2()
+	contentLayout.SetContentsMargins(0, 0, 0, 0)
+	contentLayout.SetSpacing(0)
+	if s.profileBar != nil {
+		contentLayout.AddWidget(s.profileBar)
+	}
+	if s.banner != nil {
+		contentLayout.AddWidget(s.banner)
+	}
+	contentLayout.AddWidget(s.stack.QWidget)
+	if s.footer != nil {
+		contentLayout.AddWidget(s.footer)
+	}
+	content.SetLayout(contentLayout.QLayout)
 
-	win.SetContent(content)
-	win.SetFixedSize(false)
-	// A tray app's window must never quit the process: that would take the tunnel
-	// down with it. Closing hides. Held as a field as well as installed, because
-	// fyne exposes no getter for a window's close intercept and a test otherwise has
-	// no way to reach it.
-	s.closeRequested = win.Hide
-	win.SetCloseIntercept(func() { s.closeRequested() })
+	rootLayout.AddWidget(rail)
+	rootLayout.AddWidget(content)
+	root.SetLayout(rootLayout.QLayout)
 
+	win.SetCentralWidget(root)
+	// Matches the approved mock's scale. Without an explicit size, Qt sizes
+	// the window to its layout's minimum size hint — noticeably smaller
+	// than intended, since nothing else in this migration ever ported the
+	// original design's window dimensions forward.
+	win.Resize(windowWidth, windowHeight)
 	s.Select(SectionStatus)
 	return s
 }
 
-// Select shows one section and hides the rest, along with the settings-only
-// furniture.
+// Select switches the visible content-pane section and updates the rail's
+// selected-button styling. ProfileBar and Footer are settings-specific chrome
+// (profile picker, Save/Cancel) shown only around the Connection/Advanced
+// sections — Status is self-contained and doesn't need them. Banner's
+// visibility is deliberately untouched here: it is shown on-demand by
+// settings.go's ShowIssue and dismissed by hideBanner/a successful Save, not
+// by navigation.
 func (s *Shell) Select(sec Section) {
 	s.current = sec
-	for k, b := range s.nav {
-		if k == sec {
-			b.Importance = widget.MediumImportance
-		} else {
-			b.Importance = widget.LowImportance
-		}
-		b.Refresh()
+	s.stack.SetCurrentIndex(int(sec))
+	for i, btn := range s.navBtns {
+		btn.SetChecked(Section(i) == sec)
 	}
-
-	show := func(o fyne.CanvasObject, visible bool) {
-		if o == nil {
-			return
-		}
-		if visible {
-			o.Show()
-		} else {
-			o.Hide()
-		}
+	showChrome := sec != SectionStatus
+	if s.profileBar != nil {
+		s.profileBar.SetVisible(showChrome)
 	}
-	show(s.parts.Status, sec == SectionStatus)
-	show(s.parts.Connection, sec == SectionConnection)
-	show(s.parts.Advanced, sec == SectionAdvanced)
-
-	settings := sec != SectionStatus
-	show(s.parts.ProfileBar, settings)
-	show(s.parts.Footer, settings)
-	// The banner has its own visibility (raised only by a Connect issue), so it is
-	// only ever hidden here, never shown.
-	if !settings {
-		show(s.parts.Banner, false)
+	if s.footer != nil {
+		s.footer.SetVisible(showChrome)
 	}
-
-	s.resize()
-	s.win.Content().Refresh()
 }
 
 // Current reports the visible section.
 func (s *Shell) Current() Section { return s.current }
 
-// Reveal shows the window on the given section and focuses it. This is the one
-// entry point for "bring the app up".
+// Reveal shows the window on the given section, focuses it, and
+// re-attaches native vibrancy (idempotent — safe to call on every reveal,
+// since Hide/Reveal is a normal cycle for this window: the tray hides it,
+// Reveal brings it back).
 func (s *Shell) Reveal(sec Section) {
 	s.Select(sec)
 	s.win.Show()
+	s.win.Raise()
+	s.win.ActivateWindow()
 	if s.AttachGlass != nil {
 		s.AttachGlass(s.win)
 	}
-	s.win.RequestFocus()
-}
-
-// RequestHeight lets a section ask for a taller window — the activity history uses
-// it, so revealing the history opens space rather than pushing itself off the
-// bottom edge. A height of 0 gives up the request.
-func (s *Shell) RequestHeight(h float32) {
-	s.extraHeight = h
-	s.resize()
-}
-
-// resize sizes the window for the current section, honouring any outstanding
-// height request.
-func (s *Shell) resize() {
-	h := float32(heightStatus)
-	if s.current != SectionStatus {
-		h = heightSetting
-	}
-	if s.extraHeight > h {
-		h = s.extraHeight
-	}
-	s.win.Resize(fyne.NewSize(width, h))
 }

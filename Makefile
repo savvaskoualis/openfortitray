@@ -53,15 +53,14 @@ winres:
 
 build:
 	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
-	go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
+	CGO_CXXFLAGS=-std=c++17 go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
 
 test:
-	go vet ./...
-	go test -race ./...
+	CGO_CXXFLAGS=-std=c++17 go vet ./...
+	CGO_CXXFLAGS=-std=c++17 go test -race ./...
 
-# Size trim for release builds. fyne statically links the GL bindings, a font
-# shaper and the default theme/font, so a release binary is ~15-30 MB heavier
-# than the old systray one; -s -w (strip symbol table + DWARF) claws some back.
+# Size trim for release builds: -s -w (strip symbol table + DWARF) trims the
+# release binary.
 LDFLAGS_TRIM := -s -w
 
 # Stamp the build version into main.version (shown in the tray header). VERSION
@@ -69,14 +68,14 @@ LDFLAGS_TRIM := -s -w
 # the tag in CI via `make ... VERSION=$GITHUB_REF_NAME`).
 LDFLAGS_VER := -X main.version=$(VERSION)
 
-# Build/CI reality since the fyne v2 migration: fyne renders via OpenGL/GLFW, so
-# cmd/openfortitray is a cgo build on EVERY OS. That kills the old pure
-# cross-compile model (CGO_ENABLED=0 for linux/windows from any host). Each OS
-# must now build on its own native toolchain:
+# Build/CI reality: the UI is Qt6 via miqt, so cmd/openfortitray is a cgo
+# build on EVERY OS. That kills the old pure cross-compile model
+# (CGO_ENABLED=0 for linux/windows from any host). Each OS must now build on
+# its own native toolchain:
 #   - darwin: cgo via the Xcode CLT. The amd64 slice still cross-builds from an
 #     Apple Silicon mac because the macOS SDK is a fat SDK; if a future SDK
 #     drops x86_64, delete that line — it only serves pre-2020 Intel macs.
-#   - linux: cgo needs gcc + GL/X11 dev headers (libgl1-mesa-dev xorg-dev).
+#   - linux: cgo needs gcc + the Qt6 dev headers (qt6-base-dev).
 #   - windows: cgo needs a MinGW gcc; -H=windowsgui suppresses the console
 #     window. Cannot be cross-built from a non-windows host without a MinGW
 #     cross-toolchain.
@@ -89,22 +88,22 @@ LDFLAGS_VER := -X main.version=$(VERSION)
 release: clean
 	mkdir -p $(DIST)
 ifeq ($(shell uname -s),Darwin)
-	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
-	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
+	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
+	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
 	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
 	@file $(DIST)/$(BIN)-darwin-amd64 | grep -q 'x86_64'
 	@echo "make release: built darwin arm64 + amd64. linux/windows come from CI (native runners)."
 else ifeq ($(shell uname -s),Linux)
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
+	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
 else
 	$(MAKE) winres
-	CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
 	@echo "make release: built windows amd64 (manifest embedded, runs elevated). darwin/linux come from CI (native runners)."
 endif
 	@ls -l $(DIST)
 
-# app assembles a hand-rolled macOS .app bundle (Task 10). A fyne menu-bar app
+# app assembles a hand-rolled macOS .app bundle (Task 10). A menu-bar app
 # needs a real bundle with LSUIElement=1 for the status item to render reliably
 # and to keep the process off the Dock. Idempotent: the bundle is rebuilt from
 # scratch each time. macOS only (iconutil/sips and the Cocoa systray are Darwin).
@@ -116,6 +115,21 @@ endif
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	cp $(BIN) $(APP_BUNDLE)/Contents/MacOS/$(BIN)
 	cp $(APP_PLIST) $(APP_BUNDLE)/Contents/Info.plist
+# Bundle the Qt6 runtime (miqt migration): unlike fyne's static Go binary, Qt6
+# links against real shared libraries at runtime. macdeployqt copies the
+# needed .framework bundles into Contents/Frameworks and rewrites the binary's
+# load commands to find them there, so the .app runs on a machine without a
+# matching Qt6 install. This MUST run before the codesign step below —
+# codesigning after macdeployqt modifies the binary would invalidate the
+# signature.
+	@QT_PREFIX="$$(brew --prefix qt 2>/dev/null)"; \
+	if [ -n "$$QT_PREFIX" ] && [ -x "$$QT_PREFIX/bin/macdeployqt" ]; then \
+		"$$QT_PREFIX/bin/macdeployqt" "$(APP_BUNDLE)"; \
+		echo "make app: bundled Qt6 frameworks via macdeployqt"; \
+	else \
+		echo "make app: macdeployqt not found at $$QT_PREFIX/bin — the .app will only run on machines with a matching Qt6 install" >&2; \
+		exit 1; \
+	fi
 	@if command -v iconutil >/dev/null 2>&1 && command -v rsvg-convert >/dev/null 2>&1; then \
 		set -e; \
 		work="$$(mktemp -d)"; iconset="$$work/AppIcon.iconset"; mkdir -p "$$iconset"; \

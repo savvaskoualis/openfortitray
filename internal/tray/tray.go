@@ -1,13 +1,11 @@
-// Package tray renders the menu-bar tray on fyne v2; all logic lives in App.
+// Package tray renders the menu-bar tray on Qt6 (via miqt); all logic lives in
+// App.
 package tray
 
 import (
-	"bytes"
 	"fmt"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/systray"
+	qt "github.com/mappu/miqt/qt6"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
@@ -26,248 +24,260 @@ type App interface {
 	// ShowSettings opens the same window on its Connection section.
 	ShowSettings()
 	// ShowStatus opens the app's window on its Status section. It is the only
-	// surface that shows live state: this menu cannot repaint while it is open (see
-	// the KNOWN LIMITATION below), so the window is where a state change is
-	// actually visible.
+	// surface that shows live state.
 	ShowStatus()
-	// Quit begins teardown (tunnel down) and then quits the fyne app. The tray's
-	// Quit item drives this rather than fyne's built-in quit so the VPN is always
-	// torn down before the process leaves.
+	// Quit begins teardown (tunnel down) and then quits the app. The tray's
+	// Quit item drives this rather than any toolkit-provided default quit so
+	// the VPN is always torn down before the process leaves.
 	Quit()
 	// UpdateClicked is the update menu item's action: apply a pending update, or
 	// trigger a fresh check when none is pending. Runs on the UI goroutine.
 	UpdateClicked()
 }
 
-// Controller owns the tray menu and icon and applies tunnel events to them.
-// Every one of its methods mutates fyne objects, so each must run on the fyne
-// UI goroutine: Setup runs on the main goroutine before app.Run(); the menu
-// Actions run on the UI goroutine by construction; Apply is invoked only from
-// inside fyne.Do (see the event pump in cmd/openfortitray).
+// Controller owns the tray icon and menu and applies tunnel events to them.
+// Every one of its methods mutates Qt objects, so each must run on the Qt UI
+// thread: Setup runs on the main goroutine before the event loop starts; the
+// menu Actions run on the UI thread by construction (Qt delivers signals on the
+// thread of the receiving object, which for these is the UI thread); Apply is
+// invoked only from the UI-thread event pump in cmd/openfortitray.
 type Controller struct {
-	app  App
-	desk desktop.App
-	menu *fyne.Menu
+	app App
 
-	statusItem *fyne.MenuItem
+	icon *qt.QSystemTrayIcon
+	menu *qt.QMenu
+
+	titleAction *qt.QAction
+	// statusAction is the disabled status-line row; its text is set per-state by
+	// Apply.
+	statusAction *qt.QAction
 	// actionItem is the ONE connection action. It was two rows — Connect and
-	// Disconnect — of which exactly one was always greyed out, so half of that pair
-	// was permanently dead weight in a menu where every row should mean something.
-	// Apply relabels it and repoints its action together, so the label and what it
-	// does can never disagree.
-	actionItem *fyne.MenuItem
-	autoItem   *fyne.MenuItem
-	updateItem *fyne.MenuItem
+	// Disconnect — of which exactly one was always greyed out, so half of that
+	// pair was permanently dead weight in a menu where every row should mean
+	// something. Apply relabels it and repoints its click target together, so
+	// the label and what it does can never disagree.
+	actionItem     *qt.QAction
+	openAction     *qt.QAction
+	settingsAction *qt.QAction
+	autoAction     *qt.QAction
+	logsAction     *qt.QAction
+	updateAction   *qt.QAction
+	quitAction     *qt.QAction
 
-	resGray, resGreen, resYellow, resRed fyne.Resource
-	// Badged ("update available") variants of the four state icons, composed once
-	// at construction (see newController). resourceFor returns these instead of the
-	// plain resources once updateAvailable is set.
-	resGrayU, resGreenU, resYellowU, resRedU fyne.Resource
+	// currentAction is the click target actionItem's single OnTriggered
+	// registration dispatches through. QAction.OnTriggered can only usefully be
+	// registered once: calling it again stacks a second handler rather than
+	// replacing the first, so Setup registers `func() { c.currentAction() }`
+	// exactly once and setAction reassigns this field instead of ever calling
+	// OnTriggered again.
+	currentAction func()
 
-	// updateAvailable, once set by SetUpdateAvailable, makes resourceFor return the
-	// badged variant of whatever state icon is current — so the red dot rides on
-	// top of the connection-state colour. It stays set for the process's life (the
-	// app updates/relaunches to clear it).
+	// icons and badgedIcons hold every QIcon the controller could ever need,
+	// keyed by uistate.Kind — built once in Setup from the embedded PNGs
+	// (icons.go) and, for badgedIcons, the same PNGs composited with the
+	// "update available" dot (badge.go). Since the controller already owns
+	// every icon it could possibly set, applying a state is just picking one of
+	// these by key, no byte-comparison indirection needed.
+	icons       map[uistate.Kind]*qt.QIcon
+	badgedIcons map[uistate.Kind]*qt.QIcon
+
+	// updateAvailable, once set by SetUpdateAvailable, makes iconForCurrent
+	// return the badged variant of whatever connection-state icon is current —
+	// so the red dot rides on top of the connection-state colour. It stays set
+	// for the process's life (the app updates/relaunches to clear it).
 	updateAvailable bool
-	// currentIcon is the base (unbadged) PNG of the icon Apply last rendered, so
-	// SetUpdateAvailable can re-apply the CURRENT state's icon with the badge. It
-	// starts as the gray/disconnected icon Setup installs.
-	currentIcon []byte
+	// currentKind is the uistate.Kind of the view Apply last rendered. Setup
+	// leaves it at its zero value, uistate.KindIdle, matching the
+	// disconnected icon Setup installs.
+	currentKind uistate.Kind
 
-	// lastView is the view most recently applied. Kept so a future re-assert can
-	// re-render the current state rather than the defaults.
+	// lastView is the view most recently applied. Kept so a future re-assert
+	// can re-render the current state rather than the defaults.
 	lastView uistate.View
 }
 
-// Setup builds the tray menu on the given fyne app and installs it. It must run
-// on the main goroutine before app.Run(). It fails if the app is not backed by
-// a desktop driver (headless/mobile), where a menu-bar tray cannot exist.
-func Setup(a fyne.App, app App) (*Controller, error) {
-	desk, ok := a.(desktop.App)
-	if !ok {
-		return nil, fmt.Errorf("tray: fyne app has no system tray (driver %T is not a desktop.App)", a.Driver())
+// trayIcon is the process's one tray icon, set by Setup. SetTooltip is a
+// free function (matching the pre-Qt shape callers already use), so it reaches
+// this rather than a method receiver; a nil check stands in for the old
+// recover()-guarded workaround now that Qt's SetToolTip is a real,
+// always-available API rather than a foreign package's singleton.
+var trayIcon *qt.QSystemTrayIcon
+
+// Setup builds the tray icon and menu and shows it. It must run on the main
+// goroutine, after a QApplication has already been constructed (Qt's
+// QSystemTrayIcon needs no app-driver handle the way fyne's desktop.App did —
+// only a live QApplication, which cmd/openfortitray guarantees by construction
+// order). The error return is kept for API compatibility with the pre-Qt
+// shape; Qt has no headless/mobile-driver failure mode analogous to fyne's, so
+// this never actually fails today.
+func Setup(app App) (*Controller, error) {
+	c := &Controller{app: app}
+
+	c.icons = make(map[uistate.Kind]*qt.QIcon, 4)
+	c.badgedIcons = make(map[uistate.Kind]*qt.QIcon, 4)
+	for _, k := range []uistate.Kind{uistate.KindIdle, uistate.KindBusy, uistate.KindOK, uistate.KindBad} {
+		base := iconFor(k)
+		c.icons[k] = iconFromPNG(base)
+		c.badgedIcons[k] = iconFromPNG(badgedPNG(base))
 	}
-	c := newController(app)
-	c.desk = desk
-	desk.SetSystemTrayIcon(c.resGray)
-	desk.SetSystemTrayMenu(c.menu)
+
+	c.buildMenu()
+
+	c.icon = qt.NewQSystemTrayIcon()
+	c.icon.SetContextMenu(c.menu)
+	c.icon.SetIcon(c.iconForCurrent())
+	c.icon.Show()
+	trayIcon = c.icon
+
 	return c, nil
 }
 
-// SetTooltip sets the menu-bar icon's hover tooltip. fyne's desktop.App exposes
-// no tooltip API, but it drives an internal fyne.io/systray singleton whose
-// SetTooltip targets the same tray instance fyne created. This is best-effort:
-// it must be called only after the tray has actually started (fyne starts it
-// during app.Run, so wire it from the app's OnStarted lifecycle hook, not from
-// Setup — before Run the native status item does not yet exist and the call is
-// a silent no-op). The recover keeps a not-ready or unsupported platform from
-// taking the app down: a missing tooltip is cosmetic, the title row is the
-// guaranteed identifier.
+// SetTooltip sets the menu-bar icon's hover tooltip. It is a no-op before the
+// tray exists (before Setup has run, or on a platform where it never will).
 func SetTooltip(text string) {
-	defer func() { _ = recover() }()
-	systray.SetTooltip(text)
+	if trayIcon != nil {
+		trayIcon.SetToolTip(text)
+	}
 }
 
-// newController builds the menu items, menu, and icon resources. It touches no
-// desktop driver, so it is exercised directly by the click-wiring test with a
-// fake App and a headless test app (no display needed). Setup adds the desk.
-func newController(app App) *Controller {
-	c := &Controller{
-		app: app,
-		// The four embedded PNGs (icons.go) become fyne resources once, here,
-		// rather than being re-wrapped on every icon change.
-		resGray:   fyne.NewStaticResource("openfortitray_gray.png", iconGray),
-		resGreen:  fyne.NewStaticResource("openfortitray_green.png", iconGreen),
-		resYellow: fyne.NewStaticResource("openfortitray_yellow.png", iconYellow),
-		resRed:    fyne.NewStaticResource("openfortitray_red.png", iconRed),
-		// Their "update available" variants — the same icons with a red dot
-		// composed on at runtime (badge.go). Built once here, like the plain ones.
-		resGrayU:   badgedResource("openfortitray_gray_update.png", iconGray),
-		resGreenU:  badgedResource("openfortitray_green_update.png", iconGreen),
-		resYellowU: badgedResource("openfortitray_yellow_update.png", iconYellow),
-		resRedU:    badgedResource("openfortitray_red_update.png", iconRed),
-		// Setup installs the gray/disconnected icon first, so that is what is
-		// current until Apply renders an event.
-		currentIcon: iconGray,
+// ShowMessage posts a desktop notification via the tray icon's native
+// balloon/banner (QSystemTrayIcon::showMessage). Like SetTooltip, it is a
+// no-op before the tray exists — cmd/openfortitray wires this as the app's
+// notify seam (app.notify), which is nil-checked by every caller, so this
+// guard only matters for a call arriving in the narrow window before Setup.
+func ShowMessage(title, body string) {
+	if trayIcon != nil {
+		trayIcon.ShowMessage2(title, body)
 	}
+}
 
-	// One disabled header carrying both identity and build. These were two rows;
-	// the menu-bar icon has no visible label and fyne's tray exposes no window
-	// title, so the app does need to name itself here — but it does not need two
-	// rows to do it, and the version is only ever read in the same glance as the
-	// name.
-	titleItem := fyne.NewMenuItem("OpenFortiTray "+app.Version(), nil)
-	titleItem.Disabled = true
+// buildMenu builds the menu items and installs them on c.menu. It touches no
+// QSystemTrayIcon, so it is exercised directly by tests that only care about
+// the menu's wiring.
+//
+// GROUPING — four bands, each answering a different question:
+//
+//	what is this        title+version
+//	what is it doing    status, and the one thing to do about it
+//	where do I go        the two windows
+//	everything else     preference, diagnostics, update, quit
+func (c *Controller) buildMenu() {
+	app := c.app
+	menu := qt.NewQMenu2()
 
-	c.statusItem = fyne.NewMenuItem("Disconnected", nil)
-	c.statusItem.Disabled = true
+	// One disabled header carrying both identity and build.
+	c.titleAction = menu.AddActionWithText(fmt.Sprintf("OpenFortiTray %s", app.Version()))
+	c.titleAction.SetEnabled(false)
+	menu.AddSeparator()
 
-	// The single connection action. Its label and its action are set together by
-	// Apply; it starts as Connect because nothing is up at launch.
-	c.actionItem = fyne.NewMenuItem("Connect", func() { app.Connect() })
+	// The status line. Disabled: it is a label, not a control. Its text is set
+	// per-state by Apply.
+	c.statusAction = menu.AddActionWithText("")
+	c.statusAction.SetEnabled(false)
 
-	c.autoItem = fyne.NewMenuItem("Auto-connect at login", c.toggleAutostart)
-	c.autoItem.Checked = app.AutostartEnabled()
+	// The single connection action. Its label and its click target are set
+	// together by setAction; it starts as Connect because nothing is up at
+	// launch. OnTriggered is registered exactly once, here — see the
+	// currentAction field comment.
+	c.actionItem = menu.AddActionWithText("Connect")
+	c.currentAction = app.Connect
+	c.actionItem.OnTriggered(func() { c.currentAction() })
 
-	// "Open" rather than "Status…": there is one window now, and this row opens it —
-	// on the Status section, which is what someone opening a VPN client wants to see.
-	// Naming it after a section made sense when the section WAS the window.
-	//
-	// It leads the actionable rows because it is the surface that actually shows live
-	// state; this menu is a snapshot from the moment it opened.
-	statusWindowItem := fyne.NewMenuItem("Open", func() { app.ShowStatus() })
+	menu.AddSeparator()
 
-	settingsItem := fyne.NewMenuItem("Settings…", func() { app.ShowSettings() })
+	// "Open" rather than "Status…": there is one window now, and this row opens
+	// it — on the Status section, which is what someone opening a VPN client
+	// wants to see. It leads the actionable rows because it is the surface that
+	// actually shows live state.
+	c.openAction = menu.AddActionWithText("Open")
+	c.openAction.OnTriggered(app.ShowStatus)
 
-	logsItem := fyne.NewMenuItem("View logs", func() { _ = xopen.File(app.LogPath()) })
+	c.settingsAction = menu.AddActionWithText("Settings…")
+	c.settingsAction.OnTriggered(app.ShowSettings)
+
+	menu.AddSeparator()
+
+	c.autoAction = menu.AddActionWithText("Auto-connect at login")
+	c.autoAction.SetCheckable(true)
+	c.autoAction.SetChecked(app.AutostartEnabled())
+	c.autoAction.OnTriggered(func() { c.toggleAutostart() })
+
+	c.logsAction = menu.AddActionWithText("View logs")
+	c.logsAction.OnTriggered(func() { _ = xopen.File(app.LogPath()) })
 
 	// The update row. It starts as a manual "Check for Updates…"; when the
-	// background checker finds a newer release, SetUpdateAvailable relabels it to
-	// "Update to <version> & Restart". Its Action (UpdateClicked) decides which of
-	// the two it is, so the label and behaviour stay in sync via one code path.
-	c.updateItem = fyne.NewMenuItem("Check for Updates…", app.UpdateClicked)
+	// background checker finds a newer release, SetUpdateAvailable relabels it
+	// to "Update to <version> & Restart". Its click target (UpdateClicked)
+	// decides which of the two it is, so the label and behaviour stay in sync
+	// via one code path — its OnTriggered target never changes.
+	c.updateAction = menu.AddActionWithText("Check for Updates…")
+	c.updateAction.OnTriggered(app.UpdateClicked)
 
-	// Quit carries its own Action, so fyne's addMissingQuitForMenu keeps it
-	// (it only injects a default d.Quit when an IsQuit item has a nil Action).
-	// On the desktop driver the tray invokes item.Action() directly, so our
-	// teardown runs; we do not set IsQuit ourselves and instead drive a.Quit().
-	quitItem := fyne.NewMenuItem("Quit", func() { app.Quit() })
+	menu.AddSeparator()
 
-	// GROUPING — four bands, each answering a different question:
-	//
-	//   what is this        title+version
-	//   what is it doing    status, and the one thing to do about it
-	//   where do I go       the two windows
-	//   everything else     preference, diagnostics, update, quit
-	//
-	// The old menu interleaved these: the autostart checkbox sat between Settings
-	// and View logs, so a preference, a window and a diagnostic shared a band and
-	// none of them read as belonging where they were.
-	c.menu = fyne.NewMenu("OpenFortiTray",
-		titleItem,
-		fyne.NewMenuItemSeparator(),
-		c.statusItem,
-		c.actionItem,
-		fyne.NewMenuItemSeparator(),
-		statusWindowItem,
-		settingsItem,
-		fyne.NewMenuItemSeparator(),
-		c.autoItem,
-		logsItem,
-		c.updateItem,
-		fyne.NewMenuItemSeparator(),
-		quitItem,
-	)
-	return c
+	// Quit drives our own teardown rather than any toolkit default quit, so the
+	// tunnel always comes down before the process leaves.
+	c.quitAction = menu.AddActionWithText("Quit")
+	c.quitAction.OnTriggered(app.Quit)
+
+	c.menu = menu
 }
 
-// toggleAutostart flips the login item and, only if that succeeds, the checkmark.
-// It runs on the UI goroutine (it is a menu Action), so it mutates the item and
-// refreshes the menu directly. SetAutostart already logs and rolls the OS state
-// back on failure, so a failure here simply leaves the checkbox unchanged.
+// toggleAutostart persists the login-item state the checkbox was already
+// switched to and, only on failure, switches it back.
+//
+// Unlike fyne's plain Checked field, a checkable QAction flips its own Checked
+// state BEFORE emitting triggered() — Qt has already applied the click by the
+// time this runs. So the row is read, not computed by negation: want is
+// whatever the row now shows, and a failed SetAutostart is undone by flipping
+// the row back rather than by leaving it alone.
 func (c *Controller) toggleAutostart() {
-	c.setAutostart(!c.autoItem.Checked)
-}
-
-// setAutostart persists the login-item state and, only on success, ticks the row.
-// It is the one path for both menus: the fyne item is kept in step either way (it
-// is the fallback and what the tests inspect), and the tick is applied natively
-// when the takeover is live so an open menu shows it immediately.
-func (c *Controller) setAutostart(want bool) {
+	want := c.autoAction.IsChecked()
 	if err := c.app.SetAutostart(want); err != nil {
-		return
+		c.autoAction.SetChecked(!want)
 	}
-	c.autoItem.Checked = want
-	c.menu.Refresh()
 }
 
 // Apply renders one tunnel event onto the tray: icon, status label, and the
-// Connect/Disconnect enabled state, then refreshes the menu. It must be called
-// on the UI goroutine (the event pump marshals it through fyne.Do); fyne has no
-// per-item setter, so the supported route is field mutation + (*Menu).Refresh.
+// connection action's label/target. It must be called on the UI thread (the
+// event pump marshals it there).
 func (c *Controller) Apply(e tunnel.Event) {
 	v := uistate.ViewFor(e)
-	icon := iconFor(v.Kind)
-	c.currentIcon = icon
+	c.currentKind = v.Kind
 	c.lastView = v
-	// Guarded like ReassertTray and SetUpdateAvailable: desk is nil before Setup and
-	// in the tests that exercise the menu without a desktop driver.
-	if c.desk != nil {
-		c.desk.SetSystemTrayIcon(c.resourceFor(icon))
-	}
-	c.statusItem.Label = v.MenuLabel
+	c.icon.SetIcon(c.iconForCurrent())
+	c.statusAction.SetText(v.MenuLabel)
 	c.setAction(v)
-	c.menu.Refresh()
 }
 
-// setAction points the single connection row at the thing that makes sense now.
+// setAction points the single connection row at the thing that makes sense
+// now.
 //
 // Connect when nothing is running; otherwise the action that stops what is —
 // labelled "Cancel" while a sign-in or retry is in flight, because there is no
-// connection yet to "disconnect" and calling it that would be a lie. Both route to
-// Disconnect, which is what tears an attempt down.
+// connection yet to "disconnect" and calling it that would be a lie. Both
+// route to Disconnect, which is what tears an attempt down.
 //
-// The label and the Action are assigned together and read from the same view, so a
-// menu that cannot repaint while open still cannot show one thing and do another.
+// The label and the click target are assigned together and read from the same
+// view. It reassigns c.currentAction rather than calling actionItem.OnTriggered
+// again — see that field's comment.
 func (c *Controller) setAction(v uistate.View) {
 	switch {
 	case v.CanConnect:
-		c.actionItem.Label = "Connect"
-		c.actionItem.Action = c.app.Connect
+		c.actionItem.SetText("Connect")
+		c.currentAction = c.app.Connect
 	case v.Busy():
-		c.actionItem.Label = "Cancel"
-		c.actionItem.Action = c.app.Disconnect
+		c.actionItem.SetText("Cancel")
+		c.currentAction = c.app.Disconnect
 	default:
-		c.actionItem.Label = "Disconnect"
-		c.actionItem.Action = c.app.Disconnect
+		c.actionItem.SetText("Disconnect")
+		c.currentAction = c.app.Disconnect
 	}
 }
 
-// iconFor maps a view's severity to the tray glyph. The icons stay raw PNG bytes
-// (rather than fyne resources) so this mapping is comparable in a test without a
-// status bar: on macOS SetSystemTrayIcon goes straight into Cocoa with no no-op
-// path for a tray that was never started.
+// iconFor maps a view's severity to the tray glyph's raw PNG bytes. Kept as raw
+// bytes (rather than a QIcon) so this mapping is comparable in a test without a
+// live tray.
 func iconFor(k uistate.Kind) []byte {
 	switch k {
 	case uistate.KindOK:
@@ -281,88 +291,63 @@ func iconFor(k uistate.Kind) []byte {
 	}
 }
 
+// iconFromPNG decodes PNG bytes into a QIcon via a QPixmap. The four embedded
+// icons (icons.go) and their badged variants are our own trusted assets, so a
+// decode failure is not expected; LoadFromDataWithData's bool result is
+// intentionally not checked for the same reason composeBadge's fallback exists
+// — this is a construction-time helper for known-good bytes.
+//
+// Padded to square first (see padToSquare) since the base assets are 45x32
+// and Qt's tray renders a QIcon at its native aspect ratio, unlike Fyne's
+// tray which apparently normalized this itself.
+func iconFromPNG(png []byte) *qt.QIcon {
+	if squared, err := padToSquare(png); err == nil {
+		png = squared
+	}
+	pixmap := qt.NewQPixmap()
+	pixmap.LoadFromDataWithData(png)
+	return qt.NewQIcon2(pixmap)
+}
+
+// badgedPNG composes the "update available" dot onto base (see badge.go's
+// composeBadge) and returns the result, falling back to base unchanged if the
+// compose fails — it never should, these are our own embedded PNGs.
+func badgedPNG(base []byte) []byte {
+	data, err := composeBadge(base)
+	if err != nil {
+		return base
+	}
+	return data
+}
+
+// iconForCurrent returns the QIcon for the controller's current state,
+// badged if an update is available.
+func (c *Controller) iconForCurrent() *qt.QIcon {
+	if c.updateAvailable {
+		return c.badgedIcons[c.currentKind]
+	}
+	return c.icons[c.currentKind]
+}
+
 // SetUpdateAvailable relabels the update row to offer a one-click update to
 // `version` and restart, and overlays the red "update available" dot on the
-// menu-bar icon. It sets updateAvailable so resourceFor badges every subsequent
-// icon too, then re-applies the CURRENT state's icon badged. It must run on the
-// UI goroutine (the caller marshals it through fyne.Do); like Apply it mutates
-// the item and refreshes the menu. desk is nil before Setup and in the wiring
-// tests, so the icon re-apply is guarded.
+// menu-bar icon. It sets updateAvailable so iconForCurrent badges every
+// subsequent icon too, then re-applies the CURRENT state's icon badged. It
+// must run on the UI thread (the caller marshals it there).
 func (c *Controller) SetUpdateAvailable(version string) {
-	label := "Update to " + version + " & Restart"
-	c.updateItem.Label = label
+	c.updateAction.SetText("Update to " + version + " & Restart")
 	c.updateAvailable = true
-	if c.desk != nil {
-		c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
-	}
-	c.menu.Refresh()
+	c.icon.SetIcon(c.iconForCurrent())
 }
 
-// resourceFor maps a viewFor icon (raw PNG bytes, kept that way so viewFor stays
-// pure and unit-testable) to the pre-wrapped fyne resource. Once an update is
-// available it returns the badged variant, so the red dot rides on top of
-// whatever connection-state colour is current.
-// ReassertTray re-installs the icon and menu after the native tray is live. On
-// Windows fyne's systray is not ready when Setup runs (before the run loop), so
-// the initial SetSystemTrayIcon there logs "tray not ready yet" and no icon
-// appears — the app runs but looks like nothing happened. Calling this from the
-// app's OnStarted hook (fired once the tray is up) sets them again, now that it
-// takes. Harmless on macOS/Linux, where the first set already worked. Must run on
-// the UI goroutine (OnStarted does).
+// ReassertTray re-shows the tray icon and menu. Kept as a lifecycle hook for
+// callers that re-run it at the same points fyne's version needed (Windows'
+// pre-Run timing gap), but Qt's tray icon has no such gap — Setup's
+// icon.Show() already made it visible — so this is now a cheap, idempotent
+// Show() rather than a full teardown/rebuild.
 func (c *Controller) ReassertTray() {
-	if c.desk == nil {
+	if c.icon == nil {
 		return
 	}
-	c.desk.SetSystemTrayIcon(c.resourceFor(c.currentIcon))
-	c.desk.SetSystemTrayMenu(c.menu)
-}
-
-// KNOWN LIMITATION — a menu held open does not update.
-//
-// fyne's only route to changing a tray menu is (*fyne.Menu).Refresh, which calls
-// SetSystemTrayMenu → systray.ResetMenu(): every native menu item is removed and
-// re-added with new ids. macOS draws an open NSMenu from the snapshot AppKit took
-// when tracking began, so the rebuild is invisible until the menu is closed and
-// reopened. systray's own add_or_update_menu_item WOULD update an existing item in
-// place, and AppKit does reflect that live.
-//
-// A hybrid was tried and reverted (0.1.32/0.1.33): fyne builds the menu, then the
-// rows are rebuilt at the systray level and the handles kept. It cannot work.
-// Anything that makes fyne refresh again removes those items and restores fyne's,
-// so the handles then point at rows that are no longer on screen — updates go
-// nowhere while the visible menu, whose refresh is being skipped, freezes. It froze
-// on "Disconnected" with Disconnect greyed out, on macOS and Windows, leaving the
-// menu unable to control the tunnel at all. Nor can the two be kept in step: the
-// fyne refresh that would fix the visible menu is exactly what destroys the native
-// rows.
-//
-// The two real options are to build the whole tray on fyne.io/systray and not use
-// fyne's tray menu at all (fyne would then no longer start or own the tray), or to
-// fix Refresh upstream in fyne so it updates items in place instead of resetting.
-// Until one of those is done, the menu is correct whenever it is opened and stale
-// only while held open through a state change.
-
-func (c *Controller) resourceFor(icon []byte) fyne.Resource {
-	switch {
-	case bytes.Equal(icon, iconGreen):
-		if c.updateAvailable {
-			return c.resGreenU
-		}
-		return c.resGreen
-	case bytes.Equal(icon, iconYellow):
-		if c.updateAvailable {
-			return c.resYellowU
-		}
-		return c.resYellow
-	case bytes.Equal(icon, iconRed):
-		if c.updateAvailable {
-			return c.resRedU
-		}
-		return c.resRed
-	default:
-		if c.updateAvailable {
-			return c.resGrayU
-		}
-		return c.resGray
-	}
+	c.icon.Show()
 }

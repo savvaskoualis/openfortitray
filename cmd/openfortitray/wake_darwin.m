@@ -5,6 +5,7 @@
 
 // Implemented in Go (wake_darwin.go) and exported to C.
 extern void oftSystemWoke(void);
+extern void oftScreenWoke(void);
 
 void oft_watch_wake(void) {
   // NSWorkspace's own notification center, not NSNotificationCenter's default
@@ -20,5 +21,15 @@ void oft_watch_wake(void) {
                    queue:[NSOperationQueue mainQueue]
               usingBlock:^(NSNotification *note) {
                 oftSystemWoke();
+              }];
+}
+
+void oft_watch_screen_wake(void) {
+  [[[NSWorkspace sharedWorkspace] notificationCenter]
+      addObserverForName:NSWorkspaceScreensDidWakeNotification
+                  object:nil
+                   queue:[NSOperationQueue mainQueue]
+              usingBlock:^(NSNotification *note) {
+                oftScreenWoke();
               }];
 }

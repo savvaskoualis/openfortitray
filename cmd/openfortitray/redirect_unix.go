@@ -17,15 +17,20 @@ import (
 //
 // KNOWN LIMITATION on macOS: this does not survive. The dup2 succeeds — it logs
 // that it did — but a bundled .app launched through LaunchServices has fd 2 wired
-// to the system-log socket, and Cocoa re-establishes that during fyne's driver
-// init, which runs after this. Verified with lsof against the live process: fd 2
-// is back to `unix ->0x…` while the log file sits on fd 3.
+// to the system-log socket, and Cocoa re-establishes that during the platform
+// toolkit's own Cocoa/NSApp init, which runs after this (originally observed
+// with fyne's driver init; the Qt/miqt QApplication constructor now plays the
+// same role and has not been separately re-verified with lsof — this is a
+// general LaunchServices/Cocoa behavior, not something specific to either
+// toolkit). Verified with lsof against the live process at the time: fd 2 was
+// back to `unix ->0x…` while the log file sat on fd 3.
 //
-// So NSLog output from fyne — including the notification-authorization failure this
-// was written to capture — still does NOT reach this file on macOS. The redirect is
-// kept because it is free, it works on Linux, and it captures anything written to
-// fd 2 before the driver starts (an early Go panic, a cgo failure during config
-// load). It is NOT a basis for concluding that native code logged nothing.
+// So NSLog output from the native Cocoa layer — including the notification-
+// authorization failure this was written to capture — still does NOT reach
+// this file on macOS. The redirect is kept because it is free, it works on
+// Linux, and it captures anything written to fd 2 before the toolkit's Cocoa
+// init starts (an early Go panic, a cgo failure during config load). It is
+// NOT a basis for concluding that native code logged nothing.
 //
 // The target is the LITERAL descriptor 2, not os.Stderr.Fd(): the caller sets
 // os.Stderr = f immediately before calling this, so os.Stderr.Fd() is already the
@@ -39,7 +44,7 @@ import (
 func redirectStderr(f *os.File) {
 	// The error is logged rather than discarded. A silently-failing redirect is
 	// worse than no redirect: it makes the log look authoritative about a channel
-	// it is not actually capturing, which is exactly how "fyne reported no
+	// it is not actually capturing, which is exactly how "the app reported no
 	// authorization error" became a conclusion it had not earned.
 	if err := unix.Dup2(int(f.Fd()), unix.Stderr); err != nil {
 		log.Printf("stderr: could not repoint fd 2 at the log (%v); native (NSLog/GL) output stays outside this file", err)

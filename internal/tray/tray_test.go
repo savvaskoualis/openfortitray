@@ -1,20 +1,35 @@
 package tray
 
 import (
-	"bytes"
-	"errors"
-	"strings"
+	"os"
+	"runtime"
 	"testing"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/test"
+	qt "github.com/mappu/miqt/qt6"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 )
 
-// fakeApp records which App method each menu item invoked, so the wiring from a
-// click to the application can be checked without a live menu bar.
+func init() {
+	// Qt's Cocoa integration on macOS requires anything that materializes a
+	// real native window — including QSystemTrayIcon.Show(), which Setup
+	// calls — to run on the process's real initial OS thread, or it aborts
+	// with "NSWindow should only be instantiated on the main thread!". `go
+	// test` runs every Test function, top-level ones included, on a goroutine
+	// it spawns fresh via t.Run -> go tRunner(...), never on the initial
+	// goroutine. So every Setup call below happens in TestMain (which
+	// testing.M.Run calls directly on this goroutine) instead, with the
+	// results captured into package vars; the Test functions just assert on
+	// what was captured. init() runs on the initial goroutine before any
+	// other goroutine exists, so locking here keeps it pinned to the real
+	// main OS thread for the life of the process. (Same pattern as
+	// internal/shell/shell_test.go and cmd/openfortitray/qtapp_test.go.)
+	runtime.LockOSThread()
+}
+
+// fakeApp records which App method each menu item invoked, so the wiring from
+// a click to the application can be checked without a live menu bar.
 type fakeApp struct {
 	connects      int
 	disconnects   int
@@ -45,218 +60,449 @@ func (f *fakeApp) SetAutostart(on bool) error {
 	return nil
 }
 
-// The update row starts as a manual check and its Action must reach
-// UpdateClicked; SetUpdateAvailable must relabel it to the one-click offer.
-func TestUpdateItemWiresAndRelabels(t *testing.T) {
-	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
-
-	f := &fakeApp{}
-	c := newController(f)
-
-	it := itemByLabel(c.menu, "Check for Updates…")
-	if it == nil {
-		t.Fatal("update item not found by its initial label")
-	}
-	it.Action()
-	if f.updateClicks != 1 {
-		t.Errorf("update action fired %d UpdateClicked calls, want 1", f.updateClicks)
-	}
-
-	c.SetUpdateAvailable("v1.2.3")
-	if c.updateItem.Label != "Update to v1.2.3 & Restart" {
-		t.Errorf("after SetUpdateAvailable label = %q, want the one-click offer", c.updateItem.Label)
-	}
-	if itemByLabel(c.menu, "Check for Updates…") != nil {
-		t.Error("old update label still present after relabel")
-	}
-}
-
-// Once an update is available the menu-bar icon must carry the red dot: for each
-// state icon, resourceFor returns a badged variant that is non-nil and not
-// byte-equal to the plain resource (a pixel-exact check is unnecessary). Before
-// SetUpdateAvailable it returns the plain resource unchanged.
-func TestUpdateBadgeOverlaysTrayIcon(t *testing.T) {
-	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
-
-	f := &fakeApp{}
-	c := newController(f)
-
-	for _, tc := range []struct {
-		name string
-		icon []byte
-	}{
-		{"gray", iconGray},
-		{"green", iconGreen},
-		{"yellow", iconYellow},
-		{"red", iconRed},
-	} {
-		if got := c.resourceFor(tc.icon); !bytes.Equal(got.Content(), tc.icon) {
-			t.Errorf("%s: before an update, resourceFor should return the plain icon", tc.name)
-		}
-	}
-
-	c.SetUpdateAvailable("v9")
-	if !c.updateAvailable {
-		t.Fatal("SetUpdateAvailable must set updateAvailable")
-	}
-
-	for _, tc := range []struct {
-		name string
-		icon []byte
-	}{
-		{"gray", iconGray},
-		{"green", iconGreen},
-		{"yellow", iconYellow},
-		{"red", iconRed},
-	} {
-		got := c.resourceFor(tc.icon)
-		if got == nil {
-			t.Fatalf("%s: badged resource is nil", tc.name)
-		}
-		if len(got.Content()) == 0 {
-			t.Errorf("%s: badged resource has no bytes", tc.name)
-		}
-		if bytes.Equal(got.Content(), tc.icon) {
-			t.Errorf("%s: badged resource is byte-equal to the plain icon; the red dot was not composed", tc.name)
-		}
-	}
-}
-
-func itemByLabel(m *fyne.Menu, label string) *fyne.MenuItem {
-	for _, it := range m.Items {
-		if it.Label == label {
-			return it
-		}
-	}
-	return nil
-}
-
-// A tray click must reach the matching App method. systray used per-item
-// channels; fyne uses per-item Action closures — this asserts each closure calls
-// the method the old channel case used to.
-func TestMenuActionsWireToApp(t *testing.T) {
-	test.NewTempApp(t) // establishes CurrentApp so (*Menu).Refresh() is a safe no-op
-
-	f := &fakeApp{}
-	c := newController(f)
-
-	for _, tc := range []struct {
-		label   string
-		invoke  func()
-		wantErr string
-	}{
-		{label: "Connect"},
-		{label: "Quit"},
-	} {
-		it := itemByLabel(c.menu, tc.label)
-		if it == nil {
-			t.Fatalf("menu has no %q item", tc.label)
-		}
-		if it.Action == nil {
-			t.Fatalf("%q item has no action", tc.label)
-		}
-		it.Action()
-	}
-	if f.connects != 1 {
-		t.Errorf("Connect item fired %d connects, want 1", f.connects)
-	}
-	if f.quits != 1 {
-		t.Errorf("Quit item fired %d quits, want 1 (teardown must run, not fyne's default quit)", f.quits)
-	}
-
-	// The title row is the first item: a fixed, disabled, action-less header that
-	// names the app in the popover. It sits above the status line with a
-	// separator between them.
-	if len(c.menu.Items) == 0 {
-		t.Fatal("menu has no items")
-	}
-	// One header row carries identity AND build: two rows said nothing the one row
-	// does not, and the version is only ever read in the same glance as the name.
-	title := c.menu.Items[0]
-	if title.Label != "OpenFortiTray "+f.Version() || !title.Disabled || title.Action != nil {
-		t.Errorf("first item = %+v, want a disabled, action-less \"OpenFortiTray <version>\" header", title)
-	}
-	if len(c.menu.Items) < 2 || !c.menu.Items[1].IsSeparator {
-		t.Error("the header must be followed by a separator, then the status line")
-	}
-
-	// The status item exists, is disabled, and carries no action (it is a label).
-	if s := itemByLabel(c.menu, "Disconnected"); s == nil || !s.Disabled || s.Action != nil {
-		t.Errorf("status item = %+v, want a disabled, action-less label", s)
-	}
-	// There is exactly ONE connection row, and at launch it offers Connect. The old
-	// menu had a Connect and a Disconnect row of which one was always greyed out.
-	if d := itemByLabel(c.menu, "Disconnect"); d != nil {
-		t.Error("a separate Disconnect row is dead weight; the action row relabels instead")
-	}
-	// View logs is present and wired (side-effecting, so not invoked here).
-	if l := itemByLabel(c.menu, "View logs"); l == nil || l.Action == nil {
-		t.Error("View logs item should exist with an action")
-	}
-
-	// Settings… opens the (already-built, hidden) settings window.
-	s := itemByLabel(c.menu, "Settings…")
-	if s == nil || s.Action == nil {
-		t.Fatal("Settings… item should exist with an action")
-	}
-	s.Action()
-	if f.settings != 1 {
-		t.Errorf("Settings… fired %d ShowSettings, want 1", f.settings)
-	}
-}
-
-// The auto-connect checkbox toggles the login item and only then flips the
-// checkmark; a failed SetAutostart leaves the mark where it was.
-func TestAutostartToggle(t *testing.T) {
-	test.NewTempApp(t)
-
-	t.Run("success flips the checkmark", func(t *testing.T) {
-		f := &fakeApp{autostartOn: false}
-		c := newController(f)
-		auto := itemByLabel(c.menu, "Auto-connect at login")
-		if auto == nil {
-			t.Fatal("no auto-connect item")
-		}
-		if auto.Checked {
-			t.Fatal("auto-connect should start unchecked (AutostartEnabled=false)")
-		}
-		auto.Action()
-		if len(f.autostartSet) != 1 || f.autostartSet[0] != true {
-			t.Errorf("SetAutostart calls = %v, want [true]", f.autostartSet)
-		}
-		if !auto.Checked {
-			t.Error("checkmark should be set after a successful enable")
-		}
-	})
-
-	t.Run("failure leaves the checkmark unchanged", func(t *testing.T) {
-		f := &fakeApp{autostartOn: false, setAutostartE: errFake}
-		c := newController(f)
-		auto := itemByLabel(c.menu, "Auto-connect at login")
-		auto.Action()
-		if auto.Checked {
-			t.Error("checkmark must not change when SetAutostart fails")
-		}
-	})
-}
-
 var errFake = &fakeErr{}
 
 type fakeErr struct{}
 
 func (*fakeErr) Error() string { return "autostart failed" }
 
-// The state→appearance mapping now lives in internal/uistate and is tested
-// there. What stays this package's job is turning a view's severity into a tray
-// glyph — and the glyph must never be empty, because systray.SetIcon indexes
-// iconBytes[0] and would panic on a zero-length slice.
+// --- results captured by TestMain; see init() for why. ---
+
+type setupResult struct {
+	err     error
+	ctrlNil bool
+}
+
+type headerResult struct {
+	titleText     string
+	titleEnabled  bool
+	statusEnabled bool
+}
+
+type wiringResult struct {
+	connects, statusShows, settings, updateClicks, quits int
+}
+
+type actionStartResult struct {
+	text    string
+	enabled bool
+}
+
+type stateResult struct {
+	name                  string
+	label                 string
+	enabled               bool
+	connects, disconnects int
+}
+
+type noAccumResult struct {
+	connects, disconnects int
+}
+
+type statusRowResult struct {
+	label     string
+	lastTitle string
+}
+
+type updateWireResult struct {
+	before       string
+	after        string
+	afterAvail   bool
+	updateClicks int
+}
+
+type badgeSwitchResult struct {
+	beforePlain bool
+	afterBadged bool
+}
+
+type autostartCase struct {
+	startChecked bool
+	afterChecked bool
+	setCalls     []bool
+}
+
+type tooltipResult struct {
+	afterSetup string
+}
+
+var (
+	setup               setupResult
+	header              headerResult
+	wiring              wiringResult
+	actionStart         actionStartResult
+	states              []stateResult
+	noAccum             noAccumResult
+	statusRow           statusRowResult
+	updateWire          updateWireResult
+	badgeSwitch         badgeSwitchResult
+	autoSuccess         autostartCase
+	autoFailure         autostartCase
+	autoStartsChecked   bool
+	reassertDidNotPanic bool
+	tooltip             tooltipResult
+)
+
+func TestMain(m *testing.M) {
+	// The offscreen platform plugin is Qt's own documented mechanism for
+	// headless test/CI environments — GitHub Actions runners have no logged-in
+	// GUI session, so constructing real native windows without it risks a
+	// crash during teardown (reproduced directly on two machines before this
+	// was added).
+	os.Setenv("QT_QPA_PLATFORM", "offscreen")
+	qt.NewQApplication(os.Args)
+
+	// TestSetupSucceeds
+	{
+		c, err := Setup(&fakeApp{})
+		setup = setupResult{err: err, ctrlNil: c == nil}
+	}
+
+	// TestMenuHeaderRows
+	{
+		f := &fakeApp{}
+		c, _ := Setup(f)
+		header = headerResult{
+			titleText:     c.titleAction.Text(),
+			titleEnabled:  c.titleAction.IsEnabled(),
+			statusEnabled: c.statusAction.IsEnabled(),
+		}
+	}
+
+	// TestMenuActionsWireToApp
+	{
+		f := &fakeApp{}
+		c, _ := Setup(f)
+		c.actionItem.Trigger()
+		c.openAction.Trigger()
+		c.settingsAction.Trigger()
+		c.updateAction.Trigger()
+		c.quitAction.Trigger()
+		wiring = wiringResult{
+			connects:     f.connects,
+			statusShows:  f.statusShows,
+			settings:     f.settings,
+			updateClicks: f.updateClicks,
+			quits:        f.quits,
+		}
+	}
+
+	// TestActionRowStartsAsConnect
+	{
+		c, _ := Setup(&fakeApp{})
+		actionStart = actionStartResult{
+			text:    c.actionItem.Text(),
+			enabled: c.actionItem.IsEnabled(),
+		}
+	}
+
+	// TestActionRowMatchesTheState
+	{
+		cases := []struct {
+			name  string
+			state tunnel.State
+		}{
+			{"Disconnected", tunnel.Disconnected},
+			{"Error", tunnel.Error},
+			{"Connected", tunnel.Connected},
+			{"Authenticating", tunnel.Authenticating},
+			{"Connecting", tunnel.Connecting},
+			{"Reconnecting", tunnel.Reconnecting},
+		}
+		for _, tc := range cases {
+			f := &fakeApp{}
+			c, _ := Setup(f)
+			c.Apply(tunnel.Event{State: tc.state})
+			label := c.actionItem.Text()
+			enabled := c.actionItem.IsEnabled()
+			c.actionItem.Trigger()
+			states = append(states, stateResult{
+				name:        tc.name,
+				label:       label,
+				enabled:     enabled,
+				connects:    f.connects,
+				disconnects: f.disconnects,
+			})
+		}
+	}
+
+	// TestActionRowDoesNotAccumulateActionsAcrossStates
+	{
+		f := &fakeApp{}
+		c, _ := Setup(f)
+		c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+		c.Apply(tunnel.Event{State: tunnel.Disconnected})
+		c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+		c.actionItem.Trigger()
+		noAccum = noAccumResult{connects: f.connects, disconnects: f.disconnects}
+	}
+
+	// TestApplyUpdatesStatusRow
+	{
+		c, _ := Setup(&fakeApp{})
+		c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.5"})
+		statusRow = statusRowResult{label: c.statusAction.Text(), lastTitle: c.lastView.Title}
+	}
+
+	// TestUpdateItemWiresAndRelabels
+	{
+		f := &fakeApp{}
+		c, _ := Setup(f)
+		before := c.updateAction.Text()
+		c.SetUpdateAvailable("v1.2.3")
+		after := c.updateAction.Text()
+		avail := c.updateAvailable
+		c.updateAction.Trigger()
+		updateWire = updateWireResult{before: before, after: after, afterAvail: avail, updateClicks: f.updateClicks}
+	}
+
+	// TestSetUpdateAvailableSwitchesToBadgedIcon
+	{
+		c, _ := Setup(&fakeApp{})
+		before := c.iconForCurrent() == c.icons[c.currentKind]
+		c.SetUpdateAvailable("v9")
+		after := c.iconForCurrent() == c.badgedIcons[c.currentKind]
+		badgeSwitch = badgeSwitchResult{beforePlain: before, afterBadged: after}
+	}
+
+	// TestAutostartToggle/success
+	{
+		f := &fakeApp{autostartOn: false}
+		c, _ := Setup(f)
+		start := c.autoAction.IsChecked()
+		c.autoAction.Trigger()
+		autoSuccess = autostartCase{
+			startChecked: start,
+			afterChecked: c.autoAction.IsChecked(),
+			setCalls:     f.autostartSet,
+		}
+	}
+
+	// TestAutostartToggle/failure
+	{
+		f := &fakeApp{autostartOn: false, setAutostartE: errFake}
+		c, _ := Setup(f)
+		start := c.autoAction.IsChecked()
+		c.autoAction.Trigger()
+		autoFailure = autostartCase{
+			startChecked: start,
+			afterChecked: c.autoAction.IsChecked(),
+			setCalls:     f.autostartSet,
+		}
+	}
+
+	// TestAutostartToggle/starts checked when already enabled
+	{
+		c, _ := Setup(&fakeApp{autostartOn: true})
+		autoStartsChecked = c.autoAction.IsChecked()
+	}
+
+	// TestReassertTrayIsIdempotent
+	{
+		var empty Controller
+		empty.ReassertTray() // must not panic with a nil icon
+
+		real, _ := Setup(&fakeApp{})
+		real.ReassertTray()
+		real.ReassertTray()
+		reassertDidNotPanic = true // reaching here proves none of the above aborted
+	}
+
+	// TestSetTooltipReachesTheInstalledTray
+	{
+		c, _ := Setup(&fakeApp{})
+		SetTooltip("OpenFortiTray")
+		tooltip = tooltipResult{afterSetup: c.icon.ToolTip()}
+	}
+
+	os.Exit(m.Run())
+}
+
+func TestSetupSucceeds(t *testing.T) {
+	if setup.err != nil {
+		t.Fatalf("Setup returned error: %v", setup.err)
+	}
+	if setup.ctrlNil {
+		t.Fatal("Setup returned nil controller")
+	}
+}
+
+// The title row is a fixed, disabled, click-less header that names the app and
+// its build in the popover, followed by a disabled status line.
+func TestMenuHeaderRows(t *testing.T) {
+	if want := "OpenFortiTray v9.9.9-test"; header.titleText != want {
+		t.Errorf("title = %q, want %q", header.titleText, want)
+	}
+	if header.titleEnabled {
+		t.Error("title row must be disabled")
+	}
+	if header.statusEnabled {
+		t.Error("status row must be disabled")
+	}
+}
+
+// A tray click must reach the matching App method.
+func TestMenuActionsWireToApp(t *testing.T) {
+	if wiring.connects != 1 {
+		t.Errorf("action row (Connect) fired %d connects, want 1", wiring.connects)
+	}
+	if wiring.statusShows != 1 {
+		t.Errorf("Open fired %d ShowStatus calls, want 1", wiring.statusShows)
+	}
+	if wiring.settings != 1 {
+		t.Errorf("Settings… fired %d ShowSettings calls, want 1", wiring.settings)
+	}
+	if wiring.updateClicks != 1 {
+		t.Errorf("update row fired %d UpdateClicked calls, want 1", wiring.updateClicks)
+	}
+	if wiring.quits != 1 {
+		t.Errorf("Quit fired %d quits, want 1 (teardown must run)", wiring.quits)
+	}
+}
+
+// At launch there is one connection row, offering Connect — not a separate
+// permanently-disabled Disconnect row.
+func TestActionRowStartsAsConnect(t *testing.T) {
+	if actionStart.text != "Connect" {
+		t.Errorf("action row = %q, want %q", actionStart.text, "Connect")
+	}
+	if !actionStart.enabled {
+		t.Error("the action row must never be disabled; it is the only connection control")
+	}
+}
+
+// Apply must relabel the action row and repoint its click target together, so
+// they never disagree. Disconnect stays clickable through the busy states,
+// because it is the only way out of a connect that hangs or a reconnect loop
+// that will not settle — uistate.View.CanDisconnect is false there (no tunnel
+// exists yet), so this asserts the row's behaviour against the states rather
+// than against that field.
+func TestActionRowMatchesTheState(t *testing.T) {
+	want := map[string]struct {
+		label                 string
+		connects, disconnects int
+	}{
+		"Disconnected":   {"Connect", 1, 0},
+		"Error":          {"Connect", 1, 0},
+		"Connected":      {"Disconnect", 0, 1},
+		"Authenticating": {"Cancel", 0, 1},
+		"Connecting":     {"Cancel", 0, 1},
+		"Reconnecting":   {"Cancel", 0, 1},
+	}
+	if len(states) != len(want) {
+		t.Fatalf("captured %d state results, want %d", len(states), len(want))
+	}
+	for _, got := range states {
+		t.Run(got.name, func(t *testing.T) {
+			w, ok := want[got.name]
+			if !ok {
+				t.Fatalf("unexpected state %q", got.name)
+			}
+			if got.label != w.label {
+				t.Errorf("label = %q, want %q", got.label, w.label)
+			}
+			if !got.enabled {
+				t.Error("the action row must never be disabled")
+			}
+			if got.connects != w.connects || got.disconnects != w.disconnects {
+				t.Errorf("fired %d connects / %d disconnects, want %d / %d",
+					got.connects, got.disconnects, w.connects, w.disconnects)
+			}
+		})
+	}
+}
+
+// Repeatedly Apply-ing different states must not stack up extra click targets
+// from earlier states — only one OnTriggered handler is ever registered (see
+// the currentAction field comment in tray.go).
+func TestActionRowDoesNotAccumulateActionsAcrossStates(t *testing.T) {
+	if noAccum.connects != 0 {
+		t.Errorf("connects = %d, want 0", noAccum.connects)
+	}
+	if noAccum.disconnects != 1 {
+		t.Errorf("disconnects = %d, want exactly 1 (a stale target would double-fire or fire the wrong method)", noAccum.disconnects)
+	}
+}
+
+// Apply must keep the status row's text in step with the current view.
+func TestApplyUpdatesStatusRow(t *testing.T) {
+	if want := "Connected — 10.0.0.5"; statusRow.label != want {
+		t.Errorf("status label = %q, want %q", statusRow.label, want)
+	}
+	if statusRow.lastTitle == "" {
+		t.Error("Apply must record the view it rendered")
+	}
+}
+
+// The update row starts as a manual check and its click target must reach
+// UpdateClicked; SetUpdateAvailable must relabel it to the one-click offer
+// without changing what it's wired to.
+func TestUpdateItemWiresAndRelabels(t *testing.T) {
+	if updateWire.before != "Check for Updates…" {
+		t.Fatalf("initial update label = %q, want %q", updateWire.before, "Check for Updates…")
+	}
+	if want := "Update to v1.2.3 & Restart"; updateWire.after != want {
+		t.Errorf("after SetUpdateAvailable label = %q, want %q", updateWire.after, want)
+	}
+	if !updateWire.afterAvail {
+		t.Error("SetUpdateAvailable must set updateAvailable")
+	}
+	if updateWire.updateClicks != 1 {
+		t.Errorf("update action fired %d UpdateClicked calls, want 1", updateWire.updateClicks)
+	}
+}
+
+// Once an update is available, iconForCurrent must switch to the badged
+// variant for whatever state is current.
+func TestSetUpdateAvailableSwitchesToBadgedIcon(t *testing.T) {
+	if !badgeSwitch.beforePlain {
+		t.Error("before an update, iconForCurrent should return the plain icon")
+	}
+	if !badgeSwitch.afterBadged {
+		t.Error("after SetUpdateAvailable, iconForCurrent should return the badged icon")
+	}
+}
+
+// The auto-connect checkbox toggles the login item and only then flips the
+// checkmark; a failed SetAutostart leaves the mark where it was.
+func TestAutostartToggle(t *testing.T) {
+	t.Run("success flips the checkmark", func(t *testing.T) {
+		if autoSuccess.startChecked {
+			t.Fatal("auto-connect should start unchecked (AutostartEnabled=false)")
+		}
+		if len(autoSuccess.setCalls) != 1 || autoSuccess.setCalls[0] != true {
+			t.Errorf("SetAutostart calls = %v, want [true]", autoSuccess.setCalls)
+		}
+		if !autoSuccess.afterChecked {
+			t.Error("checkmark should be set after a successful enable")
+		}
+	})
+
+	t.Run("failure leaves the checkmark unchanged", func(t *testing.T) {
+		if autoFailure.afterChecked != autoFailure.startChecked {
+			t.Errorf("checkmark = %v after a failed SetAutostart, want it unchanged (%v)", autoFailure.afterChecked, autoFailure.startChecked)
+		}
+	})
+
+	t.Run("starts checked when already enabled", func(t *testing.T) {
+		if !autoStartsChecked {
+			t.Error("auto-connect should start checked (AutostartEnabled=true)")
+		}
+	})
+}
+
+// The state→appearance mapping lives in internal/uistate and is tested there.
+// What stays this package's job is turning a view's severity into a tray
+// glyph — and the glyph must never be empty. This is a pure function over raw
+// bytes, so unlike everything else in this file it needs no QApplication and
+// can run directly in a Test function.
 func TestIconForKind(t *testing.T) {
 	nameOf := func(icon []byte) string {
 		for _, c := range []struct {
 			name string
 			data []byte
 		}{{"gray", iconGray}, {"green", iconGreen}, {"yellow", iconYellow}, {"red", iconRed}} {
-			if bytes.Equal(icon, c.data) {
+			if string(icon) == string(c.data) {
 				return c.name
 			}
 		}
@@ -270,14 +516,14 @@ func TestIconForKind(t *testing.T) {
 		{uistate.KindBusy, "yellow"},
 		{uistate.KindOK, "green"},
 		{uistate.KindBad, "red"},
-		// A Kind this package has not been taught about must still produce a real
-		// icon rather than nothing.
+		// A Kind this package has not been taught about must still produce a
+		// real icon rather than nothing.
 		{uistate.Kind(99), "gray"},
 	}
 	for _, tc := range cases {
 		got := iconFor(tc.kind)
 		if len(got) == 0 {
-			t.Fatalf("kind %v produced an empty icon; systray.SetIcon would panic", tc.kind)
+			t.Fatalf("kind %v produced an empty icon", tc.kind)
 		}
 		if n := nameOf(got); n != tc.want {
 			t.Errorf("kind %v = %s icon, want %s", tc.kind, n, tc.want)
@@ -285,107 +531,27 @@ func TestIconForKind(t *testing.T) {
 	}
 }
 
-// Disconnect stays clickable through the busy states, because it is the only way
-// out of a connect that hangs or a reconnect loop that will not settle — a state
-// this app reaches for real. uistate.View.CanDisconnect is false there (no tunnel
-// exists yet) and wiring the row to it would silently strip that escape hatch, so
-// this asserts the row's enablement against the states rather than against the
-// field.
-func TestActionRowMatchesTheState(t *testing.T) {
-	test.NewTempApp(t)
-
-	cases := []struct {
-		state     tunnel.State
-		wantLabel string
-		// which host method the row must call
-		wantConnects, wantDisconnects int
-	}{
-		{tunnel.Disconnected, "Connect", 1, 0},
-		{tunnel.Error, "Connect", 1, 0},
-		{tunnel.Connected, "Disconnect", 0, 1},
-		// In flight: there is no connection yet, so the row says Cancel — but it
-		// must stay CLICKABLE, because it is the only way out of a connect that
-		// hangs or a retry loop that will not settle.
-		{tunnel.Authenticating, "Cancel", 0, 1},
-		{tunnel.Connecting, "Cancel", 0, 1},
-		{tunnel.Reconnecting, "Cancel", 0, 1},
-	}
-	for _, tc := range cases {
-		t.Run(tc.state.String(), func(t *testing.T) {
-			f := &fakeApp{}
-			c := newController(f)
-			c.Apply(tunnel.Event{State: tc.state})
-			if c.actionItem.Label != tc.wantLabel {
-				t.Errorf("label = %q, want %q", c.actionItem.Label, tc.wantLabel)
-			}
-			if c.actionItem.Disabled {
-				t.Error("the action row must never be disabled; it is the only connection control")
-			}
-			if c.actionItem.Action == nil {
-				t.Fatal("the action row has no action")
-			}
-			c.actionItem.Action()
-			if f.connects != tc.wantConnects || f.disconnects != tc.wantDisconnects {
-				t.Errorf("fired %d connects / %d disconnects, want %d / %d",
-					f.connects, f.disconnects, tc.wantConnects, tc.wantDisconnects)
-			}
-		})
+// ReassertTray must be safe to call any number of times, including before
+// Setup has installed an icon. The exercise runs in TestMain (see init()); if
+// any of it had aborted the process, this test would never run at all.
+func TestReassertTrayIsIdempotent(t *testing.T) {
+	if !reassertDidNotPanic {
+		t.Fatal("ReassertTray exercise in TestMain did not complete")
 	}
 }
 
-// The Open row opens the app's window — named for what it does now that Status is
-// a section of one window rather than a window of its own.
-func TestOpenItemOpensTheWindow(t *testing.T) {
-	test.NewTempApp(t)
-	f := &fakeApp{}
-	c := newController(f)
-
-	it := itemByLabel(c.menu, "Open")
-	if it == nil || it.Action == nil {
-		t.Fatal("Open item should exist with an action")
-	}
-	it.Action()
-	if f.statusShows != 1 {
-		t.Errorf("Open fired %d ShowStatus calls, want 1", f.statusShows)
-	}
+// SetTooltip must be safe to call before any tray has been set up: this runs
+// directly in the Test function (not TestMain) because with no tray installed
+// it makes no Qt call at all — trayIcon is nil and SetTooltip just returns.
+func TestSetTooltipIsSafeWithNoTrayYet(t *testing.T) {
+	saved := trayIcon
+	trayIcon = nil
+	defer func() { trayIcon = saved }()
+	SetTooltip("should not panic")
 }
 
-// Apply must keep the fyne items in step: they are what the menu renders, and the
-// labels asserted here are the tray's long-standing wording — unchanged by the
-// move of the mapping into internal/uistate.
-func TestApplyUpdatesFyneItemsAsFallback(t *testing.T) {
-	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
-	c := newController(&fakeApp{})
-
-	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.5"})
-	if !strings.Contains(c.statusItem.Label, "Connected") {
-		t.Errorf("status label = %q, want it to mention Connected", c.statusItem.Label)
-	}
-	if c.actionItem.Label != "Disconnect" {
-		t.Errorf("action row = %q, want Disconnect while connected", c.actionItem.Label)
-	}
-
-	c.Apply(tunnel.Event{State: tunnel.Disconnected})
-	if c.actionItem.Label != "Connect" {
-		t.Errorf("action row = %q, want Connect while disconnected", c.actionItem.Label)
-	}
-	// And the view is remembered, so a later takeover adopts the current state
-	// instead of resetting the tray to the defaults.
-	if c.lastView.Title == "" {
-		t.Error("Apply must record the view it rendered for the native takeover to adopt")
-	}
-}
-
-// The autostart toggle must not tick the row when persisting the login item fails
-// — the menu would then claim a state the OS does not have.
-func TestAutostartToggleLeavesRowUnchangedOnFailure(t *testing.T) {
-	test.NewTempApp(t) // CurrentApp so (*Menu).Refresh() is a safe no-op
-	app := &fakeApp{setAutostartE: errors.New("nope")}
-	c := newController(app)
-
-	before := c.autoItem.Checked
-	c.toggleAutostart()
-	if c.autoItem.Checked != before {
-		t.Errorf("checkmark = %v after a failed SetAutostart, want it unchanged (%v)", c.autoItem.Checked, before)
+func TestSetTooltipReachesTheInstalledTray(t *testing.T) {
+	if tooltip.afterSetup != "OpenFortiTray" {
+		t.Errorf("tooltip = %q, want %q", tooltip.afterSetup, "OpenFortiTray")
 	}
 }

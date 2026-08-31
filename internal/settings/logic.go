@@ -21,8 +21,6 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
-
-	"fyne.io/fyne/v2/data/validation"
 )
 
 // statusKind selects the colour of the bottom-strip status text. The mapping to
@@ -298,13 +296,15 @@ var hostRe = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
 // cmd/openfortitray refuses to dial it), so this validator only rejects a
 // non-empty value that carries a scheme or port.
 func hostValidator() func(string) error {
-	re := validation.NewRegexp(hostRe.String(),
-		"host only, no https:// or :port (e.g. vpn.example.com)")
+	err := errors.New("host only, no https:// or :port (e.g. vpn.example.com)")
 	return func(s string) error {
 		if s == "" {
 			return nil
 		}
-		return re(s)
+		if !hostRe.MatchString(s) {
+			return err
+		}
+		return nil
 	}
 }
 

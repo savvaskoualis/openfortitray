@@ -25,7 +25,8 @@
 	     agent (LSUIElement=1, no Dock icon), which is the usual shape for a
 	     status-item app; the Dock icon is a product decision, not a technical
 	     one. The activation policy is also asserted at runtime — see
-	     dockpolicy_darwin.go — because fyne/glfw sets its own while starting. -->
+	     dockpolicy_darwin.go — because Qt's Cocoa platform integration sets
+	     its own while initializing NSApp. -->
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>

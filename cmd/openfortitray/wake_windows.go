@@ -72,3 +72,9 @@ func watchSystemSleep(fn func()) {
 		uintptr(unsafe.Pointer(&handle)),
 	)
 }
+
+// watchScreenWake is a no-op on Windows — the display-sleep-without-full-
+// system-sleep gap this exists to cover was diagnosed on macOS specifically;
+// see wake_darwin.go's doc comment. PBT_APMRESUMEAUTOMATIC above already
+// fires on Windows regardless of what triggered the resume.
+func watchScreenWake(fn func()) {}

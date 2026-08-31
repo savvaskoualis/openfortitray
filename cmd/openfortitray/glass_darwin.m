@@ -1,83 +1,104 @@
-//go:build darwin
-
 #import <Cocoa/Cocoa.h>
 #include "glass_darwin.h"
 
-static NSString *const oftGlassIdentifier = @"oft-glass";
+// This app has exactly one window that ever needs glass, so a pair of
+// static globals (rather than a general keyed registry) is the simplest
+// correct thing — see the design note in oft_attach_glass below for why
+// this exists as a SEPARATE window instead of manipulating the main
+// window's own view hierarchy.
+static NSWindow *gMainWindow = nil;
+static NSWindow *gGlassWindow = nil;
 
-void oft_attach_glass(uintptr_t nswindowPtr) {
-  NSWindow *window = (__bridge NSWindow *)(void *)nswindowPtr;
+// OFTGlassSync keeps the glass window's frame glued to the main window's
+// on every move/resize. A plain C function can't be an NSNotificationCenter
+// selector target, hence this tiny observer object.
+@interface OFTGlassSync : NSObject
+- (void)syncFrame:(NSNotification *)note;
+@end
+
+@implementation OFTGlassSync
+- (void)syncFrame:(NSNotification *)note {
+  if (gMainWindow == nil || gGlassWindow == nil) {
+    return;
+  }
+  [gGlassWindow setFrame:gMainWindow.frame display:YES];
+}
+@end
+
+static OFTGlassSync *gSync = nil;
+
+// oft_attach_glass adds native macOS vibrancy WITHOUT touching Qt's own
+// window or view hierarchy at all.
+//
+// An earlier version of this function made Qt's content view a sibling of
+// an NSVisualEffectView by replacing window.contentView with a new plain
+// NSView wrapping both — the same technique that worked for the Fyne-based
+// implementation this app used before migrating to Qt. Confirmed live that
+// this breaks Qt's own macOS repaint: once Qt's content view is no longer
+// literally window.contentView, switching the app's QStackedWidget page
+// (Status -> Connection -> Advanced) stopped repainting anything at all.
+//
+// Instead, this creates a SEPARATE borderless, vibrant NSWindow the exact
+// size of the main window, attaches it as a child window ordered BEHIND
+// the main window, and keeps its frame synced on every move/resize. Qt's
+// window and view objects are never touched — this sidesteps the repaint
+// bug by construction, at the cost of needing to keep two windows in sync
+// rather than one. This is a well-established pattern for adding vibrancy
+// behind a window whose own content view can't safely be restructured.
+void oft_attach_glass(uintptr_t nsviewPtr) {
+  NSView *qtView = (NSView *)nsviewPtr;
+  NSWindow *window = qtView.window;
   if (window == nil) {
     return;
   }
 
-  // window.opaque/backgroundColor are already set by GLFW itself when the
-  // TransparentFramebuffer hint is on (see go-gl/glfw's cocoa_window.m,
-  // createNativeWindow) — nothing to add here.
-
-  NSView *current = window.contentView;
-  if (current == nil) {
+  // Idempotent: Reveal() calls this on every window show. If already
+  // attached to this window, just make sure the frame is current and stop.
+  if (gGlassWindow != nil && gMainWindow == window) {
+    [gGlassWindow setFrame:window.frame display:YES];
     return;
   }
 
-  // Already wrapped by a previous call: `current` IS the wrapper this
-  // function installs below, identifiable by its first child being the
-  // tagged glass view. Just keep it sized to match (the window may have
-  // been resized since) and stop — Reveal() calls this on every window
-  // show, so without this check each reveal would wrap (and leak) another
-  // layer.
-  if (current.subviews.count > 0 &&
-      [current.subviews[0].identifier isEqualToString:oftGlassIdentifier]) {
-    current.subviews[0].frame = current.bounds;
-    return;
+  window.opaque = NO;
+  window.backgroundColor = [NSColor clearColor];
+
+  NSWindow *glass =
+      [[NSWindow alloc] initWithContentRect:window.frame
+                                   styleMask:NSWindowStyleMaskBorderless
+                                     backing:NSBackingStoreBuffered
+                                       defer:NO];
+  glass.releasedWhenClosed = NO;
+  glass.opaque = NO;
+  glass.backgroundColor = [NSColor clearColor];
+  glass.hasShadow = NO;
+  glass.ignoresMouseEvents = YES;
+  // Below the main window in z-order but still a normal-level window (not
+  // desktop-level), so it stays correctly stacked against other apps.
+  glass.level = window.level;
+
+  NSVisualEffectView *effect =
+      [[NSVisualEffectView alloc] initWithFrame:glass.contentView.bounds];
+  effect.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  effect.material = NSVisualEffectMaterialMenu;
+  effect.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+  effect.state = NSVisualEffectStateActive;
+  glass.contentView = effect;
+
+  gMainWindow = window;
+  gGlassWindow = glass;
+
+  [window addChildWindow:glass ordered:NSWindowBelow];
+  [glass orderFront:nil];
+
+  if (gSync == nil) {
+    gSync = [[OFTGlassSync alloc] init];
   }
-
-  // Deliberately NOT setting window.titlebarAppearsTransparent: the
-  // content view (and our glass view sized to match it) sits BELOW the
-  // titlebar, not behind it — a transparent titlebar with nothing drawn
-  // there just shows whatever's on the desktop behind the window, raw and
-  // unblurred, right above our actually-blurred content. That read as a
-  // glitchy mismatched strip in practice, not a unified look. The
-  // titlebar's own native (opaque) material — the same one every other
-  // vibrant macOS app's title bar uses above its blurred sidebar/content —
-  // is the correct, consistent choice here.
-
-  // `current` here is Fyne's own GL-backed rendering view (GLFW installs it
-  // directly as window.contentView) — NOT a plain container. Adding the
-  // glass view as a subview OF IT, even "positioned below", does not put
-  // glass behind Fyne's rendered pixels: an OpenGL view's own drawing is
-  // not itself a sibling layer that positioning can slot under, so a
-  // subview added there either sits fully on top (obscuring everything,
-  // confirmed live: a totally blank window) or fully underneath (no visible
-  // blur, confirmed in this project's own throwaway prototype) depending on
-  // exactly how AppKit backs the view — never the two composited together.
-  //
-  // The fix is to make glass and Fyne's view true siblings: wrap both in a
-  // new plain NSView and install THAT as window.contentView, with glass
-  // added first (bottom) and Fyne's original view added second (top, full
-  // bounds). Sibling views composite correctly, and a plain wrapper with a
-  // full-bounds front child hit-tests straight through to that front child
-  // (AppKit's default hitTest: recurses into subviews before matching
-  // itself), so mouse/keyboard input keeps reaching Fyne's view exactly as
-  // before.
-  NSView *originalContent = current;
-
-  NSVisualEffectView *glass =
-      [[NSVisualEffectView alloc] initWithFrame:originalContent.bounds];
-  glass.identifier = oftGlassIdentifier;
-  glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  glass.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-  glass.material = NSVisualEffectMaterialMenu;
-  glass.state = NSVisualEffectStateActive;
-
-  NSView *wrapper = [[NSView alloc] initWithFrame:originalContent.frame];
-  wrapper.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-  originalContent.frame = wrapper.bounds;
-  originalContent.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-  [wrapper addSubview:glass];
-  [wrapper addSubview:originalContent];
-
-  window.contentView = wrapper;
+  [[NSNotificationCenter defaultCenter] addObserver:gSync
+                                            selector:@selector(syncFrame:)
+                                                name:NSWindowDidResizeNotification
+                                              object:window];
+  [[NSNotificationCenter defaultCenter] addObserver:gSync
+                                            selector:@selector(syncFrame:)
+                                                name:NSWindowDidMoveNotification
+                                              object:window];
 }

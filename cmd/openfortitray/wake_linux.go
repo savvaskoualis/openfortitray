@@ -46,3 +46,8 @@ func watchSystemSleep(fn func()) {
 		}
 	}()
 }
+
+// watchScreenWake is a no-op on Linux — the display-sleep-without-full-
+// system-sleep gap this exists to cover was diagnosed on macOS specifically;
+// see wake_darwin.go's doc comment.
+func watchScreenWake(fn func()) {}

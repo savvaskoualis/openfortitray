@@ -432,6 +432,29 @@ install_openconnect() {
 	esac
 }
 
+# install_qt6_runtime installs the Qt6 runtime libraries the Linux binary
+# links against (miqt migration; see cmd/openfortitray/qtapp.go). This runs
+# unconditionally on Linux — deliberately NOT folded into install_openconnect,
+# which returns early when openconnect is already present. Every EXISTING
+# Linux user upgrading already has openconnect installed by definition, so
+# nesting the Qt6 install inside install_openconnect would mean upgraders
+# never get it and the new Qt6-linked binary fails to start with a dynamic-
+# linker error. macOS needs no equivalent step: the .app bundle carries its
+# own Qt6 frameworks (see `make app`).
+install_qt6_runtime() {
+	[[ "$OS" == Linux ]] || return
+	# qt6-base-dev/qt6-qtbase-devel/qt6-base also installs the Qt6 runtime
+	# libraries this binary links against — there is no separate minimal
+	# runtime-only package on most of these distros, and qt6-base-dev
+	# matches what CI already installs to build the binary, so build-time
+	# and install-time Qt6 are less likely to mismatch.
+	if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y qt6-base-dev
+	elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y qt6-qtbase-devel
+	elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --noconfirm qt6-base
+	else die "no supported package manager found; install the Qt6 runtime manually"
+	fi
+}
+
 # resolve_openconnect picks the absolute openconnect path to bake into the helper
 # and verifies nothing writable sits on the way to it.
 #
@@ -464,14 +487,16 @@ resolve_openconnect() {
 }
 
 # install_app_bundle builds the macOS .app (make app) and installs it to
-# /Applications so LSUIElement=1 is honoured — a bare /usr/local/bin binary would
-# render the fyne status item unreliably and show a Dock icon. The LaunchAgent
-# points its ProgramArguments at "$APP_EXEC", so login-launch reads the same
-# Info.plist. Prebuilt bundle downloads are deferred to the Fyne 5 packaging work.
+# /Applications so LSUIElement=1 is honoured — a bare /usr/local/bin binary
+# would render the status item unreliably and show a Dock icon. The
+# LaunchAgent points its ProgramArguments at "$APP_EXEC", so login-launch
+# reads the same Info.plist. There is no prebuilt-.dmg download path here yet
+# (see install_binary's RELEASE_URL handling for the non-macOS equivalent);
+# the .app is always built fresh from the checkout.
 install_app_bundle() {
 	local src="$REPO_DIR/dist/OpenFortiTray.app"
 	if [[ -n "$RELEASE_URL" ]]; then
-		warn "OPENFORTITRAY_RELEASE_URL is ignored on macOS; building the .app from the checkout (prebuilt bundles arrive with Fyne 5 packaging)."
+		warn "OPENFORTITRAY_RELEASE_URL is ignored on macOS; building the .app from the checkout (no prebuilt-.dmg download path yet)."
 	fi
 	(cd "$REPO_DIR" && make app)
 	[[ -d "$src" ]] || die "make app did not produce $src"
@@ -628,6 +653,7 @@ validate_helper_dir
 install_config
 preflight_paths
 install_openconnect
+install_qt6_runtime
 resolve_openconnect
 install_binary
 install_helper

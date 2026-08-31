@@ -1,54 +1,25 @@
 package status
 
 import (
-	"image/color"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/test"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
+	qt "github.com/mappu/miqt/qt6"
 
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
 func TestMain(m *testing.M) {
-	test.NewApp()
+	// The offscreen platform plugin is Qt's own documented mechanism for
+	// headless test/CI environments — GitHub Actions runners have no logged-in
+	// GUI session, so constructing real native windows without it risks a
+	// crash during teardown (reproduced directly on two machines before this
+	// was added).
+	os.Setenv("QT_QPA_PLATFORM", "offscreen")
+	qt.NewQApplication(os.Args)
 	os.Exit(m.Run())
-}
-
-// widgetHigh names the importance the primary button must carry, so the
-// assertion reads as intent rather than as an enum constant.
-const widgetHigh = widget.HighImportance
-
-func sameColor(a, b color.Color) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	ar, ag, ab, aa := a.RGBA()
-	br, bg, bb, ba := b.RGBA()
-	return ar == br && ag == bg && ab == bb && aa == ba
-}
-
-// activityRows flattens the history rows to "<timestamp> <text>" strings, so the
-// assertions are about what is on screen rather than about the widget tree.
-// The history is one FormLayout container holding alternating timestamp/text
-// labels, so the two columns line up across rows; this pairs them back up.
-func activityRows(c *Controller) []string {
-	objs := c.activity.Objects
-	out := make([]string, 0, len(objs)/2)
-	for i := 0; i+1 < len(objs); i += 2 {
-		ts, ok1 := objs[i].(*widget.Label)
-		txt, ok2 := objs[i+1].(*widget.Label)
-		if !ok1 || !ok2 {
-			continue
-		}
-		out = append(out, ts.Text+" "+txt.Text)
-	}
-	return out
 }
 
 type fakeHost struct {
@@ -65,17 +36,54 @@ func (f *fakeHost) OpenLog()             { f.logOpens++ }
 func (f *fakeHost) GatewayLabel() string { return "vpn.example.com:10443" }
 func (f *fakeHost) DTLSLabel() string    { return "DTLS off" }
 
-// newTestController builds a controller on a headless window with a clock the
-// test drives, so uptime is deterministic.
+// newTestController builds a controller on a headless (never-shown) window with a
+// clock the test drives, so uptime is deterministic.
 func newTestController(t *testing.T) (*Controller, *fakeHost, *time.Time) {
 	t.Helper()
 	h := &fakeHost{}
-	w := test.NewWindow(nil)
-	t.Cleanup(w.Close)
-	c := New(h, w)
+	win := qt.NewQMainWindow2()
+	c := New(h, win)
 	clock := time.Date(2026, 8, 13, 14, 22, 0, 0, time.UTC)
 	c.now = func() time.Time { return clock }
 	return c, h, &clock
+}
+
+// activityRows flattens the history rows to their rendered text, newest first, so
+// the assertions are about what is on screen rather than about the widget tree.
+func activityRows(c *Controller) []string {
+	out := make([]string, 0, len(c.activityRows))
+	for _, row := range c.activityRows {
+		out = append(out, row.Text())
+	}
+	return out
+}
+
+func TestContentReturnsNonNilWidget(t *testing.T) {
+	win := qt.NewQMainWindow2()
+	c := New(&fakeHost{}, win)
+	if c.Content() == nil {
+		t.Fatal("Content() returned nil")
+	}
+}
+
+// The behavioural contract the brief calls out explicitly: after a Connected
+// event, the primary button's click must drive Disconnect, not Connect.
+func TestApplyConnectedEnablesDisconnectButton(t *testing.T) {
+	win := qt.NewQMainWindow2()
+	host := &fakeHost{}
+	c := New(host, win)
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+
+	if c.primary.Text() != "Disconnect" {
+		t.Fatalf("primary button = %q, want %q", c.primary.Text(), "Disconnect")
+	}
+	c.primary.Click()
+	if host.disconnects != 1 {
+		t.Errorf("disconnects = %d, want 1", host.disconnects)
+	}
+	if host.connects != 0 {
+		t.Errorf("connects = %d, want 0 (clicking Disconnect must never call Connect)", host.connects)
+	}
 }
 
 func TestApplyRendersEachState(t *testing.T) {
@@ -84,7 +92,7 @@ func TestApplyRendersEachState(t *testing.T) {
 		event       tunnel.Event
 		wantState   string
 		wantSubHas  string
-		wantColor   fyne.ThemeColorName
+		wantRole    string
 		wantPrimary string
 		wantIP      string
 	}{
@@ -95,7 +103,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Disconnected},
 			wantState:   "Disconnected",
 			wantSubHas:  "vpn.example.com:10443",
-			wantColor:   theme.ColorNameDisabled,
+			wantRole:    "caption",
 			wantPrimary: "Connect",
 			wantIP:      "—",
 		},
@@ -104,7 +112,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Authenticating, Detail: "finish signing in in your browser"},
 			wantState:   "Authenticating",
 			wantSubHas:  "browser",
-			wantColor:   theme.ColorNameWarning,
+			wantRole:    "warning",
 			wantPrimary: "Cancel",
 			wantIP:      "—",
 		},
@@ -113,7 +121,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Reconnecting, Detail: "gateway refused the session"},
 			wantState:   "Reconnecting",
 			wantSubHas:  "gateway refused",
-			wantColor:   theme.ColorNameWarning,
+			wantRole:    "warning",
 			wantPrimary: "Cancel",
 			wantIP:      "—",
 		},
@@ -122,7 +130,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"},
 			wantState:   "Connected",
 			wantSubHas:  "vpn.example.com",
-			wantColor:   theme.ColorNameSuccess,
+			wantRole:    "success",
 			wantPrimary: "Disconnect",
 			wantIP:      "10.0.0.88",
 		},
@@ -131,7 +139,7 @@ func TestApplyRendersEachState(t *testing.T) {
 			event:       tunnel.Event{State: tunnel.Error, Detail: "couldn't connect — click Connect to try again"},
 			wantState:   "Error",
 			wantSubHas:  "click Connect",
-			wantColor:   theme.ColorNameError,
+			wantRole:    "error",
 			wantPrimary: "Connect",
 			wantIP:      "—",
 		},
@@ -142,41 +150,28 @@ func TestApplyRendersEachState(t *testing.T) {
 			c, _, _ := newTestController(t)
 			c.Apply(tc.event)
 
-			if c.stateText.Text != tc.wantState {
-				t.Errorf("state = %q, want %q", c.stateText.Text, tc.wantState)
+			if got := c.stateText.Text(); got != tc.wantState {
+				t.Errorf("state = %q, want %q", got, tc.wantState)
 			}
-			if !strings.Contains(c.subText.Text, tc.wantSubHas) {
-				t.Errorf("sub-line = %q, want it to contain %q", c.subText.Text, tc.wantSubHas)
+			if got := c.subText.Text(); !strings.Contains(got, tc.wantSubHas) {
+				t.Errorf("sub-line = %q, want it to contain %q", got, tc.wantSubHas)
 			}
-			if want := theme.Color(tc.wantColor); !sameColor(c.dot.FillColor, want) {
-				t.Errorf("dot colour = %v, want the %s token %v", c.dot.FillColor, tc.wantColor, want)
+			if got := c.dot.Property("role").ToString(); got != tc.wantRole {
+				t.Errorf("dot role = %q, want %q", got, tc.wantRole)
 			}
-			if c.primary.Text != tc.wantPrimary {
-				t.Errorf("primary button = %q, want %q", c.primary.Text, tc.wantPrimary)
+			if got := c.primary.Text(); got != tc.wantPrimary {
+				t.Errorf("primary button = %q, want %q", got, tc.wantPrimary)
 			}
-			if c.ipValue.Text != tc.wantIP {
-				t.Errorf("assigned IP = %q, want %q", c.ipValue.Text, tc.wantIP)
+			if got := c.ipValue.Text(); got != tc.wantIP {
+				t.Errorf("assigned IP = %q, want %q", got, tc.wantIP)
 			}
 			// The protocol row comes from config, so it reads the same in every state
 			// — a blank row would look like a bug. The gateway is deliberately NOT
 			// repeated here: the hero sub-line carries it (asserted above).
-			if !strings.Contains(c.protoValue.Text, "Fortinet") || !strings.Contains(c.protoValue.Text, "DTLS off") {
-				t.Errorf("protocol = %q, want it to name Fortinet and the DTLS setting", c.protoValue.Text)
+			if got := c.protoValue.Text(); !strings.Contains(got, "Fortinet") || !strings.Contains(got, "DTLS off") {
+				t.Errorf("protocol = %q, want it to name Fortinet and the DTLS setting", got)
 			}
 		})
-	}
-}
-
-// Exactly one high-importance button may be on screen: two competing primary
-// actions is the thing that makes a window look unconsidered.
-func TestOnlyThePrimaryButtonIsHighImportance(t *testing.T) {
-	c, _, _ := newTestController(t)
-	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if c.primary.Importance != widgetHigh {
-		t.Errorf("primary importance = %v, want high", c.primary.Importance)
-	}
-	if c.logBtn.Importance == widgetHigh {
-		t.Error("the log button must not compete with the primary action")
 	}
 }
 
@@ -199,7 +194,7 @@ func TestPrimaryButtonDrivesTheHost(t *testing.T) {
 		t.Run(tc.state.String(), func(t *testing.T) {
 			c, h, _ := newTestController(t)
 			c.Apply(tunnel.Event{State: tc.state})
-			test.Tap(c.primary)
+			c.primary.Click()
 			if h.connects != tc.wantConnects {
 				t.Errorf("connects = %d, want %d", h.connects, tc.wantConnects)
 			}
@@ -210,11 +205,29 @@ func TestPrimaryButtonDrivesTheHost(t *testing.T) {
 	}
 }
 
+// Clicking the primary button across several different states must not stack up
+// extra actions from earlier states — only ONE click handler is ever wired (see
+// the primaryAction field comment in status.go).
+func TestPrimaryButtonDoesNotAccumulateActionsAcrossStates(t *testing.T) {
+	c, h, _ := newTestController(t)
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+	c.Apply(tunnel.Event{State: tunnel.Disconnected})
+	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
+
+	c.primary.Click()
+	if h.connects != 0 {
+		t.Errorf("connects = %d, want 0", h.connects)
+	}
+	if h.disconnects != 1 {
+		t.Errorf("disconnects = %d, want exactly 1 (a stale connection would double-fire)", h.disconnects)
+	}
+}
+
 // Navigation to Settings belongs to the shell's rail, not to a button in here —
 // two routes to one place, one of them dressed as an action.
 func TestLogButtonDrivesTheHost(t *testing.T) {
 	c, h, _ := newTestController(t)
-	test.Tap(c.logBtn)
+	c.logBtn.Click()
 	if h.logOpens != 1 {
 		t.Errorf("OpenLog called %d times, want 1", h.logOpens)
 	}
@@ -225,21 +238,21 @@ func TestLogButtonDrivesTheHost(t *testing.T) {
 func TestUptimeTicksWhileConnected(t *testing.T) {
 	c, _, clock := newTestController(t)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if got := c.timerText.Text; got != "00:00:00" {
+	if got := c.timerText.Text(); got != "00:00:00" {
 		t.Fatalf("clock at connect = %q, want 00:00:00", got)
 	}
 	// The gateway sits on its OWN line now, so a ticking clock cannot shift it.
-	if !strings.Contains(c.subText.Text, "vpn.example.com") {
-		t.Errorf("sub-line = %q, want the gateway", c.subText.Text)
+	if got := c.subText.Text(); !strings.Contains(got, "vpn.example.com") {
+		t.Errorf("sub-line = %q, want the gateway", got)
 	}
 
 	*clock = clock.Add(94 * time.Second)
 	c.Tick()
-	if got := c.timerText.Text; got != "00:01:34" {
+	if got := c.timerText.Text(); got != "00:01:34" {
 		t.Errorf("clock after 94s = %q, want 00:01:34", got)
 	}
-	if c.sinceValue.Text != "14:22" {
-		t.Errorf("connected-since = %q, want the wall-clock time of the connect", c.sinceValue.Text)
+	if got := c.sinceValue.Text(); got != "14:22" {
+		t.Errorf("connected-since = %q, want the wall-clock time of the connect", got)
 	}
 }
 
@@ -248,18 +261,18 @@ func TestUptimeTicksWhileConnected(t *testing.T) {
 func TestTickIsANoopWhenNotConnected(t *testing.T) {
 	c, _, clock := newTestController(t)
 	c.Apply(tunnel.Event{State: tunnel.Reconnecting, Detail: "gateway refused the session"})
-	before := c.subText.Text
+	before := c.subText.Text()
 	*clock = clock.Add(time.Hour)
 	c.Tick()
-	if c.subText.Text != before {
-		t.Errorf("sub-line changed on a disconnected tick: %q -> %q", before, c.subText.Text)
+	if got := c.subText.Text(); got != before {
+		t.Errorf("sub-line changed on a disconnected tick: %q -> %q", before, got)
 	}
 	// And no clock is invented for a state that has no session.
-	if c.timerText.Text != "" {
-		t.Errorf("clock = %q, want empty when nothing is connected", c.timerText.Text)
+	if got := c.timerText.Text(); got != "" {
+		t.Errorf("clock = %q, want empty when nothing is connected", got)
 	}
-	if c.sinceValue.Text != "—" {
-		t.Errorf("connected-since = %q, want an em dash", c.sinceValue.Text)
+	if got := c.sinceValue.Text(); got != "—" {
+		t.Errorf("connected-since = %q, want an em dash", got)
 	}
 }
 
@@ -273,11 +286,11 @@ func TestUptimeResetsAcrossADrop(t *testing.T) {
 	*clock = clock.Add(30 * time.Second)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
 
-	if got := c.timerText.Text; got != "00:00:00" {
+	if got := c.timerText.Text(); got != "00:00:00" {
 		t.Errorf("clock after a reconnect = %q, want it restarted", got)
 	}
-	if c.sinceValue.Text != "14:32" {
-		t.Errorf("connected-since = %q, want the SECOND connect's time", c.sinceValue.Text)
+	if got := c.sinceValue.Text(); got != "14:32" {
+		t.Errorf("connected-since = %q, want the SECOND connect's time", got)
 	}
 }
 
@@ -289,7 +302,7 @@ func TestRepeatedConnectedDoesNotRestartTheClock(t *testing.T) {
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
 	*clock = clock.Add(5 * time.Minute)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if got := c.timerText.Text; got != "00:05:00" {
+	if got := c.timerText.Text(); got != "00:05:00" {
 		t.Errorf("clock = %q, want the original connect time preserved", got)
 	}
 }
@@ -317,22 +330,17 @@ func TestActivityListIsNewestFirst(t *testing.T) {
 	}
 }
 
-// Closing the window is the shell's concern now — see internal/shell, where the
-// intercept and its test live. This controller owns widgets, not a window.
-
-// Opening the history must put it ON SCREEN. It is a hand-rolled disclosure rather
-// than a widget.Accordion precisely because the accordion cannot report when it was
-// opened: at the closed window height the expanded list started below the last
-// pixel, so the one thing the user had just asked to see was the one thing not
-// visible. Measured before the fix: 1061px of content in a 560px window.
-func TestActivityToggleGrowsTheWindow(t *testing.T) {
+// Opening the history must put it ON SCREEN. It is a hand-rolled disclosure
+// rather than a fancier widget precisely because it has to report WHEN it was
+// opened and grow the window — see toggleActivity.
+func TestActivityToggleTogglesVisibility(t *testing.T) {
 	c, _, _ := newTestController(t)
 
-	if c.activityScroll.Visible() {
+	if !c.activityScroll.IsHidden() {
 		t.Error("the history should start folded away")
 	}
 	c.toggleActivity()
-	if !c.activityScroll.Visible() {
+	if c.activityScroll.IsHidden() {
 		t.Fatal("toggling did not reveal the history")
 	}
 	if !c.activityOpen {
@@ -340,12 +348,12 @@ func TestActivityToggleGrowsTheWindow(t *testing.T) {
 	}
 	// The list is bounded, so a long history scrolls instead of demanding an
 	// unreachable window height.
-	if h := c.activityScroll.MinSize().Height; h != activityHeight {
+	if h := c.activityScroll.MaximumHeight(); h != activityHeight {
 		t.Errorf("list height = %v, want the bounded %v", h, activityHeight)
 	}
 
 	c.toggleActivity()
-	if c.activityScroll.Visible() {
+	if !c.activityScroll.IsHidden() {
 		t.Error("toggling again did not fold the history away")
 	}
 }
@@ -354,13 +362,13 @@ func TestActivityToggleGrowsTheWindow(t *testing.T) {
 // anything.
 func TestActivityToggleShowsTheCount(t *testing.T) {
 	c, _, clock := newTestController(t)
-	if got := c.activityToggle.Text; got != "Activity" {
+	if got := c.activityToggle.Text(); got != "Activity" {
 		t.Errorf("empty history label = %q, want a bare %q", got, "Activity")
 	}
 	c.Apply(tunnel.Event{State: tunnel.Connecting})
 	*clock = clock.Add(time.Second)
 	c.Apply(tunnel.Event{State: tunnel.Connected, Detail: "10.0.0.88"})
-	if got := c.activityToggle.Text; got != "Activity (2)" {
+	if got := c.activityToggle.Text(); got != "Activity (2)" {
 		t.Errorf("label = %q, want %q", got, "Activity (2)")
 	}
 }
@@ -388,8 +396,8 @@ func TestOlderEntriesCarryTheirDate(t *testing.T) {
 	}
 }
 
-// Capacity is what makes the history useful during a flap; it was capped at 12 only
-// because the list had no scroller.
+// Capacity is what makes the history useful during a flap; it was capped at 12
+// only because the list had no scroller.
 func TestHistoryKeepsEnoughToBeUseful(t *testing.T) {
 	if activityDepth < 50 {
 		t.Errorf("activityDepth = %d; a flapping tunnel burns through a dozen transitions in minutes", activityDepth)

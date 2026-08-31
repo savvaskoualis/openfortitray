@@ -8,8 +8,7 @@ import (
 	"log"
 	"os"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/dialog"
+	qt "github.com/mappu/miqt/qt6"
 
 	oft "github.com/savvaskoualis/openfortitray"
 )
@@ -25,12 +24,13 @@ func (a *app) installBootstrapHooks() {
 
 // connectWithBootstrap is the Connect gate on macOS. It probes helper readiness
 // OFF the UI thread (the probe spawns `sudo -n`), then either dials or offers the
-// one-time install — both marshalled back onto the UI goroutine. Called on the UI
-// goroutine from Connect (after the config-issue check has passed).
+// one-time install — both marshalled back onto the UI goroutine via a.dispatch.
+// Called on the UI goroutine from Connect (after the config-issue check has
+// passed).
 func (a *app) connectWithBootstrap() {
 	go func() {
 		if oft.HelperReady() {
-			fyne.Do(a.startTunnel)
+			a.dispatch.Post(a.startTunnel)
 			return
 		}
 		// Say why Connect did not dial. Without this the app simply sits there
@@ -38,7 +38,7 @@ func (a *app) connectWithBootstrap() {
 		// app with no explanation is indistinguishable from a hang.
 		log.Printf("helper: not ready for this build (need ABI %d); offering to install it",
 			oft.RequiredHelperABI)
-		fyne.Do(a.offerBootstrapInstall)
+		a.dispatch.Post(a.offerBootstrapInstall)
 	}()
 }
 
@@ -46,12 +46,17 @@ func (a *app) connectWithBootstrap() {
 // install off the UI thread, then dials on success or explains the failure and
 // points at the manual installer. It runs on the UI goroutine (it mutates
 // widgets). A dismissed password prompt (ErrUserCancelled) is intentionally
-// silent — the user chose not to install.
+// silent — the user chose not to install. QMessageBox.Exec() is a blocking
+// modal, which is fine here: this closure already runs on the Qt UI thread (via
+// a.dispatch's drain timer), and a nested Qt event loop during exec() is
+// standard practice, exactly as internal/settings' delete-profile confirm
+// already does.
 func (a *app) offerBootstrapInstall() {
 	// Bring the window forward so the dialog has a visible parent (Connect can be
 	// invoked from the tray while the window is hidden).
 	a.win.Show()
-	a.win.RequestFocus()
+	a.win.Raise()
+	a.win.ActivateWindow()
 	// The same gate covers a first install and an upgrade of an existing helper, so
 	// the wording has to fit both: telling someone who has used the app for weeks
 	// that it "needs to install" a helper reads like a mistake.
@@ -63,26 +68,27 @@ func (a *app) offerBootstrapInstall() {
 		body = "OpenFortiTray needs to update its VPN helper before it can connect.\n" +
 			"This will ask for your Mac password. Update now?"
 	}
-	dialog.ShowConfirm(title, body,
-		func(ok bool) {
-			if !ok {
-				return
+
+	mb := qt.NewQMessageBox3(qt.QMessageBox__Question, title, body)
+	mb.SetStandardButtons(qt.QMessageBox__Yes | qt.QMessageBox__No)
+	if mb.Exec() != int(qt.QMessageBox__Yes) {
+		return
+	}
+
+	go func() {
+		err := oft.Install()
+		a.dispatch.Post(func() {
+			switch {
+			case err == nil:
+				a.startTunnel()
+			case errors.Is(err, oft.ErrUserCancelled):
+				// User dismissed the password prompt; nothing to report.
+			default:
+				errBox := qt.NewQMessageBox3(qt.QMessageBox__Critical, "Could not install the VPN helper",
+					fmt.Sprintf("%v\n\nYou can install it manually by running scripts/install-helper.sh in a Terminal.", err))
+				errBox.SetStandardButtons(qt.QMessageBox__Ok)
+				errBox.Exec()
 			}
-			go func() {
-				err := oft.Install()
-				fyne.Do(func() {
-					switch {
-					case err == nil:
-						a.startTunnel()
-					case errors.Is(err, oft.ErrUserCancelled):
-						// User dismissed the password prompt; nothing to report.
-					default:
-						dialog.ShowError(fmt.Errorf(
-							"Could not install the VPN helper: %w\n\n"+
-								"You can install it manually by running scripts/install-helper.sh in a Terminal.", err),
-							a.win)
-					}
-				})
-			}()
-		}, a.win)
+		})
+	}()
 }

@@ -7,27 +7,11 @@ import (
 	"image/draw"
 	"image/png"
 	"math"
-
-	"fyne.io/fyne/v2"
 )
 
 // badgeRed is the fill of the "update available" dot. A saturated red that reads
 // as an alert on any of the four state-coloured base icons.
 var badgeRed = color.RGBA{R: 0xE0, G: 0x2B, B: 0x20, A: 0xFF}
-
-// badgedResource decodes a base icon PNG, overlays a red "update available" dot
-// in the bottom-right quadrant, and returns the result as a fyne resource named
-// name. The compose is pure Go (image/draw + image/png), so it is cross-platform
-// and adds no committed assets. If the base cannot be decoded/re-encoded — it
-// never should, these are our own embedded PNGs — it falls back to the plain
-// icon so the menu item still signals the update.
-func badgedResource(name string, base []byte) fyne.Resource {
-	data, err := composeBadge(base)
-	if err != nil {
-		return fyne.NewStaticResource(name, base)
-	}
-	return fyne.NewStaticResource(name, data)
-}
 
 // composeBadge draws a filled red circle in the bottom-right quadrant of the
 // decoded base image, ringed by a thin fully-transparent gap so the dot reads on
@@ -73,6 +57,35 @@ func composeBadge(base []byte) ([]byte, error) {
 			}
 		}
 	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, dst); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// padToSquare centers src on a transparent square canvas sized to its
+// longer side and re-encodes as PNG. The embedded base icons are 45x32 —
+// fine under Fyne's tray, which apparently normalized this itself, but
+// Qt's QSystemTrayIcon renders a QIcon's native aspect ratio scaled to the
+// menu bar's fixed height, so a landscape source icon shows up as a
+// visibly widened rectangle instead of the usual square tray glyph.
+// Padding to square here, once, at construction time, fixes that without
+// touching the artwork or composeBadge's badge-placement math (which
+// already sizes relative to the shorter side and is unaffected by the
+// added transparent margin).
+func padToSquare(src []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, err
+	}
+	b := img.Bounds()
+	side := max(b.Dx(), b.Dy())
+	dst := image.NewRGBA(image.Rect(0, 0, side, side))
+	offX := (side - b.Dx()) / 2
+	offY := (side - b.Dy()) / 2
+	draw.Draw(dst, image.Rect(offX, offY, offX+b.Dx(), offY+b.Dy()), img, b.Min, draw.Src)
 
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, dst); err != nil {

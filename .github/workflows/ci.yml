@@ -1,13 +1,16 @@
 name: CI
 
-# Runs on every branch push and on pull requests. Since the tray moved to
-# fyne v2 it renders through OpenGL/GLFW, so cmd/openfortitray is now a cgo
-# build on EVERY OS. That kills the old "type-check windows on ubuntu" trick
-# (cgo windows cannot cross-compile from Linux), so the matrix now spans all
-# three real runners: linux needs GL + X11 dev headers (installed below),
-# macOS uses the system frameworks + Xcode CLT already on the runner, and
-# windows uses the runner's bundled MinGW gcc. Each runner does the full
-# gofmt / vet / test -race / build pass against its own native toolchain.
+# Runs on every branch push and on pull requests. cmd/openfortitray is a cgo
+# build on EVERY OS: the UI is Qt6 via miqt (see cmd/openfortitray/qtapp.go),
+# a cgo+C++ dependency (Fyne was fully removed from this codebase — see the
+# migration history). That kills the old "type-check windows on ubuntu" trick
+# (cgo windows cannot cross-compile from Linux), so the matrix spans all three
+# real runners: linux installs Qt6's dev headers via apt (below), macOS uses
+# the system frameworks + Xcode CLT plus Homebrew Qt6, and windows uses the
+# runner's bundled MinGW gcc plus an MSYS2-installed Qt6. Each runner does the
+# full gofmt / vet / test -race / build pass against its own native toolchain,
+# with CGO_CXXFLAGS=-std=c++17 (job env, below) so Qt6's C++17-only headers
+# compile under cgo's C++ front end.
 on:
   push:
     branches: ['**']
@@ -32,10 +35,11 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # cgo is now mandatory on all three OSes (fyne -> GLFW -> OpenGL). Setting
-    # it at the job level covers vet, test -race and build in one place.
+    # cgo is mandatory on all three OSes (Qt6 via miqt). Setting it at the
+    # job level covers vet, test -race and build in one place.
     env:
       CGO_ENABLED: '1'
+      CGO_CXXFLAGS: '-std=c++17'
     strategy:
       fail-fast: false
       matrix:
@@ -55,26 +59,35 @@ jobs:
           # go.sum; no separate actions/cache step needed.
           cache: true
 
+      - name: Install Qt6 (Homebrew)
+        if: runner.os == 'macOS'
+        run: |
+          brew install qt pkg-config
+
       # windows-latest ships MinGW-w64 but does NOT put it on PATH
       # (actions/runner-images #6103/#8399), so a CGO=1 vet/test/build would
       # fail for want of a C compiler. Install a known-good gcc via a pinned
       # setup-msys2 and prepend its bin to PATH ourselves. Linux uses the apt
-      # deps below; macOS uses system frameworks — neither needs this.
-      - name: Set up MinGW-w64 (MSYS2)
+      # deps below; macOS uses system frameworks (+ Homebrew Qt6 above) —
+      # neither needs this.
+      #
+      # UCRT64 (not MINGW64): miqt's README documents UCRT64 + qt6-base as a
+      # tested native-Windows recipe for Qt6.
+      - name: Set up MinGW-w64 + Qt6 (MSYS2 UCRT64)
         if: runner.os == 'Windows'
         id: msys2
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config mingw-w64-ucrt-x86_64-qt6-base
 
       - name: Put MinGW-w64 gcc on PATH
         if: runner.os == 'Windows'
         # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but the
         # steps below run in Git Bash (defaults.run.shell: bash). Prepend the
-        # MINGW64 bin dir to PATH so cgo's go toolchain finds gcc, then confirm.
+        # UCRT64 bin dir to PATH so cgo's go toolchain finds gcc, then confirm.
         run: |
-          printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+          printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\ucrt64\\bin" >> "$GITHUB_PATH"
 
       - name: Verify C toolchain
         if: runner.os == 'Windows'
@@ -95,17 +108,16 @@ jobs:
             -arch amd64 \
             -o cmd/openfortitray/resource_windows_amd64.syso
 
-      # fyne renders through OpenGL/GLFW, so building or even type-checking the
-      # tray (and anything that imports fyne/v2/app) needs cgo plus GL and X11
-      # dev headers. `go vet`/`go test -race`/`go build` below all compile
-      # cmd/openfortitray, so these must be present first. This is fyne's
-      # documented Linux build-dependency set. macOS uses system frameworks and
-      # windows uses the runner's bundled MinGW gcc, so neither needs this step.
-      - name: Install GL/X11 build deps
+      # cmd/openfortitray links against Qt6 (miqt; see qtapp.go), which needs
+      # the Qt6 dev headers/pkg-config files (qt6-base-dev) to even
+      # compile-check, let alone build. macOS uses system frameworks +
+      # Homebrew Qt6, and windows uses the runner's bundled MinGW gcc + MSYS2
+      # Qt6 above, so neither needs this step.
+      - name: Install Qt6 build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+          sudo apt-get install -y gcc pkg-config qt6-base-dev
 
       - name: Check gofmt
         # `gofmt -l` first so a failure names the offending files in the log,

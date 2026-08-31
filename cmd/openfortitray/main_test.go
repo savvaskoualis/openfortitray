@@ -11,14 +11,37 @@ import (
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2/test"
-
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
 )
+
+// drainDispatchAsync runs fn — an onSystemWake/onScreenWake-style callback —
+// and asserts it returns immediately, WITHOUT blocking the caller: in
+// production, both callbacks are invoked by the OS on the very same thread
+// that drains a.dispatch (see onSystemWake/onScreenWake's doc comments), so
+// they must only Post their work, never PostAndWait — PostAndWait there
+// would deadlock forever, since Drain can never run while the calling thread
+// is stuck waiting inside the callback it is supposed to be draining for.
+// Once fn has returned, a.dispatch.Drain() actually runs the posted work so
+// callers can assert on its effects.
+func drainDispatchAsync(t *testing.T, a *app, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("fn blocked instead of returning immediately — it must only Post its work (never PostAndWait), since in production it runs on the very thread that drains the queue")
+	}
+	a.dispatch.Drain()
+}
 
 // newTestApp builds an app whose supervisor records whether it was ever asked to
 // authenticate — i.e. whether a connection attempt actually started.
@@ -43,9 +66,10 @@ func newTestApp(t *testing.T, gateway, cfgDir string) (*app, chan struct{}) {
 			ActiveProfile: "Default",
 			Profiles:      []config.Profile{{Name: "Default", Gateway: gateway, Port: 10443}},
 		},
-		cfgDir: cfgDir,
-		sup:    tunnel.New(authFn, runFn, events),
-		events: events,
+		cfgDir:   cfgDir,
+		sup:      tunnel.New(authFn, runFn, events),
+		events:   events,
+		dispatch: uidispatch.New(),
 		// The credstore seam: an empty in-memory fake, so a test that switches the
 		// active profile to an IPsec backend (startTunnel then reads the PSK
 		// through this) never touches the real keychain, and a fast bounded retry
@@ -308,10 +332,9 @@ func TestStartTunnelRetriesIPsecPSKReadOnBusyStore(t *testing.T) {
 // not dial — a wake notification arriving while the user is deliberately
 // disconnected must never surprise them with a connection attempt.
 func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
-	a.onSystemWake()
+	drainDispatchAsync(t, a, a.onSystemWake)
 
 	select {
 	case <-authCalled:
@@ -324,7 +347,6 @@ func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
 // Disconnect+Connect rather than trust a tunnel that may have died silently
 // while the machine slept.
 func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.Connect()
@@ -334,7 +356,7 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 		t.Fatal("supervisor never started authenticating")
 	}
 
-	a.onSystemWake()
+	drainDispatchAsync(t, a, a.onSystemWake)
 
 	select {
 	case <-authCalled:
@@ -346,10 +368,44 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 	}
 }
 
+// A display wake must never touch the tunnel — it exists purely to
+// re-assert the tray icon (a.tray stays nil in this test setup, so there's
+// nothing to observe there beyond "does not panic"), unlike onSystemWake,
+// which forces a reconnect. Connected before a screen wake, still connected
+// after, with no extra auth attempt.
+func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+	// Drain any buffered signal so a false positive below can't be blamed on
+	// Connect's own initial attempt.
+	select {
+	case <-authCalled:
+	default:
+	}
+
+	// Proves onScreenWake actually posted its tray-reassert work to
+	// a.dispatch (rather than touching the tunnel directly): it must return
+	// immediately without blocking, and once the queue is drained, no auth
+	// attempt fired.
+	drainDispatchAsync(t, a, a.onScreenWake)
+
+	select {
+	case <-authCalled:
+		t.Error("onScreenWake dialed the tunnel; a display wake must never do that")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // The update dialog must surface only ONCE per distinct version: the badge and
 // menu item update on every 6-hourly check (cheap), but re-prompting the same
 // version every 6h would nag. shouldPromptUpdate is the pure decision behind the
-// thin promptUpdate wrapper (a headless fyne dialog is impractical to drive in a
+// thin promptUpdate wrapper (a real update dialog is impractical to drive in a
 // test); this pins its once-per-version contract.
 func TestShouldPromptUpdateOncePerVersion(t *testing.T) {
 	a := &app{}

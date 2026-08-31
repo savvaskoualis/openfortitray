@@ -1,27 +1,29 @@
+// Package settings renders the native settings window (profile bar +
+// Connection tab + Advanced tab + action strip) on Qt6/miqt and holds the pure
+// validation / working-copy logic that drives it.
+//
+// The window itself cannot be exercised without a display, so every decision
+// it makes — field validation, unique/non-empty names, refuse-delete-last, the
+// custom-port-off rule, and cloning the config into an editable working copy —
+// lives in logic.go as a pure function and is table-tested in logic_test.go.
+// This file (settings.go) is a thin shell that wires Qt widgets to those pure
+// functions; it owns every widget and holds no validation rule of its own.
 package settings
 
 import (
 	"errors"
-	"image/color"
 	"strings"
-	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
+	qt "github.com/mappu/miqt/qt6"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 )
 
-// Host is what the settings window needs from the application. Every method is
-// called on the fyne UI goroutine (from a widget Action or from Apply, which the
-// event pump marshals through fyne.Do).
+// Host is what the settings window needs from the application. Every method
+// is called on the Qt UI thread (from a widget signal handler or from Apply,
+// which the event pump marshals there).
 type Host interface {
 	// Config returns the live configuration. The window edits a deep copy and
 	// only writes back through Commit.
@@ -35,56 +37,101 @@ type Host interface {
 	Disconnect()
 }
 
-// Controller owns the settings window and every widget in it. It is built once
-// at startup (New) and reused: Show/Hide toggle visibility, the red close button
-// is intercepted to Hide (never quit), and Apply feeds the live status strip
-// from the one event pump. All methods run on the UI goroutine.
+// errorBorderColor outlines an invalid QLineEdit/QPlainTextEdit. uitheme
+// (Task 3) has no exported raw color for its "error" QSS role today — only
+// the QLabel[role="error"] selector used for the error labels' text color
+// below — so this is a standalone value rather than a uitheme export. It
+// reads clearly as an error on both the light and dark palettes.
+const errorBorderColor = "#E5484D"
+
+// styler is satisfied by any widget exposing SetStyleSheet — both QLineEdit
+// and QPlainTextEdit promote it from their embedded QWidget — so markInvalid
+// works uniformly across every validated row in the field-mapping table
+// instead of needing one copy per widget type.
+type styler interface {
+	SetStyleSheet(string)
+}
+
+// markInvalid is the one shared error-display helper every validated row
+// uses: an outlined border on the field plus a small message label directly
+// beneath it (see validatedRow), replacing Fyne's
+// SetValidationError/AlwaysShowValidationError.
+func markInvalid(w styler, errLabel *qt.QLabel, err error) {
+	if err != nil {
+		w.SetStyleSheet("border: 1px solid " + errorBorderColor + ";")
+		errLabel.SetText(err.Error())
+		errLabel.SetVisible(true)
+	} else {
+		w.SetStyleSheet("")
+		errLabel.SetVisible(false)
+	}
+}
+
+// fieldTarget is what ShowIssue needs to guide the user to one field: an
+// optional mark function (nil for the Select/Button fields that have no error
+// affordance of their own — the banner names the fix instead, exactly as the
+// Fyne version did) and a focus function.
+type fieldTarget struct {
+	mark  func(error)
+	focus func()
+}
+
+// Controller owns the settings content and every widget in it. It is built
+// once at startup (New) and reused: the composed panes are handed to the
+// shell, which decides where and when they are shown. Apply feeds the live
+// status strip from the one event pump. All methods run on the UI thread.
 type Controller struct {
 	host Host
-	win  fyne.Window
+	win  *qt.QMainWindow
 
-	// work is the in-memory copy being edited; nothing reaches the live config
-	// until Save/Commit. sel is the index into work.Profiles shown in the form.
+	// work is the in-memory copy being edited; nothing reaches the live
+	// config until Save/Commit. sel is the index into work.Profiles shown in
+	// the form.
 	work *config.Config
 	sel  int
 
-	// profileSelect replaces the old profile rail; syncing suppresses its OnChanged
-	// while syncProfileBar repaints it.
-	profileSelect *widget.Select
-	profileBar    *fyne.Container
+	// profileSelect replaces the old profile rail; syncing suppresses its
+	// OnCurrentIndexChanged while syncProfileBar repaints it.
+	profileSelect *qt.QComboBox
+	profileBar    *qt.QWidget
 	syncing       bool
 
-	// The composed pieces the shell arranges. This controller no longer owns a
+	// The composed panes the shell arranges. This controller does not own a
 	// window: it owns widgets, and something else decides where they live.
-	basic    fyne.CanvasObject
-	advanced fyne.CanvasObject
-	footer   fyne.CanvasObject
+	basic    *qt.QWidget
+	advanced *qt.QWidget
+	footer   *qt.QWidget
 	navigate func(tab string)
 
-	// banner is the persistent inline strip at the top of the settings sections that
-	// names a blocking Connect issue and its fix; it is hidden until ShowIssue
-	// raises it and stays up until dismissed or a successful Save.
-	banner      *fyne.Container
-	bannerLabel *widget.Label
+	// connectionLayout/advancedLayout are the outer QVBoxLayouts of the two
+	// tabs, kept so a conditional row's visibility change can force a
+	// relayout (see relayout).
+	connectionLayout *qt.QVBoxLayout
+	advancedLayout   *qt.QVBoxLayout
 
-	// forms is every widget.Form the tabs are built from, so a theme or validation
-	// change can be pushed through all of them at once.
-	forms []*widget.Form
+	// banner is the persistent inline strip shown at the top of the settings
+	// sections that names a blocking Connect issue and its fix; it is hidden
+	// until ShowIssue raises it and stays up until dismissed or a successful
+	// Save.
+	banner      *qt.QWidget
+	bannerLabel *qt.QLabel
 
-	nameEntry     *widget.Entry
-	gatewayEntry  *widget.Entry
-	portEntry     *widget.Entry
-	authSelect    *widget.Select
-	authNote      *widget.Label
-	backendSelect *widget.Select
-	// The row that appears and disappears with the chosen auth method, in its
-	// own container so hiding it reclaims its space as well as its label (see
-	// row).
-	authNoteRow *fyne.Container
-	autoConnect *widget.Check
-	keepAlive   *widget.Check
+	nameEntry       *qt.QLineEdit
+	nameErrLabel    *qt.QLabel
+	gatewayEntry    *qt.QLineEdit
+	gatewayErrLabel *qt.QLabel
+	portEntry       *qt.QLineEdit
+	portErrLabel    *qt.QLabel
+	authSelect      *qt.QComboBox
+	authNote        *qt.QLabel
+	// authNoteRow is its own container, shown/hidden as a whole (see
+	// updateAuthNote), so hiding it reclaims its space entirely.
+	authNoteRow   *qt.QWidget
+	backendSelect *qt.QComboBox
+	autoConnect   *qt.QCheckBox
+	keepAlive     *qt.QCheckBox
 
-	// IPsec auth fields (Connection section). ipsecSecretDirty/ipsecSecretValue
+	// IPsec auth fields (Connection tab). ipsecSecretDirty/ipsecSecretValue
 	// track the PSK entry, keyed by profile index (c.sel) — mirroring how
 	// every other field writes straight into c.work.Profiles[c.sel] — so an
 	// unsaved PSK typed for one profile survives switching the profile
@@ -95,66 +142,75 @@ type Controller struct {
 	// was typed this session (loadProfile reads them, never credstore); an
 	// unset index is the zero value (false / ""), which is exactly "nothing
 	// typed yet for this profile".
-	ipsecAuthSelect     *widget.Select
-	ipsecSecretEntry    *widget.Entry
+	ipsecAuthSelect     *qt.QComboBox
+	ipsecSecretEntry    *qt.QLineEdit
+	ipsecSecretErrLabel *qt.QLabel
 	ipsecSecretDirty    map[int]bool
 	ipsecSecretValue    map[int]string
-	ipsecCertPathLabel  *widget.Label
-	ipsecKeyPathLabel   *widget.Label
-	ipsecCertPathButton *widget.Button
-	ipsecKeyPathButton  *widget.Button
-	ipsecPSKRow         *fyne.Container
-	ipsecCertRow        *fyne.Container
-	ipsecKeyRow         *fyne.Container
+	ipsecCertPathEntry  *qt.QLineEdit
+	ipsecKeyPathEntry   *qt.QLineEdit
+	ipsecCertPathButton *qt.QPushButton
+	ipsecKeyPathButton  *qt.QPushButton
+	ipsecPSKRow         *qt.QWidget
+	ipsecCertRow        *qt.QWidget
+	ipsecKeyRow         *qt.QWidget
 
 	// Advanced tab.
-	dualStack       *widget.Check
-	dtls            *widget.Check
-	rememberSession *widget.Check
-	certMode        *widget.RadioGroup
-	certPin         *widget.Entry
-	certPinRow      *fyne.Container
-	splitDNS        *widget.Entry
-	samlPortEntry   *widget.Entry
-	openconnectPath *widget.Entry
-	helperPath      *widget.Entry
+	dualStack               *qt.QCheckBox
+	dtls                    *qt.QCheckBox
+	rememberSession         *qt.QCheckBox
+	certMode                *qt.QComboBox
+	certPin                 *qt.QLineEdit
+	certPinErrLabel         *qt.QLabel
+	certPinRow              *qt.QWidget
+	splitDNS                *qt.QPlainTextEdit
+	splitDNSErrLabel        *qt.QLabel
+	samlPortEntry           *qt.QLineEdit
+	samlPortErrLabel        *qt.QLabel
+	openconnectPath         *qt.QLineEdit
+	openconnectPathErrLabel *qt.QLabel
+	helperPath              *qt.QLabel
 
 	// IPsec proposal/identity fields (Advanced tab). Always visible regardless
-	// of Backend, like every other forward-designed-but-inactive field in this
-	// tab — inert for an SSL profile.
-	ikeProposalEntry *widget.Entry
-	espProposalEntry *widget.Entry
-	localIDEntry     *widget.Entry
-	remoteIDEntry    *widget.Entry
+	// of Backend, like every other forward-designed-but-inactive field in
+	// this tab — inert for an SSL profile.
+	ikeProposalEntry *qt.QLineEdit
+	espProposalEntry *qt.QLineEdit
+	localIDEntry     *qt.QLineEdit
+	remoteIDEntry    *qt.QLineEdit
 
-	statusText *canvas.Text
+	statusText *qt.QLabel
 	// reconnectBtn is "Save & Reconnect", enabled only while a tunnel is up.
-	reconnectBtn *widget.Button
-	// delBtn is disabled when only one profile remains, which states the rule
-	// without a dialog. savedNote is the transient "Saved" confirmation.
-	delBtn    *widget.Button
-	savedNote *canvas.Text
+	reconnectBtn *qt.QPushButton
+	// delBtn is disabled when only one profile remains, which states the
+	// rule without a dialog. savedNote is the transient "Saved" confirmation.
+	delBtn    *qt.QPushButton
+	savedNote *qt.QLabel
 	// activeBtn promotes the selected profile to the active one.
-	activeBtn *widget.Button
+	activeBtn *qt.QPushButton
 
-	// loading suppresses the widgets' OnChanged handlers while loadProfile
-	// populates them, so repainting the form for a newly selected profile does
-	// not write those values straight back into the working copy.
+	// loading suppresses the widgets' change handlers while loadProfile
+	// populates them, so repainting the form for a newly selected profile
+	// does not write those values straight back into the working copy.
 	loading bool
+
+	// fieldTargets maps a Field* constant to the widget(s) ShowIssue must
+	// mark invalid and focus. Built once in build(), after every widget it
+	// references exists.
+	fieldTargets map[string]fieldTarget
 }
 
-// New builds the settings window on the given (not-yet-shown) window and wires
-// it to host. The window is left hidden; the tray's Settings… item calls Show.
-func New(host Host, win fyne.Window) *Controller {
+// New builds the settings content wired to host, placed on win (used only as
+// the parent for modal dialogs — the shell owns showing/hiding win itself).
+func New(host Host, win *qt.QMainWindow) *Controller {
 	c := &Controller{
 		host:             host,
 		win:              win,
 		ipsecSecretDirty: map[int]bool{},
 		ipsecSecretValue: map[int]string{},
 	}
-	// Populate the working copy before build: SetContent renders the Form, which
-	// runs the entry validators immediately, and the name validator reads
-	// c.work. reset() then repaints list + form with the loaded values.
+	// Populate the working copy before build: loadProfile (called from
+	// reset(), right after build()) reads c.work and c.sel.
 	c.work = cloneConfig(host.Config())
 	c.sel = c.indexOf(c.work.ActiveProfile)
 	c.build()
@@ -163,35 +219,42 @@ func New(host Host, win fyne.Window) *Controller {
 }
 
 // Show refreshes the working copy from the live config (discarding any edits
-// left from a previous session) and reveals the window, focused.
-// Show re-syncs the form from the live config. Revealing the window is the shell's
-// job now — there is only one window, and it may already be on screen showing
-// another section.
+// left from a previous session). Revealing the window is the shell's job.
 func (c *Controller) Show() {
 	c.reset()
 }
 
 // Apply renders one tunnel event onto the bottom status strip and mirrors the
-// tray's Connect/Disconnect enabling. It is called only from inside fyne.Do
-// (the shared event pump), so it is already on the UI goroutine and mutates
-// widgets directly. Updating a hidden window's widgets is safe and cheap.
+// tray's Connect/Disconnect enabling. It is called only from the shared event
+// pump, so it is already on the UI thread and mutates widgets directly.
 func (c *Controller) Apply(e tunnel.Event) {
 	text, kind, active := statusFor(e)
-	c.statusText.Text = text
-	c.statusText.Color = colorFor(kind)
-	c.statusText.Refresh()
+	c.statusText.SetText(text)
+	setRole(c.statusText, roleForStatus(kind))
 	// Save & Reconnect only makes sense against a tunnel there is something to
-	// bounce. Offered when nothing is up, it is just a slower Save that briefly
-	// dials — so it is disabled instead, which says so without a word of UI text.
-	if active {
-		c.reconnectBtn.Enable()
-	} else {
-		c.reconnectBtn.Disable()
+	// bounce. Offered when nothing is up, it is just a slower Save that
+	// briefly dials — so it is disabled instead, which says so without a word
+	// of UI text.
+	c.reconnectBtn.SetEnabled(active)
+}
+
+// roleForStatus maps a statusKind onto uitheme's QSS roles (see
+// internal/uitheme's [role="success"|"warning"|"error"] selectors).
+func roleForStatus(k statusKind) string {
+	switch k {
+	case statusGreen:
+		return "success"
+	case statusYellow:
+		return "warning"
+	case statusRed:
+		return "error"
+	default:
+		return ""
 	}
 }
 
 // reset discards the working copy and rebuilds it from the live config, then
-// repaints the list and the form. Used on Show and on Cancel.
+// repaints the profile bar and the form. Used on Show and on Cancel.
 func (c *Controller) reset() {
 	c.work = cloneConfig(c.host.Config())
 	c.sel = c.indexOf(c.work.ActiveProfile)
@@ -199,10 +262,6 @@ func (c *Controller) reset() {
 	// committed until Save's credstore.Set), same as every field in c.work —
 	// discarding "any edits left from a previous session" means dropping
 	// these too, for every profile, not just the one about to be shown.
-	// Without this, a PSK typed and then abandoned via Cancel — or by
-	// reopening the window without saving — would reappear the next time
-	// that profile is viewed, echoing back a not-yet-saved secret the same
-	// way this app is careful never to echo back a stored one.
 	c.ipsecSecretDirty = map[int]bool{}
 	c.ipsecSecretValue = map[int]string{}
 	c.syncProfileBar()
@@ -220,73 +279,259 @@ func (c *Controller) indexOf(name string) int {
 	return 0
 }
 
+// activeProfile returns the profile currently shown in the form, or nil when
+// c.sel is out of range (an empty working copy — defensive, since Add/Delete
+// keep at least one profile in normal use).
+func (c *Controller) activeProfile() *config.Profile {
+	if c.sel < 0 || c.sel >= len(c.work.Profiles) {
+		return nil
+	}
+	return &c.work.Profiles[c.sel]
+}
+
 func (c *Controller) build() {
 	c.buildProfileBar()
-	c.basic = c.buildBasicTab()
+	c.basic = c.buildConnectionTab()
 	c.advanced = c.buildAdvancedTab()
 	c.buildBanner()
 	c.footer = c.buildActionStrip()
+	c.buildFieldTargets()
 }
 
 // Banner returns the inline warning strip, shown at the top of the settings
-// sections. Hidden until ShowIssue raises it; a BorderLayout gives a hidden child
-// no space.
-func (c *Controller) Banner() fyne.CanvasObject { return c.banner }
+// sections. Hidden until ShowIssue raises it.
+func (c *Controller) Banner() *qt.QWidget { return c.banner }
 
-// ProfileBar returns the profile selector and its management buttons. It governs
-// both settings sections, so the shell places it above whichever is showing.
-func (c *Controller) ProfileBar() fyne.CanvasObject { return c.profileBar }
+// ProfileBar returns the profile selector and its management buttons. It
+// governs both settings sections, so the shell places it above whichever is
+// showing.
+func (c *Controller) ProfileBar() *qt.QWidget { return c.profileBar }
 
-// ConnectionContent and AdvancedContent are the two settings sections. They were
-// tabs inside a window of their own; the shell now presents them as destinations
-// alongside Status, so the app has ONE window and one level of navigation.
-func (c *Controller) ConnectionContent() fyne.CanvasObject { return c.basic }
-func (c *Controller) AdvancedContent() fyne.CanvasObject   { return c.advanced }
+// ConnectionContent and AdvancedContent are the two settings sections,
+// presented by the shell as destinations alongside Status.
+func (c *Controller) ConnectionContent() *qt.QWidget { return c.basic }
+func (c *Controller) AdvancedContent() *qt.QWidget   { return c.advanced }
 
 // Footer returns the Cancel / Save & Reconnect / Save strip.
-func (c *Controller) Footer() fyne.CanvasObject { return c.footer }
+func (c *Controller) Footer() *qt.QWidget { return c.footer }
 
-// SetNavigator gives the controller a way to ask the shell to show a section, so
-// ShowIssue can put the user in front of the offending field.
+// SetNavigator gives the controller a way to ask the shell to show a section,
+// so ShowIssue can put the user in front of the offending field.
 func (c *Controller) SetNavigator(nav func(tab string)) { c.navigate = nav }
+
+// setRole sets (or clears, with role == "") the "role" dynamic property that
+// uitheme's stylesheet keys its [role="..."] selectors on, then forces Qt to
+// re-evaluate the stylesheet against this widget. Qt does NOT automatically
+// repolish a widget when an arbitrary dynamic property changes — only the
+// unpolish/polish pair below makes an attribute-selector style update take
+// effect after the widget has already been shown once (see internal/status's
+// identical helper).
+func setRole(w *qt.QLabel, role string) {
+	w.SetProperty("role", qt.NewQVariant11(role))
+	if s := w.Style(); s != nil {
+		s.Unpolish(w.QWidget)
+		s.Polish(w.QWidget)
+	}
+}
+
+// newCaption is an uppercase, muted section heading, reusing uitheme's
+// "caption" QSS role.
+func newCaption(text string) *qt.QLabel {
+	l := qt.NewQLabel3(strings.ToUpper(text))
+	setRole(l, "sectionHeader")
+	return l
+}
+
+// newNote is a wrapping, muted line of explanatory text under a field.
+func newNote(text string) *qt.QLabel {
+	l := qt.NewQLabel3(text)
+	l.SetWordWrap(true)
+	setRole(l, "caption")
+	return l
+}
+
+// newSeparator is a thin rule between groups, reusing uitheme's "separator"
+// QSS role (the same background token the tray/status windows use).
+func newSeparator() *qt.QLabel {
+	l := qt.NewQLabel2()
+	setRole(l, "separator")
+	l.SetFixedHeight(1)
+	return l
+}
+
+func addCaption(layout *qt.QVBoxLayout, text string) { layout.AddWidget(newCaption(text).QWidget) }
+func addSeparator(layout *qt.QVBoxLayout)            { layout.AddWidget(newSeparator().QWidget) }
+
+// newScrollableColumn builds a tab's outer frame: a padded, vertically
+// stacked column of rows and groups inside a scroll area, so a tab taller
+// than the window stays reachable — the Advanced tab is, on a small display.
+func newScrollableColumn() (*qt.QScrollArea, *qt.QVBoxLayout) {
+	inner := qt.NewQWidget(nil)
+	layout := qt.NewQVBoxLayout2()
+	layout.SetContentsMargins(16, 16, 16, 16)
+	layout.SetSpacing(8)
+	inner.SetLayout(layout.QLayout)
+
+	scroll := qt.NewQScrollArea2()
+	scroll.SetWidget(inner)
+	scroll.SetWidgetResizable(true)
+	return scroll, layout
+}
+
+// wrapWithError places a QFormLayout row and a hidden error QLabel beneath it
+// inside the row's own QVBoxLayout — the shape every validated row in the
+// field-mapping table needs, so markInvalid's show/hide has somewhere to
+// paint and hiding the WHOLE row (not just the field) is possible elsewhere.
+func wrapWithError(form *qt.QFormLayout) (*qt.QLabel, *qt.QWidget) {
+	errLabel := qt.NewQLabel2()
+	setRole(errLabel, "error")
+	errLabel.SetWordWrap(true)
+	errLabel.SetVisible(false)
+
+	box := qt.NewQVBoxLayout2()
+	box.SetContentsMargins(0, 0, 0, 0)
+	box.SetSpacing(2)
+	box.AddLayout(form.QLayout)
+	box.AddWidget(errLabel.QWidget)
+
+	row := qt.NewQWidget(nil)
+	row.SetLayout(box.QLayout)
+	return errLabel, row
+}
+
+// validatedRow builds one QLineEdit field row with a hidden error label
+// beneath it. width, when > 0, caps the field's pixel width for a value whose
+// length is known and short (a port number), so it does not stretch to the
+// full column.
+func validatedRow(labelText string, width int) (*qt.QLineEdit, *qt.QLabel, *qt.QWidget) {
+	entry := qt.NewQLineEdit2()
+	if width > 0 {
+		entry.SetFixedWidth(width)
+	}
+	form := qt.NewQFormLayout2()
+	form.SetContentsMargins(0, 0, 0, 0)
+	form.AddRow3(labelText, entry.QWidget)
+	errLabel, row := wrapWithError(form)
+	return entry, errLabel, row
+}
+
+// plainRow builds one QLineEdit field row with no validator and no error
+// label — the IPsec proposal/identity fields, which are inert for an SSL
+// profile and carry no validation.
+func plainRow(labelText string) (*qt.QLineEdit, *qt.QWidget) {
+	entry := qt.NewQLineEdit2()
+	form := qt.NewQFormLayout2()
+	form.SetContentsMargins(0, 0, 0, 0)
+	form.AddRow3(labelText, entry.QWidget)
+	row := qt.NewQWidget(nil)
+	row.SetLayout(form.QLayout)
+	return entry, row
+}
+
+// comboRow builds one QComboBox field row populated with items, in display
+// order.
+func comboRow(labelText string, items []string) (*qt.QComboBox, *qt.QWidget) {
+	box := qt.NewQComboBox2()
+	box.AddItems(items)
+	form := qt.NewQFormLayout2()
+	form.SetContentsMargins(0, 0, 0, 0)
+	form.AddRow3(labelText, box.QWidget)
+	row := qt.NewQWidget(nil)
+	row.SetLayout(form.QLayout)
+	return box, row
+}
+
+// fileRow builds a read-only path QLineEdit plus a browse QPushButton in one
+// QHBoxLayout, wrapped in the row's own container so IPsec-auth visibility
+// can hide/show it as a whole (see updateIPsecAuthVisibility). The button
+// opens a QFileDialog restricted to an existing file; onChosen is called with
+// the picked path.
+func fileRow(win *qt.QMainWindow, labelText, buttonText string, onChosen func(path string)) (*qt.QLineEdit, *qt.QPushButton, *qt.QWidget) {
+	pathEntry := qt.NewQLineEdit2()
+	pathEntry.SetReadOnly(true)
+
+	btn := qt.NewQPushButton3(buttonText)
+	btn.OnClicked(func() {
+		dlg := qt.NewQFileDialog4(win.QWidget, buttonText)
+		dlg.SetFileMode(qt.QFileDialog__ExistingFile)
+		if dlg.Exec() == int(qt.QDialog__Accepted) {
+			files := dlg.SelectedFiles()
+			if len(files) > 0 {
+				pathEntry.SetText(files[0])
+				onChosen(files[0])
+			}
+		}
+	})
+
+	hbox := qt.NewQHBoxLayout2()
+	hbox.SetContentsMargins(0, 0, 0, 0)
+	hbox.AddWidget(pathEntry.QWidget)
+	hbox.AddWidget(btn.QWidget)
+
+	form := qt.NewQFormLayout2()
+	form.SetContentsMargins(0, 0, 0, 0)
+	form.AddRow4(labelText, hbox.QLayout)
+
+	row := qt.NewQWidget(nil)
+	row.SetLayout(form.QLayout)
+	return pathEntry, btn, row
+}
 
 func (c *Controller) buildProfileBar() {
 	// The profile list used to be a permanent left rail. The left edge is now
-	// navigation, and for the handful of profiles anyone actually keeps a rail was
-	// always a lot of furniture for a one-of-N choice — a selector says the same
-	// thing in one row and puts it beside the fields it governs.
-	c.profileSelect = widget.NewSelect(nil, func(string) {
+	// navigation, and for the handful of profiles anyone actually keeps a
+	// rail was always a lot of furniture for a one-of-N choice — a selector
+	// says the same thing in one row and puts it beside the fields it
+	// governs.
+	c.profileSelect = qt.NewQComboBox2()
+	c.profileSelect.OnCurrentIndexChanged(func(index int) {
 		if c.syncing {
 			return
 		}
-		c.sel = c.profileSelect.SelectedIndex()
+		c.sel = index
 		c.loadProfile(c.sel)
 	})
 
-	addBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), c.addProfile)
-	dupBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), c.duplicateProfile)
-	c.delBtn = widget.NewButtonWithIcon("", theme.DeleteIcon(), c.deleteProfile)
-	delBtn := c.delBtn
-	c.activeBtn = widget.NewButton("Set as active", c.setActive)
-	for _, b := range []*widget.Button{addBtn, dupBtn, delBtn, c.activeBtn} {
-		b.Importance = widget.LowImportance
-	}
+	addBtn := qt.NewQPushButton3("Add")
+	dupBtn := qt.NewQPushButton3("Duplicate")
+	c.delBtn = qt.NewQPushButton3("Delete")
+	c.activeBtn = qt.NewQPushButton3("Set as active")
 
-	label := canvas.NewText("PROFILE", theme.Color(theme.ColorNamePlaceHolder))
-	label.TextSize = theme.Size(theme.SizeNameCaptionText)
-	label.TextStyle = fyne.TextStyle{Bold: true}
+	addBtn.OnClicked(c.addProfile)
+	dupBtn.OnClicked(c.duplicateProfile)
+	c.delBtn.OnClicked(c.deleteProfile)
+	c.activeBtn.OnClicked(c.setActive)
 
-	c.profileBar = container.NewVBox(
-		container.NewBorder(nil, nil, container.NewPadded(label),
-			container.NewHBox(addBtn, dupBtn, delBtn, c.activeBtn), c.profileSelect),
-		widget.NewSeparator(),
-	)
+	label := newCaption("Profile")
+
+	btnRow := qt.NewQHBoxLayout2()
+	btnRow.SetContentsMargins(0, 0, 0, 0)
+	btnRow.AddWidget(addBtn.QWidget)
+	btnRow.AddWidget(dupBtn.QWidget)
+	btnRow.AddWidget(c.delBtn.QWidget)
+	btnRow.AddWidget(c.activeBtn.QWidget)
+
+	top := qt.NewQHBoxLayout2()
+	top.SetContentsMargins(0, 0, 0, 0)
+	top.AddWidget(label.QWidget)
+	top.AddWidget(c.profileSelect.QWidget)
+	top.AddLayout(btnRow.QLayout)
+
+	rootLayout := qt.NewQVBoxLayout2()
+	rootLayout.SetContentsMargins(12, 8, 12, 8)
+	rootLayout.AddLayout(top.QLayout)
+	rootLayout.AddWidget(newSeparator().QWidget)
+
+	root := qt.NewQWidget(nil)
+	root.SetLayout(rootLayout.QLayout)
+	c.profileBar = root
 }
 
-// syncProfileBar repaints the selector from the working copy. syncing suppresses
-// the Select's own OnChanged for the duration: SetSelectedIndex fires it, and
-// without the guard choosing a profile would reload it twice — once from the click
-// and once from this repaint.
+// syncProfileBar repaints the selector from the working copy. syncing
+// suppresses the combo box's own OnCurrentIndexChanged for the duration:
+// Clear/AddItems/SetCurrentIndex all fire it, and without the guard choosing
+// a profile would reload it twice — once from the click and once from this
+// repaint.
 func (c *Controller) syncProfileBar() {
 	names := make([]string, len(c.work.Profiles))
 	for i, p := range c.work.Profiles {
@@ -297,385 +542,542 @@ func (c *Controller) syncProfileBar() {
 		names[i] = name
 	}
 	c.syncing = true
-	c.profileSelect.Options = names
+	c.profileSelect.Clear()
+	c.profileSelect.AddItems(names)
 	if c.sel >= 0 && c.sel < len(names) {
-		c.profileSelect.SetSelectedIndex(c.sel)
+		c.profileSelect.SetCurrentIndex(c.sel)
 	}
 	c.syncing = false
-	c.profileSelect.Refresh()
 
-	// The last profile cannot be deleted. That rule used to be enforced by letting
-	// the user click Delete and then interrupting with a modal to say no — a dialog
-	// whose only job was to refuse. A disabled button states the rule before the
-	// click, and needs no words.
+	// The last profile cannot be deleted. A disabled button states the rule
+	// before the click, and needs no words.
 	if c.delBtn != nil {
-		if canDeleteProfile(len(c.work.Profiles)) {
-			c.delBtn.Enable()
-		} else {
-			c.delBtn.Disable()
-		}
+		c.delBtn.SetEnabled(canDeleteProfile(len(c.work.Profiles)))
 	}
 }
 
-func (c *Controller) buildBasicTab() fyne.CanvasObject {
-	c.nameEntry = widget.NewEntry()
-	c.nameEntry.Validator = func(s string) error { return validateName(s, c.work.Profiles, c.sel) }
-	c.nameEntry.OnChanged = func(s string) {
+// buildConnectionTab builds the Connection tab's rows, in the same visual
+// order as the pre-migration Fyne version: Connection group (name, gateway,
+// port, protocol, IPsec auth, then the conditional PSK/cert/key rows),
+// Authentication group (method, then the conditional note), Startup group
+// (the two checkboxes).
+func (c *Controller) buildConnectionTab() *qt.QWidget {
+	scroll, layout := newScrollableColumn()
+
+	addCaption(layout, "Connection")
+
+	var row *qt.QWidget
+
+	c.nameEntry, c.nameErrLabel, row = validatedRow("Profile name", 0)
+	c.nameEntry.OnTextChanged(func(s string) {
 		if c.loading {
 			return
 		}
-		// renameProfile keeps ActiveProfile pointing at this profile if it was
-		// the active one, so renaming the active profile does not orphan it.
-		renameProfile(c.work, c.sel, s)
+		markInvalid(c.nameEntry, c.nameErrLabel, validateName(s, c.work.Profiles, c.sel))
+	})
+	// The rename itself (and the uniqueness it may collide with) commits on
+	// blur or Save, not on every keystroke — see save()'s pre-commit rename,
+	// which covers Save without a preceding blur.
+	c.nameEntry.OnEditingFinished(func() {
+		if c.loading || c.sel < 0 || c.sel >= len(c.work.Profiles) {
+			return
+		}
+		renameProfile(c.work, c.sel, c.nameEntry.Text())
 		c.syncProfileBar()
-	}
+	})
+	layout.AddWidget(row)
 
-	c.gatewayEntry = widget.NewEntry()
-	c.gatewayEntry.SetPlaceHolder("vpn.example.com")
-	c.gatewayEntry.Validator = hostValidator()
-	c.gatewayEntry.OnChanged = func(s string) {
+	c.gatewayEntry, c.gatewayErrLabel, row = validatedRow("Gateway host", 0)
+	c.gatewayEntry.SetPlaceholderText("vpn.example.com")
+	c.gatewayEntry.OnTextChanged(func(s string) {
+		markInvalid(c.gatewayEntry, c.gatewayErrLabel, validateHost(s))
 		if c.loading {
 			return
 		}
-		c.work.Profiles[c.sel].Gateway = s
-	}
+		if p := c.activeProfile(); p != nil {
+			p.Gateway = s
+		}
+	})
+	layout.AddWidget(row)
 
-	c.portEntry = widget.NewEntry()
-	c.portEntry.Validator = validatePortString
-	c.portEntry.OnChanged = func(s string) {
+	c.portEntry, c.portErrLabel, row = validatedRow("Port", 150)
+	c.portEntry.OnTextChanged(func(s string) {
+		err := validatePortString(s)
+		markInvalid(c.portEntry, c.portErrLabel, err)
 		if c.loading {
 			return
 		}
-		if n, err := parsePort(s); err == nil {
-			c.work.Profiles[c.sel].Port = n
-			// CustomPort is no longer a control the user sees — it is derived from
-			// whether the port differs from the default. It stays in the schema
-			// because FortiClient's EnableCustomPort maps onto it, and because
-			// effectivePort still reads it, but asking someone to tick a box before
-			// they may type a port was two controls for one value.
-			c.work.Profiles[c.sel].CustomPort = n != defaultPort
+		p := c.activeProfile()
+		if p == nil {
+			return
+		}
+		if n, perr := parsePort(s); perr == nil {
+			p.Port = n
+			// CustomPort is no longer a control the user sees — it is
+			// derived from whether the port differs from the default.
+			p.CustomPort = n != defaultPort
 		} else {
-			c.work.Profiles[c.sel].Port = 0 // flagged invalid; Save's validator catches it
-			c.work.Profiles[c.sel].CustomPort = true
+			p.Port = 0 // flagged invalid; Save's validator catches it
+			p.CustomPort = true
 		}
-	}
-
-	c.authSelect = widget.NewSelect(authLabels, func(label string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].Auth.Method = authMethod(label)
-		c.updateAuthNote()
 	})
-	c.authNote = widget.NewLabel("")
-	c.authNote.Importance = widget.WarningImportance
+	layout.AddWidget(row)
 
-	c.backendSelect = widget.NewSelect(backendLabels, func(label string) {
+	c.backendSelect, row = comboRow("Protocol", backendLabels)
+	c.backendSelect.OnCurrentIndexChanged(func(int) {
 		if c.loading {
 			return
 		}
-		c.work.Profiles[c.sel].Backend = backendFromLabel(label)
+		if p := c.activeProfile(); p != nil {
+			p.Backend = backendFromLabel(c.backendSelect.CurrentText())
+		}
 		c.updateIPsecAuthVisibility()
 	})
+	layout.AddWidget(row)
 
-	// Auth sub-field. Only SAML is wired into the runtime; this is shown so the
-	// roadmap is visible but kept disabled (updateAuthNote toggles it), and Save
-	// refuses to activate an unsupported auth method. It still round-trips to
-	// the config so the shape is forward-designed.
-
-	c.authNoteRow = c.row("", c.authNote)
-
-	c.ipsecAuthSelect = widget.NewSelect(ipsecAuthLabels, func(label string) {
+	c.ipsecAuthSelect, row = comboRow("IPsec auth", ipsecAuthLabels)
+	c.ipsecAuthSelect.OnCurrentIndexChanged(func(int) {
 		if c.loading {
 			return
 		}
-		c.work.Profiles[c.sel].IPsec.AuthMethod = ipsecAuthFromLabel(label)
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.AuthMethod = ipsecAuthFromLabel(c.ipsecAuthSelect.CurrentText())
+		}
 		c.updateIPsecAuthVisibility()
 	})
+	layout.AddWidget(row)
 
-	c.ipsecSecretEntry = widget.NewPasswordEntry()
-	c.ipsecSecretEntry.OnChanged = func(v string) {
+	// These rows sit below the group's form, each in its own container, so
+	// the group closes up under whichever IPsec auth fields do not apply
+	// instead of leaving a hole under IPsec auth.
+	c.ipsecSecretEntry, c.ipsecSecretErrLabel, c.ipsecPSKRow = validatedRow("Pre-shared key", 0)
+	c.ipsecSecretEntry.SetEchoMode(qt.QLineEdit__Password)
+	c.ipsecSecretEntry.OnTextChanged(func(v string) {
 		if c.loading {
 			return
 		}
 		c.ipsecSecretDirty[c.sel] = true
 		c.ipsecSecretValue[c.sel] = v
-	}
-
-	c.ipsecCertPathLabel = widget.NewLabel("")
-	c.ipsecCertPathButton = widget.NewButton("Choose certificate…", func() {
-		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
-			if err != nil || f == nil {
-				return
-			}
-			defer f.Close()
-			c.work.Profiles[c.sel].IPsec.CertPath = f.URI().Path()
-			c.ipsecCertPathLabel.SetText(f.URI().Path())
-		}, c.win)
 	})
+	layout.AddWidget(c.ipsecPSKRow)
 
-	c.ipsecKeyPathLabel = widget.NewLabel("")
-	c.ipsecKeyPathButton = widget.NewButton("Choose private key…", func() {
-		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
-			if err != nil || f == nil {
-				return
-			}
-			defer f.Close()
-			c.work.Profiles[c.sel].IPsec.KeyPath = f.URI().Path()
-			c.ipsecKeyPathLabel.SetText(f.URI().Path())
-		}, c.win)
+	c.ipsecCertPathEntry, c.ipsecCertPathButton, c.ipsecCertRow = fileRow(c.win, "Certificate", "Choose certificate…", func(path string) {
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.CertPath = path
+		}
 	})
+	layout.AddWidget(c.ipsecCertRow)
 
-	c.ipsecPSKRow = c.row("Pre-shared key", c.ipsecSecretEntry)
-	c.ipsecCertRow = c.row("Certificate", container.NewHBox(c.ipsecCertPathButton, c.ipsecCertPathLabel))
-	c.ipsecKeyRow = c.row("Private key", container.NewHBox(c.ipsecKeyPathButton, c.ipsecKeyPathLabel))
+	c.ipsecKeyPathEntry, c.ipsecKeyPathButton, c.ipsecKeyRow = fileRow(c.win, "Private key", "Choose private key…", func(path string) {
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.KeyPath = path
+		}
+	})
+	layout.AddWidget(c.ipsecKeyRow)
 
-	c.autoConnect = widget.NewCheck("Auto-connect at login", func(on bool) {
+	addSeparator(layout)
+	addCaption(layout, "Authentication")
+
+	// Auth sub-field. Only SAML is wired into the runtime; this is shown so
+	// the roadmap is visible but kept as a note (updateAuthNote toggles it),
+	// and Save refuses to activate an unsupported auth method. It still
+	// round-trips to the config so the shape is forward-designed.
+	c.authSelect, row = comboRow("Method", authLabels)
+	c.authSelect.OnCurrentIndexChanged(func(int) {
 		if c.loading {
 			return
 		}
-		c.work.Autostart = on
-		if on {
-			c.work.ActiveProfile = c.work.Profiles[c.sel].Name
-			c.syncProfileBar()
+		if p := c.activeProfile(); p != nil {
+			p.Auth.Method = authMethod(c.authSelect.CurrentText())
 		}
+		c.updateAuthNote()
 	})
+	layout.AddWidget(row)
 
-	c.keepAlive = widget.NewCheck("Keep VPN up (auto-reconnect)", func(on bool) {
+	c.authNote = qt.NewQLabel2()
+	c.authNote.SetWordWrap(true)
+	setRole(c.authNote, "warning")
+	noteLayout := qt.NewQVBoxLayout2()
+	noteLayout.SetContentsMargins(0, 0, 0, 0)
+	noteLayout.AddWidget(c.authNote.QWidget)
+	c.authNoteRow = qt.NewQWidget(nil)
+	c.authNoteRow.SetLayout(noteLayout.QLayout)
+	layout.AddWidget(c.authNoteRow)
+
+	addSeparator(layout)
+	addCaption(layout, "Startup")
+
+	c.autoConnect = qt.NewQCheckBox3("Auto-connect at login")
+	c.autoConnect.OnToggled(func(checked bool) {
 		if c.loading {
 			return
 		}
-		c.work.Profiles[c.sel].KeepAlive = on
+		c.work.Autostart = checked
+		if checked {
+			if p := c.activeProfile(); p != nil {
+				c.work.ActiveProfile = p.Name
+				c.syncProfileBar()
+			}
+		}
 	})
+	layout.AddWidget(c.autoConnect.QWidget)
 
-	// Same twelve fields, same order — grouped under captions instead of dumped in
-	// one column. The grouping is the whole change: a flat twelve-row form gives a
-	// reader no way to tell which fields belong together, and "Realm" next to
-	// "Auto-connect at login" implies a relationship that does not exist.
-	//
-	// Connection is built from group (not the section helper) so the IPsec
-	// auth/secret/cert rows can sit right under Protocol, the control that
-	// triggers them, the same way Authentication already mixes a form with a
-	// conditional row below it. Using section here would only accept FormItems
-	// and force those rows away from the field they explain.
-	connectionForm := widget.NewForm(
-		widget.NewFormItem("Profile name", c.nameEntry),
-		widget.NewFormItem("Gateway host", c.gatewayEntry),
-		widget.NewFormItem("Port", narrow(c.portEntry, 150)),
-		widget.NewFormItem("Protocol", c.backendSelect),
-		widget.NewFormItem("IPsec auth", c.ipsecAuthSelect),
-	)
-	c.forms = append(c.forms, connectionForm)
+	c.keepAlive = qt.NewQCheckBox3("Keep VPN up (auto-reconnect)")
+	c.keepAlive.OnToggled(func(checked bool) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.KeepAlive = checked
+		}
+	})
+	layout.AddWidget(c.keepAlive.QWidget)
 
-	return sections(
-		c.group("Connection",
-			connectionForm,
-			// These rows sit outside that form, each in its own container, so
-			// the group closes up under whichever IPsec auth fields do not
-			// apply instead of leaving a hole under IPsec auth.
-			c.ipsecPSKRow,
-			c.ipsecCertRow,
-			c.ipsecKeyRow,
-		),
-		c.group("Authentication",
-			c.row("Method", c.authSelect),
-			// The conditional row sits outside that form, in its own container,
-			// so the group closes up under SAML instead of leaving a hole.
-			c.authNoteRow,
-		),
-		c.section("Startup",
-			widget.NewFormItem("", c.autoConnect),
-			widget.NewFormItem("", c.keepAlive),
-		),
-	)
+	layout.AddStretch()
+	c.connectionLayout = layout
+	return scroll.QWidget
 }
 
-// section is one captioned group of form rows: an uppercase caption in the muted
-// foreground, then the rows.
-//
-// The caption is plain uppercase with no letter-spacing. fyne offers no tracking,
-// and the usual hack — inserting spaces between characters — breaks text selection
-// and reads the letters out individually to a screen reader, which is a real cost
-// for a cosmetic gain.
-func (c *Controller) section(caption string, items ...*widget.FormItem) fyne.CanvasObject {
-	form := widget.NewForm(items...)
-	c.forms = append(c.forms, form)
-	return c.group(caption, form)
+// buildAdvancedTab builds the Advanced tab: dual-stack, DTLS, session reuse,
+// the server-cert mode combo (+ conditional fingerprint field), split-DNS
+// domains, the IPsec proposal/identity fields, the SAML redirect port, the
+// machine-wide openconnect path and the read-only helper path — in the same
+// order as the pre-migration Fyne version.
+func (c *Controller) buildAdvancedTab() *qt.QWidget {
+	scroll, layout := newScrollableColumn()
+
+	var row *qt.QWidget
+
+	addCaption(layout, "Tunnel")
+	c.dualStack = qt.NewQCheckBox3("Enable IPv6 / dual-stack")
+	c.dualStack.OnToggled(func(checked bool) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.DualStack = checked
+		}
+	})
+	layout.AddWidget(c.dualStack.QWidget)
+
+	c.dtls = qt.NewQCheckBox3("Prefer DTLS (UDP)")
+	c.dtls.OnToggled(func(checked bool) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.DTLS = checked
+		}
+	})
+	layout.AddWidget(c.dtls.QWidget)
+
+	addSeparator(layout)
+	addCaption(layout, "Session")
+	c.rememberSession = qt.NewQCheckBox3("Reuse session to avoid re-login")
+	c.rememberSession.OnToggled(func(checked bool) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.RememberSession = checked
+		}
+	})
+	layout.AddWidget(c.rememberSession.QWidget)
+	layout.AddWidget(newNote("Skips the browser login while the session is valid; off never stores it.").QWidget)
+
+	addSeparator(layout)
+	addCaption(layout, "Server certificate")
+	// The old "Trust (accept invalid)" option was removed upstream (see
+	// logic.go's certModeLabels doc): only Warn and Pin remain.
+	c.certMode, row = comboRow("Verification", certModeLabels)
+	c.certMode.OnCurrentIndexChanged(func(int) {
+		if c.loading {
+			return
+		}
+		mode := certMode(c.certMode.CurrentText())
+		if p := c.activeProfile(); p != nil {
+			p.ServerCert.Mode = mode
+		}
+		c.applyCertMode(mode)
+	})
+	layout.AddWidget(row)
+
+	c.certPin, c.certPinErrLabel, c.certPinRow = validatedRow("Fingerprint", 0)
+	c.certPin.SetPlaceholderText("e.g. sha256:AB:CD:...")
+	c.certPin.OnTextChanged(func(s string) {
+		markInvalid(c.certPin, c.certPinErrLabel, fingerprintCharset(s))
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.ServerCert.Pin = s
+		}
+	})
+	layout.AddWidget(c.certPinRow)
+
+	addSeparator(layout)
+	addCaption(layout, "DNS")
+	c.splitDNS = qt.NewQPlainTextEdit2()
+	c.splitDNS.SetPlaceholderText("one domain per line, e.g.\ncorp.example.com\ninternal")
+	c.splitDNS.SetFixedHeight(90)
+	c.splitDNS.OnTextChanged(func() {
+		text := c.splitDNS.ToPlainText()
+		markInvalid(c.splitDNS, c.splitDNSErrLabel, validateSplitDNSText(text))
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.SplitDNS = parseSplitDNS(text)
+		}
+	})
+	splitDNSForm := qt.NewQFormLayout2()
+	splitDNSForm.SetContentsMargins(0, 0, 0, 0)
+	splitDNSForm.AddRow3("Split-DNS domains", c.splitDNS.QWidget)
+	var splitDNSRow *qt.QWidget
+	c.splitDNSErrLabel, splitDNSRow = wrapWithError(splitDNSForm)
+	layout.AddWidget(splitDNSRow)
+	// The scoped /etc/resolver install/remove that makes these domains
+	// resolve through the tunnel goes through the privileged helper (see
+	// tunnel.splitDNSEnabled), which is macOS and Linux only — on Windows
+	// these domains are stored and not applied, which is the thing a user
+	// actually needs told.
+	layout.AddWidget(newNote("Looked up through the VPN's DNS. macOS and Linux only; stored but not applied on Windows.").QWidget)
+
+	addSeparator(layout)
+	addCaption(layout, "IPsec")
+
+	c.ikeProposalEntry, row = plainRow("IKE proposal")
+	c.ikeProposalEntry.OnTextChanged(func(s string) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.IKEProposal = s
+		}
+	})
+	layout.AddWidget(row)
+
+	c.espProposalEntry, row = plainRow("ESP proposal")
+	c.espProposalEntry.OnTextChanged(func(s string) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.ESPProposal = s
+		}
+	})
+	layout.AddWidget(row)
+
+	c.localIDEntry, row = plainRow("Local ID")
+	c.localIDEntry.OnTextChanged(func(s string) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.LocalID = s
+		}
+	})
+	layout.AddWidget(row)
+
+	c.remoteIDEntry, row = plainRow("Remote ID")
+	c.remoteIDEntry.OnTextChanged(func(s string) {
+		if c.loading {
+			return
+		}
+		if p := c.activeProfile(); p != nil {
+			p.IPsec.RemoteID = s
+		}
+	})
+	layout.AddWidget(row)
+
+	addSeparator(layout)
+	addCaption(layout, "Paths")
+
+	c.samlPortEntry, c.samlPortErrLabel, row = validatedRow("SAML redirect port", 150)
+	c.samlPortEntry.OnTextChanged(func(s string) {
+		err := validatePortString(s)
+		markInvalid(c.samlPortEntry, c.samlPortErrLabel, err)
+		if c.loading {
+			return
+		}
+		p := c.activeProfile()
+		if p == nil {
+			return
+		}
+		if n, perr := parsePort(s); perr == nil {
+			p.SAMLPort = n
+		} else {
+			p.SAMLPort = 0 // flagged invalid; Save's validator catches it
+		}
+	})
+	layout.AddWidget(row)
+
+	c.openconnectPath, c.openconnectPathErrLabel, row = validatedRow("openconnect binary", 0)
+	c.openconnectPath.OnTextChanged(func(s string) {
+		markInvalid(c.openconnectPath, c.openconnectPathErrLabel, openconnectPathEntryValidator(s))
+		if c.loading {
+			return
+		}
+		c.work.OpenconnectPath = s
+	})
+	layout.AddWidget(row)
+	layout.AddWidget(newNote("Only used on Windows; macOS/Linux dial through the privileged helper.").QWidget)
+
+	// Read-only: the sudoers rule is scoped to exactly this path, so editing
+	// it here without re-running install.sh would break sudo. Shown for
+	// reference only.
+	c.helperPath = qt.NewQLabel2()
+	helperForm := qt.NewQFormLayout2()
+	helperForm.SetContentsMargins(0, 0, 0, 0)
+	helperForm.AddRow3("Privileged helper", c.helperPath.QWidget)
+	helperRow := qt.NewQWidget(nil)
+	helperRow.SetLayout(helperForm.QLayout)
+	layout.AddWidget(helperRow)
+
+	helperNote := newNote("Changing this requires re-running scripts/install.sh.")
+	setRole(helperNote, "warning")
+	layout.AddWidget(helperNote.QWidget)
+
+	layout.AddStretch()
+	c.advancedLayout = layout
+	return scroll.QWidget
 }
 
-// show reveals or hides one of those rows. A nil row is tolerated so the
-// build order does not have to be perfect.
-//
-// Hiding is only half the job — see (*Controller).relayout.
-func show(row *fyne.Container, visible bool) {
-	if row == nil {
+// applyCertMode reveals the fingerprint row only when the Pin mode is chosen.
+// Its validator tolerates empty so a hidden field never blocks the form.
+func (c *Controller) applyCertMode(mode config.ServerCertMode) {
+	pin := mode == config.CertPin
+	c.certPinRow.SetVisible(pin)
+	c.certPin.SetEnabled(pin)
+	c.relayout()
+}
+
+// updateAuthNote refreshes the auth-method warning shown next to the Method
+// combo box. This is only the visual affordance shown before the user even
+// tries to Save; the real gate is validateAuthSupported, which Save and
+// Connect both run regardless of what this note says.
+func (c *Controller) updateAuthNote() {
+	p := c.activeProfile()
+	if p == nil {
 		return
 	}
-	if visible {
-		row.Show()
-	} else {
-		row.Hide()
-	}
-	row.Refresh()
+	text := authMethodNoteText(p.Auth.Method)
+	c.authNote.SetText(text)
+	c.authNoteRow.SetVisible(text != "")
+	c.relayout()
 }
 
-// relayout re-lays out the tabs after a row's visibility changed.
-//
-// Hiding a widget in fyne does NOT relayout its ancestors. A container keeps the
-// size it computed while the child was still visible, and its own MinSize quietly
-// drops without anything acting on the difference. The rows are hidden during the
-// first loadProfile, which runs AFTER build, so the Authentication group was laid
-// out at 210px while reporting a minimum of 93 — leaving a 120px hole between
-// "Method" and "Realm" that looked exactly like a spacing bug and was not.
-//
-// Measured, not guessed: the group's laid-out size and MinSize disagreed by the
-// combined height of the three hidden rows.
+// updateIPsecAuthVisibility shows the PSK row XOR the cert+key rows based on
+// the working copy's chosen IPsec auth method, and hides all three entirely
+// when the active profile is not an IPsec profile — an SSL profile has no
+// reason to show any IPsec field. Called from the backendSelect and
+// ipsecAuthSelect handlers, and from loadProfile.
+func (c *Controller) updateIPsecAuthVisibility() {
+	p := c.activeProfile()
+	if p == nil {
+		return
+	}
+	isIPsec := p.Backend == config.BackendIPsec
+	isCert := p.IPsec.AuthMethod == config.IPsecAuthCert
+	c.ipsecPSKRow.SetVisible(isIPsec && !isCert)
+	c.ipsecCertRow.SetVisible(isIPsec && isCert)
+	c.ipsecKeyRow.SetVisible(isIPsec && isCert)
+	c.relayout()
+}
+
+// relayout forces both tabs' outer layouts to re-run their geometry pass
+// after a row's visibility changed. Empirically, Qt's QVBoxLayout already
+// reclaims a hidden child's space on its own (verified with a throwaway
+// SizeHint() check before/after SetVisible(false) during implementation), so
+// this is a defensive no-op in the common case rather than a load-bearing
+// workaround — but it costs nothing and protects against a layout that
+// someday doesn't.
 func (c *Controller) relayout() {
-	for _, o := range []fyne.CanvasObject{c.basic, c.advanced} {
-		if o != nil {
-			o.Refresh()
-		}
+	if c.connectionLayout != nil {
+		c.connectionLayout.Activate()
+	}
+	if c.advancedLayout != nil {
+		c.advancedLayout.Activate()
 	}
 }
 
-// narrow caps a field's width and left-aligns it, for values whose length is known
-// and short. A form stretches every field to the full column, so a five-digit port
-// got the same width as a hostname — which tells the reader nothing about what
-// belongs in it, and makes a settings pane look like a generated form rather than a
-// designed one.
-// The width must leave room for the validation tick a validated Entry draws
-// INSIDE its own box: at 110px the digits and the tick collided.
-func narrow(o fyne.CanvasObject, w float32) fyne.CanvasObject {
-	return container.NewHBox(
-		container.New(layout.NewGridWrapLayout(fyne.NewSize(w, 34)), o),
-		layout.NewSpacer(),
-	)
-}
-
-// group is a captioned stack of arbitrary objects, for the groups that mix a form
-// with rows that come and go (see row).
-func (c *Controller) group(caption string, objs ...fyne.CanvasObject) fyne.CanvasObject {
-	label := canvas.NewText(strings.ToUpper(caption), theme.Color(theme.ColorNamePlaceHolder))
-	label.TextSize = theme.Size(theme.SizeNameCaptionText)
-	label.TextStyle = fyne.TextStyle{Bold: true}
-	return container.NewVBox(append([]fyne.CanvasObject{label}, objs...)...)
-}
-
-// row builds a single form row inside its own container, so it can be hidden
-// COMPLETELY — label, widget and the vertical space they occupied.
-//
-// This is the only arrangement that works. Hiding a FormItem's widget leaves its
-// label drawn beside empty space; blanking item.Text as well removes the text but
-// fyne's form layout still reserves the row's height, so the Authentication group
-// kept a three-row hole under SAML — which is every real install. A hidden
-// container is skipped by the enclosing VBox entirely, which is what "hidden"
-// should have meant in the first place.
-func (c *Controller) row(label string, w fyne.CanvasObject) *fyne.Container {
-	form := widget.NewForm(widget.NewFormItem(label, w))
-	c.forms = append(c.forms, form)
-	return container.NewVBox(form)
-}
-
-// sections stacks captioned groups with a separator between them, inside a
-// scroller so a tab taller than the window stays reachable — the Advanced tab is,
-// on a small display.
-func sections(groups ...fyne.CanvasObject) fyne.CanvasObject {
-	objs := make([]fyne.CanvasObject, 0, len(groups)*2)
-	for i, g := range groups {
-		if i > 0 {
-			objs = append(objs, widget.NewSeparator())
-		}
-		objs = append(objs, g)
-	}
-	return container.NewVScroll(container.NewPadded(container.NewVBox(objs...)))
-}
-
-// buildActionStrip builds the footer: connection state on the left, the two save
-// actions and Cancel on the right.
-//
-// Connect and Disconnect USED to live here, making five equal-weight buttons in one
-// row with no hierarchy at all. They are gone: driving the tunnel is the tray's job
-// and the status window's job, and a settings window's job is settings. Every
-// surface having every control is what "nothing has a meaningful place" looks like.
-// The state text stays, because knowing whether a change will disrupt a live tunnel
-// is genuinely settings context.
-func (c *Controller) buildActionStrip() fyne.CanvasObject {
-	c.statusText = canvas.NewText("Disconnected", colorFor(statusGray))
-	c.statusText.TextSize = theme.Size(theme.SizeNameCaptionText)
-	c.statusText.TextStyle = fyne.TextStyle{Bold: true}
-
-	// One high-importance action. Save & Reconnect is the same commit plus a tunnel
-	// bounce, so it reads as a variant of Save rather than a rival to it; Cancel is
-	// quietest because discarding is never what someone came here to do.
-	saveBtn := widget.NewButton("Save", func() { c.save(false) })
-	saveBtn.Importance = widget.HighImportance
-	c.reconnectBtn = widget.NewButton("Save & Reconnect", func() { c.save(true) })
-	c.reconnectBtn.Importance = widget.MediumImportance
-	cancelBtn := widget.NewButton("Cancel", c.cancel)
-	cancelBtn.Importance = widget.LowImportance
-
-	c.savedNote = canvas.NewText("", theme.Color(theme.ColorNameSuccess))
-	c.savedNote.TextSize = theme.Size(theme.SizeNameCaptionText)
-	c.savedNote.TextStyle = fyne.TextStyle{Bold: true}
-	c.savedNote.Hide()
-
-	buttons := container.NewHBox(c.savedNote, cancelBtn, c.reconnectBtn, saveBtn)
-	return container.NewBorder(widget.NewSeparator(), nil,
-		container.NewPadded(c.statusText), container.NewPadded(buttons))
-}
-
-// buildBanner constructs the persistent inline banner shown at the top of the
-// window when Connect is refused: a warning icon, a bold wrapping message, and a
-// dismiss button, over a subtle amber background that reads on both light and
-// dark themes. It starts hidden; ShowIssue fills and reveals it.
 func (c *Controller) buildBanner() {
-	c.bannerLabel = widget.NewLabel("")
-	c.bannerLabel.Wrapping = fyne.TextWrapWord
-	c.bannerLabel.TextStyle = fyne.TextStyle{Bold: true}
+	c.bannerLabel = qt.NewQLabel2()
+	c.bannerLabel.SetWordWrap(true)
 
-	// The banner ground is the theme's warning colour at low alpha, so it tracks the
-	// OS light/dark setting instead of being an amber mixed for one of them.
-	bg := canvas.NewRectangle(withAlpha(theme.Color(theme.ColorNameWarning), 0x33))
-	icon := widget.NewIcon(theme.WarningIcon())
-	dismiss := widget.NewButtonWithIcon("", theme.CancelIcon(), c.hideBanner)
-	dismiss.Importance = widget.LowImportance
+	dismiss := qt.NewQPushButton3("Dismiss")
+	dismiss.OnClicked(c.hideBanner)
 
-	inner := container.NewBorder(nil, nil, icon, dismiss, container.NewPadded(c.bannerLabel))
-	c.banner = container.NewStack(bg, container.NewPadded(inner))
-	c.banner.Hide()
-}
+	inner := qt.NewQHBoxLayout2()
+	inner.SetContentsMargins(12, 8, 12, 8)
+	inner.AddWidget(c.bannerLabel.QWidget)
+	inner.AddWidget(dismiss.QWidget)
 
-// withAlpha returns c at the given alpha, for the translucent washes (the banner
-// ground) that must still follow the theme's hue.
-func withAlpha(c color.Color, a uint8) color.Color {
-	r, g, b, _ := c.RGBA()
-	return color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: a}
+	root := qt.NewQWidget(nil)
+	root.SetLayout(inner.QLayout)
+	// A subtle warning-colored wash, translucent so it tracks the OS
+	// light/dark setting the way the rest of the app's chrome does rather
+	// than being a color mixed for only one of them.
+	root.SetStyleSheet("background: rgba(224, 161, 64, 0.20); border-radius: 6px;")
+	root.SetVisible(false)
+	c.banner = root
 }
 
 // showBanner fills the banner with msg and reveals it.
 func (c *Controller) showBanner(msg string) {
 	c.bannerLabel.SetText(msg)
-	c.banner.Show()
-	c.banner.Refresh()
+	c.banner.SetVisible(true)
 }
 
-// hideBanner dismisses the banner. Wired to the dismiss button and called after
-// a successful Save (the issue it named is resolved).
+// hideBanner dismisses the banner. Wired to the dismiss button and called
+// after a successful Save (the issue it named is resolved).
 func (c *Controller) hideBanner() {
-	c.banner.Hide()
-	c.banner.Refresh()
+	c.banner.SetVisible(false)
 }
 
-// ShowIssue reveals the settings window and guides the user straight to the
+// buildFieldTargets maps every Field* constant (see logic.go) to the
+// widget(s) ShowIssue must mark invalid (where the field has an error
+// affordance) and focus. Must run after every widget it references has been
+// built.
+func (c *Controller) buildFieldTargets() {
+	c.fieldTargets = map[string]fieldTarget{
+		FieldGateway: {
+			mark:  func(err error) { markInvalid(c.gatewayEntry, c.gatewayErrLabel, err) },
+			focus: c.gatewayEntry.SetFocus,
+		},
+		FieldPort: {
+			mark:  func(err error) { markInvalid(c.portEntry, c.portErrLabel, err) },
+			focus: c.portEntry.SetFocus,
+		},
+		// Selects have no error affordance; the banner names the fix.
+		FieldBackend: {focus: c.backendSelect.SetFocus},
+		FieldAuth:    {focus: c.authSelect.SetFocus},
+		FieldServerCert: {
+			mark:  func(err error) { markInvalid(c.certPin, c.certPinErrLabel, err) },
+			focus: c.certPin.SetFocus,
+		},
+		FieldSplitDNS: {
+			mark:  func(err error) { markInvalid(c.splitDNS, c.splitDNSErrLabel, err) },
+			focus: c.splitDNS.SetFocus,
+		},
+		FieldIPsecAuth: {focus: c.ipsecAuthSelect.SetFocus},
+		FieldIPsecSecret: {
+			mark:  func(err error) { markInvalid(c.ipsecSecretEntry, c.ipsecSecretErrLabel, err) },
+			focus: c.ipsecSecretEntry.SetFocus,
+		},
+		// The IPsec cert/key fields are buttons, not entries, so they too are
+		// only focused — the banner names the file to choose.
+		FieldIPsecCertPath: {focus: c.ipsecCertPathButton.SetFocus},
+		FieldIPsecKeyPath:  {focus: c.ipsecKeyPathButton.SetFocus},
+	}
+}
+
+// ShowIssue reveals the settings content and guides the user straight to the
 // field blocking Connect. It re-syncs the form to the saved config first —
 // Connect dials what is saved, not any unsaved edits, so the guidance must
 // match the saved profile — then selects the issue's profile, switches to its
 // tab, marks the offending field invalid and focuses it, and raises the
 // persistent banner naming the exact fix.
-//
-// It mutates widgets, so it must run on the UI goroutine. Both Connect entry
-// points that reach it (the tray's Connect item and the window's Connect
-// button) already run there, so it takes no lock and does no fyne.Do of its own.
 func (c *Controller) ShowIssue(issue *Issue) {
 	if issue == nil {
 		return
@@ -689,66 +1091,45 @@ func (c *Controller) ShowIssue(issue *Issue) {
 	c.showBanner(issue.Message)
 }
 
-// selectTab switches the Basic/Advanced container to the tab an issue lives on.
+// selectTab asks the shell to show the tab an issue lives on.
 func (c *Controller) selectTab(tab string) {
 	if c.navigate != nil {
 		c.navigate(tab)
 	}
 }
 
-// markField puts the issue's field into its validation-error state and focuses
-// it. Entries are marked via AlwaysShowValidationError with an explicit error,
-// so even the empty-gateway case — which the entry's own validator deliberately
-// accepts (an unconfigured profile is savable) — still shows as invalid. The
-// backend and auth controls are Selects with no error affordance, so they are
-// only focused; the banner carries the "choose SSL VPN" / "choose SAML / SSO"
-// instruction. The IPsec cert/key fields are buttons, not entries, so they too
-// are only focused — the banner names the file to choose.
+// markField puts the issue's field into its validation-error state (where it
+// has one) and focuses it.
 func (c *Controller) markField(issue *Issue) {
-	var focus fyne.Focusable
-	switch issue.Field {
-	case FieldGateway:
-		markEntryInvalid(c.gatewayEntry, "a gateway host is required")
-		focus = c.gatewayEntry
-	case FieldPort:
-		markEntryInvalid(c.portEntry, "enter a port between 1 and 65535")
-		focus = c.portEntry
-	case FieldBackend:
-		focus = c.backendSelect
-	case FieldAuth:
-		focus = c.authSelect
-	case FieldServerCert:
-		markEntryInvalid(c.certPin, "a fingerprint is required to pin the certificate")
-		focus = c.certPin
-	case FieldSplitDNS:
-		markEntryInvalid(c.splitDNS, "one domain per line, e.g. corp.example.com")
-		focus = c.splitDNS
-	case FieldIPsecAuth:
-		focus = c.ipsecAuthSelect
-	case FieldIPsecSecret:
-		markEntryInvalid(c.ipsecSecretEntry, "a pre-shared key is required")
-		focus = c.ipsecSecretEntry
-	case FieldIPsecCertPath:
-		focus = c.ipsecCertPathButton
-	case FieldIPsecKeyPath:
-		focus = c.ipsecKeyPathButton
+	target, ok := c.fieldTargets[issue.Field]
+	if !ok {
+		return
 	}
-	if focus != nil {
-		c.win.Canvas().Focus(focus)
+	if target.mark != nil {
+		target.mark(errors.New(issue.Message))
+	}
+	if target.focus != nil {
+		target.focus()
 	}
 }
 
-// markEntryInvalid forces an entry into its error state. AlwaysShowValidationError
-// makes SetValidationError stick even when the entry validator would accept the
-// current text (as the gateway validator accepts empty); the error clears the
-// moment the user types a value the validator accepts.
-func markEntryInvalid(e *widget.Entry, msg string) {
-	e.AlwaysShowValidationError = true
-	e.SetValidationError(errors.New(msg))
+// clearFieldErrors resets every validated field's error state. Called at the
+// start of loadProfile so a stale invalid mark from a previous ShowIssue (for
+// a different profile, or a since-fixed value) does not linger on screen for
+// a freshly loaded, valid profile.
+func (c *Controller) clearFieldErrors() {
+	markInvalid(c.nameEntry, c.nameErrLabel, nil)
+	markInvalid(c.gatewayEntry, c.gatewayErrLabel, nil)
+	markInvalid(c.portEntry, c.portErrLabel, nil)
+	markInvalid(c.certPin, c.certPinErrLabel, nil)
+	markInvalid(c.splitDNS, c.splitDNSErrLabel, nil)
+	markInvalid(c.ipsecSecretEntry, c.ipsecSecretErrLabel, nil)
+	markInvalid(c.samlPortEntry, c.samlPortErrLabel, nil)
+	markInvalid(c.openconnectPath, c.openconnectPathErrLabel, nil)
 }
 
 // loadProfile paints the form from work.Profiles[i]. loading is set for the
-// duration so the OnChanged handlers do not echo these values back into the
+// duration so the change handlers do not echo these values back into the
 // working copy.
 func (c *Controller) loadProfile(i int) {
 	if i < 0 || i >= len(c.work.Profiles) {
@@ -757,17 +1138,19 @@ func (c *Controller) loadProfile(i int) {
 	c.sel = i
 	p := c.work.Profiles[i]
 	c.loading = true
+	c.clearFieldErrors()
+
 	c.nameEntry.SetText(p.Name)
 	c.gatewayEntry.SetText(p.Gateway)
 	c.portEntry.SetText(itoa(effectivePort(p.CustomPort, p.Port)))
-	c.authSelect.SetSelected(authLabel(p.Auth.Method))
-	c.backendSelect.SetSelected(backendLabel(p.Backend))
+	c.authSelect.SetCurrentText(authLabel(p.Auth.Method))
+	c.backendSelect.SetCurrentText(backendLabel(p.Backend))
 	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 	c.keepAlive.SetChecked(p.KeepAlive)
 
-	c.ipsecAuthSelect.SetSelected(ipsecAuthLabel(p.IPsec.AuthMethod))
-	c.ipsecCertPathLabel.SetText(p.IPsec.CertPath)
-	c.ipsecKeyPathLabel.SetText(p.IPsec.KeyPath)
+	c.ipsecAuthSelect.SetCurrentText(ipsecAuthLabel(p.IPsec.AuthMethod))
+	c.ipsecCertPathEntry.SetText(p.IPsec.CertPath)
+	c.ipsecKeyPathEntry.SetText(p.IPsec.KeyPath)
 	// Never pre-fill a secret field with a stored value — same convention the
 	// SSL password field already follows (were it implemented). The PSK
 	// itself lives in credstore, not in the working copy; what this shows is
@@ -780,10 +1163,10 @@ func (c *Controller) loadProfile(i int) {
 	c.dualStack.SetChecked(p.DualStack)
 	c.dtls.SetChecked(p.DTLS)
 	c.rememberSession.SetChecked(p.RememberSession)
-	c.certMode.SetSelected(certModeLabel(p.ServerCert.Mode))
+	c.certMode.SetCurrentText(certModeLabel(p.ServerCert.Mode))
 	c.certPin.SetText(p.ServerCert.Pin)
 	c.applyCertMode(p.ServerCert.Mode)
-	c.splitDNS.SetText(strings.Join(p.SplitDNS, "\n"))
+	c.splitDNS.SetPlainText(strings.Join(p.SplitDNS, "\n"))
 	c.samlPortEntry.SetText(itoa(effectiveSAMLPort(p.SAMLPort)))
 	c.openconnectPath.SetText(effectiveOpenconnectPath(c.work.OpenconnectPath))
 	c.helperPath.SetText(c.work.HelperPath)
@@ -797,224 +1180,75 @@ func (c *Controller) loadProfile(i int) {
 	c.updateAuthNote()
 }
 
-// updateAuthNote refreshes the auth-method warning shown next to the Method
-// select. This is only the visual affordance shown before the user even tries
-// to Save; the real gate is validateAuthSupported, which Save and Connect both
-// run regardless of what this note says.
-func (c *Controller) updateAuthNote() {
-	p := c.work.Profiles[c.sel]
-	text := authMethodNoteText(p.Auth.Method)
-	c.authNote.SetText(text)
-	show(c.authNoteRow, text != "")
-	c.relayout()
+func (c *Controller) buildActionStrip() *qt.QWidget {
+	c.statusText = qt.NewQLabel3("Disconnected")
+
+	// One high-importance action. Save & Reconnect is the same commit plus a
+	// tunnel bounce, so it reads as a variant of Save rather than a rival to
+	// it; Cancel is quietest because discarding is never what someone came
+	// here to do.
+	saveBtn := qt.NewQPushButton3("Save")
+	saveBtn.OnClicked(func() { c.save(false) })
+
+	c.reconnectBtn = qt.NewQPushButton3("Save & Reconnect")
+	c.reconnectBtn.OnClicked(func() { c.save(true) })
+
+	cancelBtn := qt.NewQPushButton3("Cancel")
+	cancelBtn.OnClicked(c.cancel)
+
+	c.savedNote = qt.NewQLabel2()
+	setRole(c.savedNote, "success")
+	c.savedNote.SetVisible(false)
+
+	layout := qt.NewQHBoxLayout2()
+	layout.SetContentsMargins(12, 8, 12, 8)
+	layout.AddWidget(c.statusText.QWidget)
+	layout.AddStretch()
+	layout.AddWidget(c.savedNote.QWidget)
+	layout.AddWidget(cancelBtn.QWidget)
+	layout.AddWidget(c.reconnectBtn.QWidget)
+	layout.AddWidget(saveBtn.QWidget)
+
+	root := qt.NewQWidget(nil)
+	root.SetLayout(layout.QLayout)
+	return root
 }
 
-// updateIPsecAuthVisibility shows the PSK row XOR the cert+key rows based on
-// the working copy's chosen IPsec auth method, and hides all three entirely
-// when the active profile is not an IPsec profile — an SSL profile has no
-// reason to show any IPsec field. Called from the backendSelect and
-// ipsecAuthSelect callbacks, and from loadProfile.
-func (c *Controller) updateIPsecAuthVisibility() {
-	p := c.work.Profiles[c.sel]
-	isIPsec := p.Backend == config.BackendIPsec
-	isCert := p.IPsec.AuthMethod == config.IPsecAuthCert
-	show(c.ipsecPSKRow, isIPsec && !isCert)
-	show(c.ipsecCertRow, isIPsec && isCert)
-	show(c.ipsecKeyRow, isIPsec && isCert)
-	c.relayout()
-}
+// flashSaved confirms a save in the footer for a couple of seconds. It runs
+// entirely on the Qt UI thread via QTimer's own event-loop callback — Save is
+// already called there, and the timer's timeout fires there too — so, unlike
+// the Fyne version's time.AfterFunc+fyne.Do, no cross-thread marshaling is
+// needed at all.
+func (c *Controller) flashSaved() {
+	if c.savedNote == nil {
+		return
+	}
+	c.savedNote.SetText("Saved")
+	c.savedNote.SetVisible(true)
 
-// buildAdvancedTab builds the Advanced form: dual-stack, DTLS, the server-cert
-// mode radio (+ conditional fingerprint entry), split-DNS domains, SAML redirect
-// port, the machine-wide openconnect path and the read-only helper path.
-func (c *Controller) buildAdvancedTab() fyne.CanvasObject {
-	c.dualStack = widget.NewCheck("Enable IPv6 / dual-stack", func(on bool) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].DualStack = on
+	timer := qt.NewQTimer()
+	timer.SetSingleShot(true)
+	timer.OnTimeout(func() {
+		c.savedNote.SetVisible(false)
+		timer.DeleteLater()
 	})
-	c.dtls = widget.NewCheck("Prefer DTLS (UDP)", func(on bool) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].DTLS = on
-	})
-	c.rememberSession = widget.NewCheck("Reuse session to avoid re-login", func(on bool) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].RememberSession = on
-	})
-
-	c.certPin = widget.NewEntry()
-	c.certPin.SetPlaceHolder("e.g. sha256:AB:CD:...")
-	c.certPin.Validator = fingerprintCharset
-	c.certPin.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].ServerCert.Pin = s
-	}
-	c.certPinRow = c.row("Fingerprint", c.certPin)
-
-	c.certMode = widget.NewRadioGroup(certModeLabels, func(label string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].ServerCert.Mode = certMode(label)
-		c.applyCertMode(certMode(label))
-	})
-
-	c.splitDNS = widget.NewMultiLineEntry()
-	c.splitDNS.SetPlaceHolder("one domain per line, e.g.\ncorp.example.com\ninternal")
-	c.splitDNS.Validator = validateSplitDNSText
-	c.splitDNS.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].SplitDNS = parseSplitDNS(s)
-	}
-	// TODO(task11): SplitDNS is only captured + validated here. The scoped
-	// /etc/resolver install/remove that makes these domains resolve through the
-	// tunnel is a separate task; nothing installs a resolver yet.
-	// The old note said this was "installed in a later release". It is not: the
-	// tunnel installs scoped resolvers through the privileged helper (see
-	// tunnel.splitDNSEnabled). What IS true is that the helper path is macOS and
-	// Linux only, so on Windows these domains are stored and not applied — which is
-	// the thing a user actually needs told.
-	splitDNSNote := widget.NewLabel("Looked up through the VPN's DNS. macOS and Linux only; stored but not applied on Windows.")
-	splitDNSNote.Wrapping = fyne.TextWrapWord
-
-	c.samlPortEntry = widget.NewEntry()
-	c.samlPortEntry.Validator = validatePortString
-	c.samlPortEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		if n, err := parsePort(s); err == nil {
-			c.work.Profiles[c.sel].SAMLPort = n
-		} else {
-			c.work.Profiles[c.sel].SAMLPort = 0 // flagged invalid; Save's validator catches it
-		}
-	}
-
-	c.openconnectPath = widget.NewEntry()
-	c.openconnectPath.Validator = openconnectPathEntryValidator
-	c.openconnectPath.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.OpenconnectPath = s
-	}
-	openconnectNote := widget.NewLabel("Only used on Windows; macOS/Linux dial through the privileged helper.")
-	openconnectNote.Wrapping = fyne.TextWrapWord
-
-	// Read-only: the sudoers rule is scoped to exactly this path, so editing it
-	// here without re-running install.sh would break sudo. Shown for reference.
-	c.helperPath = widget.NewEntry()
-	c.helperPath.Disable()
-	helperNote := widget.NewLabel("Changing this requires re-running scripts/install.sh.")
-	helperNote.Importance = widget.WarningImportance
-	helperNote.Wrapping = fyne.TextWrapWord
-
-	rememberNote := widget.NewLabel("Skips the browser login while the session is valid; off never stores it.")
-	rememberNote.Wrapping = fyne.TextWrapWord
-
-	// IPsec proposal/identity fields. Bound the same way the tab's other
-	// advanced text fields already are. Always visible regardless of Backend —
-	// they're inert (never read) for an SSL profile, matching how every other
-	// forward-designed-but-inactive field in this app already behaves (e.g.
-	// Auth.CertPath for the not-yet-implemented AuthCert method).
-	c.ikeProposalEntry = widget.NewEntry()
-	c.ikeProposalEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].IPsec.IKEProposal = s
-	}
-	c.espProposalEntry = widget.NewEntry()
-	c.espProposalEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].IPsec.ESPProposal = s
-	}
-	c.localIDEntry = widget.NewEntry()
-	c.localIDEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].IPsec.LocalID = s
-	}
-	c.remoteIDEntry = widget.NewEntry()
-	c.remoteIDEntry.OnChanged = func(s string) {
-		if c.loading {
-			return
-		}
-		c.work.Profiles[c.sel].IPsec.RemoteID = s
-	}
-
-	// Same rows, same order, grouped. The Paths group last on purpose: it is where
-	// the two fields live that break the app if they are wrong, so it should not be
-	// the first thing a browsing user reaches for.
-	return sections(
-		c.section("Tunnel",
-			widget.NewFormItem("", c.dualStack),
-			widget.NewFormItem("", c.dtls),
-		),
-		c.section("Session",
-			widget.NewFormItem("", c.rememberSession),
-			widget.NewFormItem("", rememberNote),
-		),
-		c.group("Server certificate",
-			c.row("Verification", c.certMode),
-			// Its own container, so the group closes up when the certificate is not
-			// pinned rather than leaving a reserved empty row.
-			c.certPinRow,
-		),
-		c.section("DNS",
-			widget.NewFormItem("Split-DNS domains", c.splitDNS),
-			widget.NewFormItem("", splitDNSNote),
-		),
-		c.section("IPsec",
-			widget.NewFormItem("IKE proposal", c.ikeProposalEntry),
-			widget.NewFormItem("ESP proposal", c.espProposalEntry),
-			widget.NewFormItem("Local ID", c.localIDEntry),
-			widget.NewFormItem("Remote ID", c.remoteIDEntry),
-		),
-		c.section("Paths",
-			widget.NewFormItem("SAML redirect port", narrow(c.samlPortEntry, 150)),
-			widget.NewFormItem("openconnect binary", c.openconnectPath),
-			widget.NewFormItem("", openconnectNote),
-			widget.NewFormItem("Privileged helper", c.helperPath),
-			widget.NewFormItem("", helperNote),
-		),
-	)
-}
-
-// applyCertMode reveals the fingerprint entry only when the Pin mode is chosen.
-// Hiding the FormItem keeps the fingerprint out of sight for the other modes;
-// its validator tolerates empty so a hidden field never blocks the form.
-func (c *Controller) applyCertMode(mode config.ServerCertMode) {
-	if mode == config.CertPin {
-		show(c.certPinRow, true)
-		c.certPin.Enable()
-	} else {
-		c.certPin.Disable()
-		show(c.certPinRow, false)
-	}
-	c.relayout()
+	timer.Start(2000)
 }
 
 func (c *Controller) save(reconnect bool) {
+	// Commit the profile name even if the user has not blurred the field
+	// yet — OnEditingFinished only fires on blur/Enter (see the field-mapping
+	// table), so Save must also apply whatever is currently typed.
+	if c.sel >= 0 && c.sel < len(c.work.Profiles) {
+		renameProfile(c.work, c.sel, c.nameEntry.Text())
+	}
+
 	work := cloneConfig(c.work)
 	normalizePorts(work)
-	// Failures land in the inline banner rather than a modal. The banner sits above
-	// the very fields the message is about, stays up until the problem is dealt with,
-	// and does not have to be dismissed before the user can act on it — all three of
-	// which a modal gets wrong. The mechanism already existed for refused Connects;
-	// there was no reason Save had its own, worse channel.
+	// Failures land in the inline banner rather than a modal. The banner sits
+	// above the very fields the message is about, stays up until the problem
+	// is dealt with, and does not have to be dismissed before the user can
+	// act on it — all three of which a modal gets wrong.
 	if err := validateConfig(work); err != nil {
 		c.showBanner(err.Error())
 		return
@@ -1023,15 +1257,14 @@ func (c *Controller) save(reconnect bool) {
 		c.showBanner("Could not save: " + err.Error())
 		return
 	}
-	// Persist EVERY profile's IPsec PSK secret with an unsaved edit — not just
-	// the one currently shown in the form. Like the SSL password/cookie, a PSK
-	// is never stored in config.json — only in credstore, keyed by gateway
-	// (config.IPsecPSKCredstoreKey). ipsecSecretDirty/ipsecSecretValue are
-	// keyed by profile index specifically so switching the profile dropdown
-	// does not lose an edit made to another profile; Save must honor that by
-	// writing each dirty entry to ITS OWN profile's credstore key, not just
-	// c.sel's — reading only c.sel here silently dropped every other dirty
-	// profile's PSK on the next reset() (Cancel or reopening Settings).
+	// Persist EVERY profile's IPsec PSK secret with an unsaved edit — not
+	// just the one currently shown in the form. Like the SSL password/cookie,
+	// a PSK is never stored in config.json — only in credstore, keyed by
+	// gateway (config.IPsecPSKCredstoreKey). ipsecSecretDirty/ipsecSecretValue
+	// are keyed by profile index specifically so switching the profile
+	// dropdown does not lose an edit made to another profile; Save must
+	// honor that by writing each dirty entry to ITS OWN profile's credstore
+	// key, not just c.sel's.
 	for idx, dirty := range c.ipsecSecretDirty {
 		if !dirty || idx < 0 || idx >= len(c.work.Profiles) {
 			continue // stale/cleared entry; skip rather than index out of range
@@ -1046,43 +1279,25 @@ func (c *Controller) save(reconnect bool) {
 		}
 		// Persisted: drop the plaintext from memory rather than leaving it
 		// sitting in the map for the life of the window. Safe to delete the
-		// current key while ranging over the same map (see the Go spec on map
-		// iteration).
+		// current key while ranging over the same map (see the Go spec on
+		// map iteration).
 		delete(c.ipsecSecretDirty, idx)
 		delete(c.ipsecSecretValue, idx)
 	}
 	// Keep the visible working copy consistent with what was just persisted.
 	c.work = cloneConfig(work)
-	// The config now validates, so any Connect-issue banner it raised is stale.
+	// The config now validates, so any Connect-issue banner it raised is
+	// stale.
 	c.hideBanner()
 	if reconnect {
-		// Reaching a running tunnel with the new settings: tear the current one
-		// down and bring it back up so the supervisor re-reads the active profile.
+		// Reaching a running tunnel with the new settings: tear the current
+		// one down and bring it back up so the supervisor re-reads the
+		// active profile.
 		c.host.Disconnect()
 		c.host.Connect()
 		return
 	}
 	c.flashSaved()
-}
-
-// flashSaved confirms a save in the footer for a couple of seconds.
-//
-// It replaces a modal that said "Settings saved." and had to be dismissed. A modal
-// for success is the purest form of interruption: it tells the user something went
-// right, and then makes them click to admit it.
-func (c *Controller) flashSaved() {
-	if c.savedNote == nil {
-		return
-	}
-	c.savedNote.Text = "Saved"
-	c.savedNote.Show()
-	c.savedNote.Refresh()
-	time.AfterFunc(2*time.Second, func() {
-		fyne.Do(func() {
-			c.savedNote.Hide()
-			c.savedNote.Refresh()
-		})
-	})
 }
 
 func (c *Controller) cancel() {
@@ -1096,12 +1311,15 @@ func (c *Controller) addProfile() {
 	c.sel = len(c.work.Profiles) - 1
 	c.syncProfileBar()
 	c.loadProfile(c.sel)
-	c.win.Canvas().Focus(c.nameEntry)
+	c.nameEntry.SetFocus()
 }
 
 func (c *Controller) duplicateProfile() {
-	src := c.work.Profiles[c.sel]
-	dup := *cloneProfile(&src)
+	src := c.activeProfile()
+	if src == nil {
+		return
+	}
+	dup := *cloneProfile(src)
 	dup.Name = uniqueName(src.Name+" copy", c.work.Profiles)
 	c.work.Profiles = append(c.work.Profiles, dup)
 	c.sel = len(c.work.Profiles) - 1
@@ -1110,42 +1328,42 @@ func (c *Controller) duplicateProfile() {
 }
 
 func (c *Controller) deleteProfile() {
-	// Guarded by the disabled button; kept as a belt-and-braces return rather than a
-	// dialog, because a refusal is not news worth a modal.
+	// Guarded by the disabled button; kept as a belt-and-braces return rather
+	// than a dialog, because a refusal is not news worth a modal.
 	if !canDeleteProfile(len(c.work.Profiles)) {
 		return
 	}
-	victim := c.work.Profiles[c.sel]
-	dialog.ShowConfirm("Delete profile",
-		"Delete the profile \""+victim.Name+"\"?",
-		func(ok bool) {
-			if !ok {
-				return
-			}
-			removed := c.sel
-			c.work.Profiles = append(c.work.Profiles[:c.sel], c.work.Profiles[c.sel+1:]...)
-			c.reindexIPsecSecrets(removed)
-			// If the active profile was removed, fall back to the first one.
-			if c.work.ActiveProfile == victim.Name {
-				c.work.ActiveProfile = c.work.Profiles[0].Name
-			}
-			if c.sel >= len(c.work.Profiles) {
-				c.sel = len(c.work.Profiles) - 1
-			}
-			c.syncProfileBar()
-			c.loadProfile(c.sel)
-		}, c.win)
+	victim := c.activeProfile()
+	if victim == nil {
+		return
+	}
+	mb := qt.NewQMessageBox3(qt.QMessageBox__Question, "Delete profile",
+		"Delete the profile \""+victim.Name+"\"? This cannot be undone.")
+	mb.SetStandardButtons(qt.QMessageBox__Yes | qt.QMessageBox__No)
+	if mb.Exec() != int(qt.QMessageBox__Yes) {
+		return
+	}
+
+	removedName := victim.Name
+	removed := c.sel
+	c.work.Profiles = append(c.work.Profiles[:c.sel], c.work.Profiles[c.sel+1:]...)
+	c.reindexIPsecSecrets(removed)
+	// If the active profile was removed, fall back to the first one.
+	if c.work.ActiveProfile == removedName {
+		c.work.ActiveProfile = c.work.Profiles[0].Name
+	}
+	if c.sel >= len(c.work.Profiles) {
+		c.sel = len(c.work.Profiles) - 1
+	}
+	c.syncProfileBar()
+	c.loadProfile(c.sel)
 }
 
 // reindexIPsecSecrets drops the not-yet-saved PSK edit (if any) for the
 // profile at index removed, and shifts every later index down by one, so
 // ipsecSecretDirty/ipsecSecretValue — keyed by profile index — stay aligned
 // with c.work.Profiles after deleteProfile shifts everything after removed
-// left by one. There is no other per-profile state indexed this way in
-// Controller to mirror; this keeps the map correct rather than merely
-// crash-safe — an un-reindexed map would otherwise silently attach one
-// profile's typed-but-unsaved secret to a different, unrelated profile the
-// next time that index is loaded.
+// left by one.
 func (c *Controller) reindexIPsecSecrets(removed int) {
 	dirty := map[int]bool{}
 	value := map[int]string{}
@@ -1174,10 +1392,15 @@ func (c *Controller) reindexIPsecSecrets(removed int) {
 }
 
 func (c *Controller) setActive() {
-	c.work.ActiveProfile = c.work.Profiles[c.sel].Name
+	p := c.activeProfile()
+	if p == nil {
+		return
+	}
+	c.work.ActiveProfile = p.Name
 	c.syncProfileBar()
-	// The auto-connect checkbox reflects "this profile is active"; refresh it.
-	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == c.work.Profiles[c.sel].Name)
+	// The auto-connect checkbox reflects "this profile is active"; refresh
+	// it.
+	c.autoConnect.SetChecked(c.work.Autostart && c.work.ActiveProfile == p.Name)
 }
 
 // cloneProfile deep-copies a single profile (its only reference type is the
@@ -1188,24 +1411,4 @@ func cloneProfile(p *config.Profile) *config.Profile {
 		out.SplitDNS = append([]string(nil), p.SplitDNS...)
 	}
 	return &out
-}
-
-// colorFor maps a status kind to a fixed colour readable on both light and dark
-// window backgrounds.
-// colorFor is the status strip's colour, taken from the theme's semantic tokens
-// rather than from literals as it used to be. Hardcoded hex could not follow the
-// OS light/dark setting — the old amber and red were mixed for a light background
-// and were the wrong contrast on a dark one — and it meant the status strip and
-// the status window's dot could disagree about what "connected" looks like.
-func colorFor(k statusKind) color.Color {
-	switch k {
-	case statusGreen:
-		return theme.Color(theme.ColorNameSuccess)
-	case statusYellow:
-		return theme.Color(theme.ColorNameWarning)
-	case statusRed:
-		return theme.Color(theme.ColorNameError)
-	default:
-		return theme.Color(theme.ColorNameDisabled)
-	}
 }

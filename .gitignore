@@ -9,3 +9,4 @@ dist/
 
 # internal SDD process artifacts — never publish
 .superpowers/
+.worktrees/

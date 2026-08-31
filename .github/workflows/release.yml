@@ -3,12 +3,11 @@ name: Release
 # Fires on version tags only (v1.2.3, v0.1.0-rc1, ...). Build flags below mirror
 # the Makefile `release` target's per-OS builds — if you change one, change both.
 #
-# Since the fyne v2 tray migration, cmd/openfortitray is a cgo + OpenGL/GLFW
-# build on every OS, so the old "cross-build linux + windows from one ubuntu
-# host with CGO_ENABLED=0" model is dead. Each OS is now built on its own
-# native runner with CGO_ENABLED=1. macOS additionally ships a real .app
-# bundle (fyne menu-bar apps need one) inside a drag-to-/Applications .dmg,
-# the primary macOS download.
+# cmd/openfortitray is a cgo + Qt6 (miqt) build on every OS, so the old
+# "cross-build linux + windows from one ubuntu host with CGO_ENABLED=0" model
+# is dead. Each OS is now built on its own native runner with CGO_ENABLED=1.
+# macOS additionally ships a real .app bundle (a menu-bar/LSUIElement app
+# needs one) inside a drag-to-/Applications .dmg, the primary macOS download.
 on:
   push:
     tags:
@@ -29,8 +28,8 @@ defaults:
     shell: bash
 
 jobs:
-  # darwin needs cgo (fyne drives the Cocoa status bar and renders via OpenGL),
-  # so both slices must be built on a macOS runner. macos-14 is Apple Silicon:
+  # darwin needs cgo (Qt6/miqt drives the Cocoa status bar and window), so
+  # both slices must be built on a macOS runner. macos-14 is Apple Silicon:
   # arm64 is native and the amd64 slice cross-builds because the macOS SDK is a
   # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
   # guard — it only serves pre-2020 Intel macs.
@@ -39,6 +38,7 @@ jobs:
     runs-on: macos-14
     env:
       CGO_ENABLED: '1'
+      CGO_CXXFLAGS: '-std=c++17'
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -57,16 +57,30 @@ jobs:
           xcode-select -p
           xcrun --sdk macosx --show-sdk-path
 
+      # macos-14 is Apple Silicon, so Homebrew's arm64-native `qt` bottle lives
+      # under /opt/homebrew. The amd64 build leg below needs a second,
+      # x86_64 Qt6 install: macos-14 runners ship a parallel x86_64 Homebrew
+      # at /usr/local (under Rosetta) for exactly this cross-arch case.
+      - name: Install Qt6 (arm64 + x86_64, for both build legs)
+        run: |
+          brew install qt pkg-config
+          arch -x86_64 /usr/local/bin/brew install qt pkg-config
+
       # The build version is stamped into main.version (shown in the tray header)
       # via -X main.version=${GITHUB_REF_NAME}, merged into the -ldflags below
-      # (alongside -s -w, and -H=windowsgui on the windows job).
+      # (alongside -s -w, and -H=windowsgui on the windows job). PKG_CONFIG_PATH
+      # is set explicitly per architecture: with both the arm64 (/opt/homebrew)
+      # and x86_64 (/usr/local, Rosetta) Qt6 installs present on the runner,
+      # pkg-config's default search path must not resolve the wrong one for
+      # either leg.
       - name: Build darwin binaries
-        # -s -w strips the symbol table and DWARF to claw back some of fyne's
-        # size (a fyne binary is ~15-30 MB heavier than the old systray one).
+        # -s -w strips the symbol table and DWARF to trim the binary's size.
         run: |
           mkdir -p dist
+          PKG_CONFIG_PATH="$(/opt/homebrew/bin/brew --prefix qt)/lib/pkgconfig" \
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
             go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
+          PKG_CONFIG_PATH="$(arch -x86_64 /usr/local/bin/brew --prefix qt)/lib/pkgconfig" \
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
             go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
           ls -l dist
@@ -77,8 +91,8 @@ jobs:
           file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
           file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
 
-      # A fyne menu-bar app needs a real .app bundle (Info.plist + LSUIElement)
-      # to host the status item reliably and stay off the Dock. `make dmg`
+      # A menu-bar app needs a real .app bundle (Info.plist + LSUIElement) to
+      # host the status item reliably and stay off the Dock. `make dmg`
       # depends on `make app` (which rebuilds the host-arch arm64 binary and
       # assembles the bundle with the hand-rolled Info.plist + generated .icns),
       # then wraps it in a double-click, drag-to-/Applications disk image — the
@@ -118,16 +132,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # linux is now a cgo build (fyne -> GLFW -> OpenGL), so it must build on a
-  # linux runner with the GL + X11 dev headers, not cross-compiled with cgo
-  # off. Consequence: the linux binary now carries a glibc version floor from
-  # ubuntu-latest (it no longer runs on arbitrarily old glibc). Runtime still
-  # needs an SNI-capable panel (unchanged) plus a working GL stack.
+  # linux is a cgo build (Qt6/miqt), so it must build on a linux runner with
+  # the Qt6 dev headers, not cross-compiled with cgo off. Consequence: the
+  # linux binary carries a glibc version floor from ubuntu-latest (it no
+  # longer runs on arbitrarily old glibc). Runtime still needs an
+  # SNI-capable panel (unchanged).
   build-linux:
     name: Build linux (amd64)
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: '1'
+      CGO_CXXFLAGS: '-std=c++17'
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -138,13 +153,16 @@ jobs:
           go-version: stable
           cache: true
 
-      - name: Install GL/X11 build deps
+      # cmd/openfortitray links against Qt6 (miqt migration; see
+      # cmd/openfortitray/qtapp.go), which needs the Qt6 dev headers/
+      # pkg-config files (qt6-base-dev) to build.
+      - name: Install Qt6 build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+          sudo apt-get install -y gcc pkg-config qt6-base-dev
 
       - name: Build linux binary
-        # -s -w trims fyne's size. Ships the bare binary: there is no
+        # -s -w trims the binary's size. Ships the bare binary: there is no
         # linux/.desktop asset in the repo, so no .tar.xz is assembled here.
         run: |
           mkdir -p dist
@@ -180,6 +198,7 @@ jobs:
     runs-on: windows-latest
     env:
       CGO_ENABLED: '1'
+      CGO_CXXFLAGS: '-std=c++17'
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -190,20 +209,22 @@ jobs:
           go-version: stable
           cache: true
 
-      # Provides a MinGW-w64 gcc for cgo. Pinned to a full commit SHA like every
-      # other action here.
-      - name: Set up MinGW-w64 (MSYS2)
+      # Provides a MinGW-w64 gcc for cgo, plus Qt6 for the miqt migration
+      # (cmd/openfortitray/qtapp.go). Pinned to a full commit SHA like every
+      # other action here. UCRT64 (not MINGW64): miqt's README documents
+      # UCRT64 + qt6-base as a tested native-Windows recipe for Qt6.
+      - name: Set up MinGW-w64 + Qt6 (MSYS2 UCRT64)
         id: msys2
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config mingw-w64-ucrt-x86_64-qt6-base
 
       - name: Put MinGW-w64 gcc on PATH
         # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but our
         # build steps run in Git Bash (defaults.run.shell: bash). Prepend the
-        # MINGW64 bin dir to PATH so cgo's `go build` finds gcc.
-        run: printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\mingw64\\bin" >> "$GITHUB_PATH"
+        # UCRT64 bin dir to PATH so cgo's `go build` finds gcc.
+        run: printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\ucrt64\\bin" >> "$GITHUB_PATH"
 
       # Confirms gcc is now resolvable, so a cgo failure names the cause up
       # front rather than surfacing as a cryptic linker error.
@@ -240,8 +261,12 @@ jobs:
 
       # Bundle Mesa's llvmpipe software OpenGL next to the exe so the tray runs
       # on GPU-less Windows — VMs, RDP sessions, minimal/Server installs — where
-      # there is no GL driver and fyne/GLFW otherwise dies at launch with
-      # "APIUnavailable: WGL: The driver does not appear to support OpenGL".
+      # there is no GL driver. This guarded against a hard crash on the old
+      # Fyne/GLFW build ("APIUnavailable: WGL: The driver does not appear to
+      # support OpenGL"); Qt6/miqt's own GPU-less-Windows behavior has not been
+      # separately reverified (see main.go's func main() comment on
+      # GALLIUM_DRIVER), so this bundling is kept as a cheap, defensive
+      # carry-over rather than removed on an unverified assumption.
       # Windows resolves an application-directory opengl32.dll before the system
       # one (per-process), so placing Mesa's opengl32.dll here makes THIS process
       # render in software; a light tray + settings window is fine in llvmpipe.
@@ -276,6 +301,22 @@ jobs:
           test -s dist/opengl32.dll
           test -s dist/libgallium_wgl.dll
           ls -l dist/opengl32.dll dist/libgallium_wgl.dll
+
+      # Bundle the Qt6 runtime (miqt migration; see cmd/openfortitray/qtapp.go):
+      # unlike fyne's static Go binary, the exe now links against real Qt6
+      # DLLs at runtime. windeployqt6 copies the required Qt DLLs and the
+      # platform plugin (platforms\qwindows.dll) next to the exe, into the
+      # same dist\ layout the Mesa DLL bundling above already uses, so the
+      # exe is turnkey without a separately-installed matching Qt6.
+      #
+      # This step runs under bash (defaults.run.shell: bash), so the target
+      # path uses forward slashes like every other dist/... path in this
+      # file (the go build -o line above, the test -s checks) — an unquoted
+      # backslash path here would be corrupted by bash's escape handling
+      # (`dist\openfortitray...` becomes `distopenfortitray...`).
+      - name: Bundle Qt6 runtime DLLs
+        run: |
+          "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\windeployqt6.exe" --release --no-translations dist/openfortitray-windows-amd64.exe
 
       # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
       # the app so Windows is turnkey. There is no reliable way to install

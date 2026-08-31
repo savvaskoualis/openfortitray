@@ -36,6 +36,48 @@ func TestValidateHost(t *testing.T) {
 	}
 }
 
+// TestHostValidator proves hostValidator's stdlib-regexp implementation
+// (post-Fyne-removal) behaves identically to validateHost: same accept/
+// reject decision on every case, and — for the rejected cases — the exact
+// same error message the old Fyne-validation-package-backed version used to
+// return ("host only, no https:// or :port (e.g. vpn.example.com)"). This is
+// the dedicated regression test required by the Task 11 ruling authorizing
+// this one edit to logic.go.
+func TestHostValidator(t *testing.T) {
+	wantMsg := "host only, no https:// or :port (e.g. vpn.example.com)"
+	tests := []struct {
+		name    string
+		host    string
+		wantErr bool
+	}{
+		{"empty is allowed (unconfigured profile is savable)", "", false},
+		{"a bare host is fine", "vpn.example.com", false},
+		{"dotted and hyphenated", "vpn-gw.example.com", false},
+		{"a scheme is rejected", "https://vpn.example.com", true},
+		{"a port is rejected", "vpn.example.com:10443", true},
+		{"a path is rejected", "vpn.example.com/vpn", true},
+		{"whitespace is rejected", "vpn example.com", true},
+	}
+	validate := hostValidator()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validate(tc.host)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("hostValidator()(%q) err=%v, wantErr=%v", tc.host, err, tc.wantErr)
+			}
+			if tc.wantErr && err.Error() != wantMsg {
+				t.Errorf("hostValidator()(%q) error message = %q, want %q", tc.host, err.Error(), wantMsg)
+			}
+			// hostValidator and validateHost must agree on every input: they
+			// are two call sites for the same validation rule (live widget
+			// validation vs. whole-working-copy re-check on Save).
+			if wantErrFromPure := validateHost(tc.host); (wantErrFromPure != nil) != (err != nil) {
+				t.Errorf("hostValidator/validateHost disagree for %q: hostValidator err=%v, validateHost err=%v", tc.host, err, wantErrFromPure)
+			}
+		})
+	}
+}
+
 func TestValidatePort(t *testing.T) {
 	tests := []struct {
 		name    string

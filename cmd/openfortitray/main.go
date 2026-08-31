@@ -2,9 +2,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,14 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"fyne.io/fyne/v2"
-	fyneapp "fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
-	"github.com/go-gl/glfw/v3.4/glfw"
+	qt "github.com/mappu/miqt/qt6"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -41,6 +32,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
+	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
 	"github.com/savvaskoualis/openfortitray/internal/uitheme"
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
@@ -88,7 +80,10 @@ type app struct {
 	events        chan tunnel.Event
 	logPath       string
 
-	fyneApp  fyne.App
+	// dispatch marshals background-goroutine work onto the Qt UI thread — the
+	// replacement for fyne.Do/fyne.DoAndWait. A QTimer drains it on the Qt
+	// main thread (see main).
+	dispatch *uidispatch.Queue
 	tray     *tray.Controller
 	settings *settings.Controller
 	// status is the connection panel; the shell decides when it is on screen.
@@ -99,9 +94,9 @@ type app struct {
 	// nil until the ticker is started in OnStarted; called once during teardown so
 	// the goroutine cannot outlive the UI it posts to.
 	stopTick func()
-	// win is the (initially hidden) settings window, reused as the parent for the
+	// win is the (initially hidden) single window, reused as the parent for the
 	// first-run bootstrap dialogs. Set once in main after the window is built.
-	win fyne.Window
+	win *qt.QMainWindow
 	// connectBootstrap, when non-nil, runs the macOS first-run helper-install gate
 	// before dialing: a passwordless-helper readiness probe, and — if the helper is
 	// not yet installed — an admin-password prompt that installs it, then a dial. It
@@ -120,8 +115,8 @@ type app struct {
 	onConnectIssue func(*settings.Issue)
 	// quitting stops the event pump touching a tearing-down UI. It is set once,
 	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
-	// drains events without calling fyne.Do — so no fyne.Do is ever queued
-	// against a UI that a.fyneApp.Quit() is about to destroy.
+	// drains events without posting to a.dispatch — so no UI work is ever queued
+	// against a UI that qt.QCoreApplication_Quit() is about to destroy.
 	quitting atomic.Bool
 	// shutdownDone is closed once the teardown goroutine has finished, so
 	// awaitShutdown can hold the process open until the tunnel is really down. It
@@ -172,10 +167,11 @@ type app struct {
 	cookieRetryInterval time.Duration
 	cookieRetryWindow   time.Duration
 
-	// notify posts a desktop notification. It is the fyne app's
-	// SendNotification in production and a recorder in tests; nil means "no
-	// notifications" (the pump null-checks it). Only the pump goroutine calls
-	// it, via notifyFor, so no extra synchronisation is needed.
+	// notify posts a desktop notification. It is tray.ShowMessage (via the
+	// system tray icon's native balloon/banner) in production and a recorder
+	// in tests; nil means "no notifications" (the pump null-checks it). Only
+	// the pump goroutine calls it, via notifyFor, so no extra synchronisation
+	// is needed.
 	notify func(title, body string)
 	// lastNotified is the state the last notification described, so the pump
 	// notifies on TRANSITIONS only — the supervisor re-emits the same state on
@@ -420,7 +416,14 @@ func (a *app) startTunnel() {
 // goroutine) — never the pump.
 func (a *app) onSystemWake() {
 	wantConnected := a.wantConnected.Load()
-	fyne.DoAndWait(func() {
+	// Post, not PostAndWait: this callback is invoked by NSWorkspace's
+	// notification center on the main queue (see wake_darwin.m), which is
+	// the SAME thread Drain runs on via the dispatch-drain QTimer. Waiting
+	// here would block forever, since Drain can never run while this
+	// function has not yet returned control to that thread's event loop —
+	// there is nothing in this handler that needs the mutation to be
+	// visibly complete before returning to the OS.
+	a.dispatch.Post(func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
@@ -430,6 +433,27 @@ func (a *app) onSystemWake() {
 		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
 		a.Connect()
+	})
+}
+
+// onScreenWake re-asserts the tray icon and menu every time the display
+// wakes, independent of onSystemWake and of wantConnected — a display sleep
+// alone never drops the network, so this never touches the tunnel, only the
+// tray. It exists because a Mac that never fully suspends (see
+// watchScreenWake's doc comment) still cycles its display constantly, and
+// each cycle is a real opportunity for the NSStatusItem to silently drop —
+// the same class of issue ReassertTray's OnStarted and onSystemWake calls
+// already guard against, just on a much more frequent trigger.
+func (a *app) onScreenWake() {
+	log.Print("openfortitray: display woke; re-asserting tray")
+	// Post, not PostAndWait — same reasoning as onSystemWake: this callback
+	// already runs on the main queue/thread that Drain itself runs on, so
+	// waiting for Drain to run it would deadlock forever.
+	a.dispatch.Post(func() {
+		if a.tray != nil {
+			a.tray.ReassertTray()
+		}
+		log.Print("openfortitray: tray re-assert after display wake done")
 	})
 }
 
@@ -870,7 +894,7 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 		return
 	}
 	prompt := manual || a.shouldPromptUpdate(rel.Tag)
-	fyne.Do(func() {
+	a.dispatch.Post(func() {
 		if a.quitting.Load() {
 			return
 		}
@@ -887,8 +911,8 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 // recording it so the same version is never prompted twice. A new (distinct,
 // non-empty) tag prompts once; a repeat of the last-prompted tag, or an empty
 // tag, does not. It is a pure decision guarded by updateMu, unit-tested directly
-// (wiring a headless fyne dialog in a test is impractical, so the actual
-// dialog.Show lives in the thin promptUpdate wrapper).
+// (wiring a real update dialog in a test is impractical, so the actual
+// dlg.Show lives in the thin promptUpdate wrapper).
 func (a *app) shouldPromptUpdate(tag string) bool {
 	a.updateMu.Lock()
 	defer a.updateMu.Unlock()
@@ -902,47 +926,29 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 // promptUpdate opens the update flow: the offer, then the download, then the
 // request to restart. See updateflow.go.
 func (a *app) promptUpdate(rel *update.Release) {
-	if a.fyneApp == nil {
+	if a.dispatch == nil {
 		return
 	}
-	newUpdateFlow(a, rel).start()
+	newUpdateFlow(a, rel, a.dispatch).start()
 }
 
 // reportCheckResult answers a MANUAL check for updates. A click has to produce a
 // visible result whatever the answer — "no update" reported as silence is
 // indistinguishable from a menu item that does nothing, which is precisely how this
-// one read.
+// one read. A plain modal QMessageBox is enough for a one-shot heading+message
+// result — there is no multi-state flow here the way the update offer/download/
+// restart dialog (updateflow.go) needs a persistent QDialog for.
 func (a *app) reportCheckResult(heading, body string) {
-	if a.fyneApp == nil {
+	if a.dispatch == nil {
 		return
 	}
-	fyne.Do(func() {
+	a.dispatch.Post(func() {
 		if a.quitting.Load() {
 			return
 		}
-		glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
-		w := a.fyneApp.NewWindow("OpenFortiTray Update")
-		w.SetFixedSize(true)
-		w.Resize(fyne.NewSize(420, 200))
-		w.CenterOnScreen()
-		w.SetCloseIntercept(w.Hide)
-
-		h := canvas.NewText(heading, theme.Color(theme.ColorNameForeground))
-		h.TextSize = theme.Size(theme.SizeNameSubHeadingText)
-		h.TextStyle = fyne.TextStyle{Bold: true}
-		msg := widget.NewLabel(body)
-		msg.Wrapping = fyne.TextWrapWord
-		msg.Importance = widget.LowImportance
-		ok := widget.NewButton("OK", func() { w.Hide() })
-		ok.Importance = widget.HighImportance
-
-		w.SetContent(container.NewPadded(container.NewVBox(
-			h, msg, layout.NewSpacer(),
-			container.NewHBox(layout.NewSpacer(), ok),
-		)))
-		w.Show()
-		attachGlass(w)
-		w.RequestFocus()
+		mb := qt.NewQMessageBox3(qt.QMessageBox__Information, heading, body)
+		mb.SetStandardButtons(qt.QMessageBox__Ok)
+		mb.Exec()
 	})
 }
 
@@ -977,10 +983,10 @@ func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
 // startUptimeTicker drives the status window's session clock, the one thing on
 // screen that changes without a tunnel event.
 //
-// It is started from OnStarted rather than from main because it posts through
-// fyne.Do, and it is stopped during teardown: a ticker goroutine that outlived
-// the UI would queue work against a driver Quit is destroying — the same hazard
-// the pump's quitting flag guards against, so it reads that flag too.
+// It posts through a.dispatch, and is stopped during teardown: a ticker
+// goroutine that outlived the UI would queue work against a driver Quit is
+// destroying — the same hazard the pump's quitting flag guards against, so it
+// reads that flag too.
 //
 // status.Tick returns on a branch when no session is up, so an idle app pays for
 // a channel receive per second and nothing else.
@@ -1001,7 +1007,7 @@ func (a *app) startUptimeTicker() {
 				if a.quitting.Load() {
 					return
 				}
-				fyne.Do(func() {
+				a.dispatch.Post(func() {
 					if a.quitting.Load() || a.status == nil {
 						return
 					}
@@ -1012,11 +1018,12 @@ func (a *app) startUptimeTicker() {
 	}()
 }
 
-// pump is the one goroutine that reads tunnel events and drives the UI. fyne
-// owns the main thread, so every mutation of a fyne object from here is
-// marshalled onto the UI goroutine with fyne.Do. Once quitting is set the pump
-// keeps draining the channel (so the supervisor's teardown events never block)
-// but stops touching the UI, which a.fyneApp.Quit() is about to destroy.
+// pump is the one goroutine that reads tunnel events and drives the UI. Qt
+// owns the main thread, so every mutation of a Qt object from here is
+// marshalled onto the UI goroutine via a.dispatch. Once quitting is set the
+// pump keeps draining the channel (so the supervisor's teardown events never
+// block) but stops touching the UI, which qt.QCoreApplication_Quit() is
+// about to destroy.
 func (a *app) pump() {
 	for e := range a.events {
 		if a.quitting.Load() {
@@ -1024,21 +1031,23 @@ func (a *app) pump() {
 		}
 		e := e
 		// Notify before the UI hop: notifyFor is pure bookkeeping plus one
-		// SendNotification, both safe off the UI goroutine, and doing it here
-		// keeps it out of the fyne.Do closure that a teardown can skip.
+		// notification post, both safe off the UI goroutine, and doing it here
+		// keeps it out of the a.dispatch.Post closure that a teardown can skip.
 		a.notifyFor(e)
-		fyne.Do(func() {
+		a.dispatch.Post(func() {
 			// Re-check inside the closure: the pre-check above is not atomic with
-			// fyne.Do, and once fyne has drained its queue fyne.Do runs the closure
-			// inline on this goroutine, so an event slipping past the pre-check just
-			// as Quit tears the driver down could otherwise call Apply against a
-			// terminated UI (§7.8). Belt-and-suspenders with the pre-check.
+			// a.dispatch.Post, and once the queue is drained the closure runs
+			// inline on the UI goroutine, so an event slipping past the pre-check
+			// just as Quit tears the driver down could otherwise call Apply
+			// against a terminated UI (§7.8). Belt-and-suspenders with the
+			// pre-check.
 			if a.quitting.Load() {
 				return
 			}
 			a.tray.Apply(e)
-			// Same consumer, same fyne.Do: mirror the status onto the settings
-			// window's live strip. Safe whether the window is shown or hidden.
+			// Same consumer, same a.dispatch.Post: mirror the status onto the
+			// settings window's live strip. Safe whether the window is shown or
+			// hidden.
 			if a.settings != nil {
 				a.settings.Apply(e)
 			}
@@ -1148,18 +1157,20 @@ func (a *app) notifyFor(e tunnel.Event) {
 		return
 	}
 
-	// Logged because SendNotification reports nothing back: it cannot fail visibly,
+	// Logged because ShowMessage reports nothing back: it cannot fail visibly,
 	// so without this line a missing toast is indistinguishable from a toast the app
-	// never tried to post. That ambiguity cost real debugging time — on macOS the
-	// authorization failure is logged by fyne through NSLog, which only reaches this
-	// file because redirectStderr repoints fd 2 (see redirect_unix.go).
+	// never tried to post. That ambiguity cost real debugging time — on macOS an
+	// authorization failure is logged through NSLog, which only reaches this file
+	// because redirectStderr repoints fd 2 (see redirect_unix.go).
 	log.Printf("notify: posting %q — %q", title, body)
 	a.notify(title, body)
 }
 
 // Quit is invoked from the tray's Quit item on the UI goroutine. It routes to the
-// shared graceful shutdown, which quits the fyne app once the tunnel is down.
-func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
+// shared graceful shutdown, which quits the Qt application once the tunnel is down.
+func (a *app) Quit() {
+	a.shutdown(func() { a.dispatch.Post(func() { qt.QCoreApplication_Quit() }) })
+}
 
 // shutdown tears the tunnel down and then calls done to leave the process. It is
 // the one graceful-exit path: the tray's Quit item and the OS-signal handler both
@@ -1174,8 +1185,8 @@ func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
 // goroutine (blocking that would freeze the menu bar); quitting is set first so
 // the event pump stops touching a UI that is about to be destroyed; and the
 // teardown runs at most once (shutdownOnce). done differs by caller only in how
-// the process is left — the tray and signal paths both quit the fyne app, which
-// unblocks a.fyneApp.Run() in main.
+// the process is left — the tray and signal paths both quit the Qt application,
+// which unblocks execQApplication() in main.
 //
 // Residual limitation: a true SIGKILL (or power loss) of the APP cannot run any
 // in-process teardown, so this path never executes and the root openconnect is
@@ -1188,10 +1199,11 @@ func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
 		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
-		// Stop the uptime ticker before the teardown begins, so it cannot queue a
-		// fyne.Do against a driver that is about to be destroyed. quitting is already
-		// set, so an in-flight tick returns without touching the UI either way; this
-		// just stops the goroutine rather than leaving it running to no purpose.
+		// Stop the uptime ticker before the teardown begins, so it cannot queue
+		// work against a driver that is about to be destroyed. quitting is
+		// already set, so an in-flight tick returns without touching the UI
+		// either way; this just stops the goroutine rather than leaving it
+		// running to no purpose.
 		if a.stopTick != nil {
 			a.stopTick()
 			a.stopTick = nil
@@ -1247,21 +1259,23 @@ func (a *app) shutdown(done func()) {
 // awaitShutdown blocks until the tunnel teardown has finished, starting it if
 // nothing has yet.
 //
-// It exists because fyne installs its OWN SIGINT/SIGTERM handler
-// (gLDriver.catchTerm) which calls Quit as soon as a signal arrives. Go delivers a
-// signal to every registered channel, so a SIGTERM reaches both handlers at once:
-// ours begins the graceful teardown on a goroutine, while fyne's ends the run
-// loop. main then returned and the process died mid-teardown — openconnect never
-// got to send its clean logout, so the FortiGate kept the session and refused
-// every new cookie (for minutes) until it timed the session out server-side. That
-// looked exactly like "we get logged out a lot" and like a connect that will not
-// connect. The observable symptom in the log was a "tearing down" line with no
-// matching "tunnel: exited" or "exiting" line after it.
+// It exists because shutdown() itself does not block: it launches the actual
+// teardown — concurrently Disconnect()+Wait()ing BOTH supervisors (SSL and
+// IPsec) via a shared WaitGroup, bounded by one shutdownWait deadline (see
+// shutdown's own doc comment) — on a worker goroutine and returns immediately,
+// so the run loop is never blocked waiting for openconnect to exit. Something
+// still has to keep the PROCESS alive for that worker to finish, or main would
+// return and the process would die mid-teardown: openconnect would never get
+// to send its clean logout, so the FortiGate would keep the session and refuse
+// every new cookie (for minutes) until it timed the session out server-side —
+// indistinguishable from "we get logged out a lot" and a connect that will not
+// connect. awaitShutdown is that wait, called after Run/Exec returns so the
+// process outlives the UI by as long as the teardown needs.
 //
-// Called after Run returns, so the process outlives the UI by as long as the
-// teardown needs. shutdown is once-guarded, so calling it here is safe whether
-// the exit came from the tray's Quit, a signal, or fyne's own handler; the done
-// callback is a no-op because the run loop has already ended.
+// shutdown is once-guarded, so calling it here is always safe, whether the
+// exit came from the tray's Quit, a signal (watchSignals), or (defensively)
+// neither; the done callback is a no-op here because the run loop has already
+// ended.
 func (a *app) awaitShutdown() {
 	a.shutdown(func() {})
 	select {
@@ -1279,7 +1293,7 @@ func (a *app) awaitShutdown() {
 // a root openconnect the unprivileged parent cannot signal. It loops rather than
 // returning after the first signal so a second signal is observed too — though
 // shutdown is once-guarded, so the second is a no-op. quit is what leaves the
-// process (a.fyneApp.Quit in production).
+// process (qt.QCoreApplication_Quit, posted via a.dispatch, in production).
 func (a *app) watchSignals(sigs <-chan os.Signal, quit func()) {
 	for s := range sigs {
 		log.Printf("openfortitray: received signal %s, tearing down", s)
@@ -1372,44 +1386,6 @@ func (a *app) SetAutostart(on bool) error {
 	return nil
 }
 
-// fyneRootConfigDir mirrors fyne's own internal/app.rootConfigDir (v2.8): fyne
-// stores preferences.json under <root>/<appID>/. It is reimplemented here rather
-// than imported because fyne's is in an internal package. Kept in step with the
-// fyne version pinned in go.mod.
-func fyneRootConfigDir() string {
-	home, _ := os.UserHomeDir()
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Preferences", "fyne")
-	case "windows":
-		return filepath.Join(home, "AppData", "Roaming", "fyne")
-	default:
-		base, _ := os.UserConfigDir()
-		return filepath.Join(base, "fyne")
-	}
-}
-
-// sanitizeFynePreferences removes fyne's preferences.json for appID when it is
-// empty or not valid JSON, so fyne's loader sees a missing (clean, empty) store
-// instead of logging "Fyne Preferences load error: EOF". A file that parses as
-// JSON is left untouched. Best-effort: every error is logged and swallowed —
-// this is cosmetic, never a reason to fail startup.
-func sanitizeFynePreferences(appID string) {
-	path := filepath.Join(fyneRootConfigDir(), appID, "preferences.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return // missing (the common case) or unreadable: fyne handles missing itself
-	}
-	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && json.Valid(trimmed) {
-		return // real preferences: leave them alone
-	}
-	if err := os.Remove(path); err != nil {
-		log.Printf("openfortitray: could not clear corrupt fyne preferences %s: %v", path, err)
-		return
-	}
-	log.Printf("openfortitray: cleared corrupt/empty fyne preferences %s (%d bytes)", path, len(data))
-}
-
 // setLoginItem installs or removes the per-user login item for this executable.
 func setLoginItem(on bool) error {
 	if !on {
@@ -1456,17 +1432,11 @@ const (
 )
 
 func main() {
-	// Windows ships a bundled Mesa software OpenGL (the app-dir opengl32.dll
-	// shadows the system one), whose default gallium driver is llvmpipe. llvmpipe
-	// JITs with LLVM and uses CPU vector instructions, and on some GPU-less hosts
-	// (locked-down Cloud PCs / RDP) that hard-crashes on the first window draw —
-	// the tray survives (no GL surface) but opening any window kills the process
-	// with no WER/crash record. Force the pure-C softpipe driver, which renders
-	// this light UI fine and does not crash there. Must be set before any GL call
-	// (i.e. before fyne creates its driver). No-op off Windows.
-	if runtime.GOOS == "windows" {
-		_ = os.Setenv("GALLIUM_DRIVER", "softpipe")
-	}
+	// The old Fyne/glfw build forced GALLIUM_DRIVER=softpipe on Windows to work
+	// around a Mesa/llvmpipe crash on GPU-less Cloud PCs — Mesa/OpenGL-specific
+	// software-rendering plumbing with no Qt equivalent verified this session.
+	// Dropped rather than ported: if a future report surfaces a GPU-less-Windows
+	// RDP crash, this is the first place to look (see the Task 10 report).
 
 	cfgDir, err := config.DefaultDir()
 	if err != nil {
@@ -1543,6 +1513,11 @@ func main() {
 		cookieRetryInterval: cookieRetryInterval,
 		cookieRetryWindow:   cookieRetryWindow,
 	}
+	// a.dispatch marshals every cross-goroutine UI mutation onto the Qt UI
+	// thread — the replacement for fyne.Do/fyne.DoAndWait. Constructed before
+	// anything that might post to it (the auth/run funcs' goroutines never do,
+	// but Connect and the update checker, wired below, do).
+	a.dispatch = uidispatch.New()
 
 	// The auth/run funcs read a.snapshot() rather than a value captured at
 	// startup, so a Connect that follows a settings Save (Save & Reconnect) dials
@@ -1618,100 +1593,63 @@ func main() {
 
 	a.sup = tunnel.New(authFn, runFn, events)
 
-	// fyne owns the main thread: NewWithID (not bare New) so tray/preferences
-	// plumbing has a stable app identity. The tray must be built before Run.
+	// The one QApplication instance for the process. Qt's native platform
+	// integration (NSApp on macOS, etc.) is constructed synchronously here, in
+	// the constructor — unlike fyne/glfw, which deferred that to Run() — so
+	// anything that needs it (setDockActivationPolicy, below) can run right
+	// after this, with no OnStarted-style lifecycle callback needed.
+	qtApp := newQApplication(os.Args)
+	qt.QCoreApplication_SetOrganizationName("io.github.savvaskoualis")
+	qt.QCoreApplication_SetApplicationName("OpenFortiTray")
+
+	// The app theme, applied once at the QApplication level before any window
+	// is built so nothing is ever laid out against an unstyled widget and then
+	// re-laid out. Qt propagates a QApplication-level stylesheet to every
+	// widget unless overridden locally.
 	//
-	// Migrations["fyneDo"] declares that this app already marshals every
-	// cross-goroutine UI mutation through fyne.Do (the event pump does; menu
-	// Actions run on the UI goroutine). Without it fyne v2.8 logs a standing
-	// "not migrated to the fyne.Do threading model" advisory at Run(). The
-	// thread-safety checks themselves stay active.
-	fyneapp.SetMetadata(fyne.AppMetadata{
-		ID:         "io.github.savvaskoualis.openfortitray",
-		Name:       "OpenFortiTray",
-		Migrations: map[string]bool{"fyneDo": true},
-	})
-	// A previous unclean write can leave fyne's preferences.json empty or corrupt,
-	// which makes fyne log a scary "Fyne Preferences load error: EOF" at startup.
-	// Clear it first (the app keeps its real settings in internal/config, not in
-	// fyne preferences, so this loses nothing) so fyne sees a clean, empty store.
-	sanitizeFynePreferences("io.github.savvaskoualis.openfortitray")
-	a.fyneApp = fyneapp.NewWithID("io.github.savvaskoualis.openfortitray")
-	// The app theme, installed before any window is built so nothing is ever laid
-	// out against the default palette and then re-laid out. It tracks the OS
-	// light/dark setting: fyne resolves the variant and hands it to Color.
-	a.fyneApp.Settings().SetTheme(uitheme.New())
-	ctrl, err := tray.Setup(a.fyneApp, a)
+	// miqt v0.14.0's QStyleHints has no ColorScheme accessor (verified
+	// against gen_qstylehints.go), so isDarkMode reads the OS setting
+	// directly (NSUserDefaults on macOS; always false elsewhere — see
+	// darkmode_other.go). This matters in practice, not just cosmetically:
+	// rendering the light palette under a dark system vibrancy material
+	// (or vice versa) produces near-invisible text and a muddy, flat
+	// appearance rather than merely "the wrong colors".
+	dark := isDarkMode()
+	qtApp.SetStyleSheet(uitheme.StyleSheet(dark))
+
+	ctrl, err := tray.Setup(a)
 	if err != nil {
 		log.Fatal(err)
 	}
 	a.tray = ctrl
 	log.Print("tray: system tray menu installed")
+	tray.SetTooltip("OpenFortiTray")
 
 	// Desktop notifications for the transitions worth interrupting for (see
-	// notifyFor). Wired only now that the fyne app exists; before this the pump
-	// would have had nothing to send through, and a.notify == nil is a no-op.
-	a.notify = func(title, body string) {
-		a.fyneApp.SendNotification(fyne.NewNotification(title, body))
-	}
+	// notifyFor), via the tray icon's own native balloon/banner.
+	a.notify = tray.ShowMessage
 
-	// Best-effort menu-bar tooltip. fyne has no tooltip API, so this reaches the
-	// systray singleton fyne drives. It must run after the tray is live: fyne
-	// starts the tray during Run and then fires OnStarted (on the UI goroutine),
-	// which is the first moment the native status item exists. tray.SetTooltip is
-	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
-	a.fyneApp.Lifecycle().SetOnStarted(func() {
-		log.Print("fyne lifecycle: OnStarted (tray live)")
-		// Re-assert the tray icon + menu now that the native systray exists. On
-		// Windows the initial set in tray.Setup (before the run loop) logs "tray not
-		// ready yet" and no icon appears; setting it again here makes it stick.
-		a.tray.ReassertTray()
-		log.Print("tray: re-asserted icon+menu after OnStarted")
-		tray.SetTooltip("OpenFortiTray")
-		// Assert the Dock-visible (Regular) activation policy. fyne/glfw sets its
-		// own policy while initializing NSApp during Run, so the policy the app
-		// wants has to be set AFTER that — OnStarted fires on the UI/main goroutine
-		// once NSApp exists, which is both late enough and on the right thread.
-		// No-op off darwin.
-		setDockActivationPolicy()
-		// Give the Dock icon an effect. fyne does not implement AppKit's reopen
-		// delegate method, so without this the icon is inert: clicking it does
-		// nothing at all, which is worse than having no icon.
-		//
-		// The FIRST activation is ignored on purpose. Launching the app activates it,
-		// and a window appearing unasked at every login is exactly the behaviour a
-		// tray app should not have. Every activation after that is a deliberate
-		// "bring this up" — a Dock click or a Cmd-Tab — and shows the window.
-		firstActivation := true
-		watchDockActivation(func() {
-			if firstActivation {
-				firstActivation = false
-				log.Print("dock: first activation (launch) — leaving the window hidden")
-				return
-			}
-			log.Print("dock: activated — showing the status window")
-			a.ShowStatus()
-		})
-		a.startUptimeTicker()
-	})
-	// OnStopped fires when fyne itself tears the run loop down. If this appears in
-	// the log (rather than the "run loop returned" line, or nothing), the app is
-	// being quit by fyne — e.g. a tray-only app the driver did not keep alive —
-	// not crashing. The distinction drives the fix.
-	a.fyneApp.Lifecycle().SetOnStopped(func() {
-		log.Print("fyne lifecycle: OnStopped (fyne is quitting the run loop)")
-	})
+	// Assert the Dock-visible (Regular) activation policy. No-op off darwin.
+	setDockActivationPolicy()
 
-	// ONE window, built once and left hidden. It is never ShowAndRun'd, so it cannot
-	// be the master window whose close quits the app; the shell intercepts its close
-	// to Hide.
+	// ONE window, built once and left hidden. It is never explicitly Exec'd, so
+	// it cannot be the master window whose close quits the app; the shell
+	// intercepts its close to Hide.
 	//
 	// Status and Settings were two separate windows: two things to find, two to
 	// arrange, and — once the app grew a Dock icon — an ambiguous answer to "bring
 	// this app up". The controllers still take the window, because dialogs and focus
 	// need one, but they no longer decide what it contains or when it appears.
-	glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
-	win := a.fyneApp.NewWindow("OpenFortiTray")
+	//
+	// WA_TranslucentBackground is the direct replacement for the old
+	// glfw.WindowHint(TransparentFramebuffer, true) + the fyne theme's alpha
+	// background: it tells Qt this widget's own paint may leave native
+	// vibrancy (NSVisualEffectView / DWM Acrylic / X11 blur) showing through.
+	// The alpha-bearing background itself comes from the QApplication-level
+	// stylesheet applied above (uitheme.StyleSheet's `QWidget { background:
+	// rgba(...) }` rule cascades to this window's central widget).
+	win := qt.NewQMainWindow2()
+	win.SetAttribute2(qt.WA_TranslucentBackground, true)
 	a.win = win
 	a.settings = settings.New(a, win)
 	a.status = status.New(a, win)
@@ -1724,7 +1662,10 @@ func main() {
 		Banner:     a.settings.Banner(),
 		Footer:     a.settings.Footer(),
 	})
-	a.shell.AttachGlass = attachGlass
+	// shell.Shell.AttachGlass takes the *qt.QMainWindow it reveals; attachGlass
+	// (Task 8) takes the *qt.QWidget WinId() needs. QMainWindow promotes its
+	// embedded *QWidget as a field, so the adapter is just that field access.
+	a.shell.AttachGlass = func(w *qt.QMainWindow) { attachGlass(w.QWidget) }
 	// Settings asks the shell to navigate when a refused Connect points at a field.
 	a.settings.SetNavigator(func(tab string) {
 		if tab == settings.TabAdvanced {
@@ -1733,8 +1674,9 @@ func main() {
 		}
 		a.shell.Reveal(shell.SectionConnection)
 	})
-	// Revealing the activity history needs a taller window; the shell owns the size.
-	a.status.OnHeightRequest = a.shell.RequestHeight
+	// Revealing the activity history needs a taller window: status.Controller
+	// resizes a.win itself (win.AdjustSize()), so there is nothing to wire here
+	// — see toggleActivity's doc comment.
 
 	// Route a refused Connect (invalid active profile) to the settings window,
 	// which opens on the offending field with a banner naming the fix.
@@ -1748,9 +1690,29 @@ func main() {
 	// and a.settings are set — the bootstrap dialogs parent on a.win.
 	a.installBootstrapHooks()
 
-	// The one event pump. Started before Run so events emitted by the
-	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and
-	// render as soon as Run starts.
+	// Give the Dock icon an effect. Qt has no reopen-delegate hook of its own on
+	// macOS either, so without this the icon is inert: clicking it does nothing
+	// at all, which is worse than having no icon.
+	//
+	// The FIRST activation is ignored on purpose. Launching the app activates it,
+	// and a window appearing unasked at every login is exactly the behaviour a
+	// tray app should not have. Every activation after that is a deliberate
+	// "bring this up" — a Dock click or a Cmd-Tab — and shows the window.
+	firstActivation := true
+	watchDockActivation(func() {
+		if firstActivation {
+			firstActivation = false
+			log.Print("dock: first activation (launch) — leaving the window hidden")
+			return
+		}
+		log.Print("dock: activated — showing the status window")
+		a.ShowStatus()
+	})
+	a.startUptimeTicker()
+
+	// The one event pump. Started before the event loop so events emitted by
+	// the connect-on-launch below queue onto a.dispatch and render as soon as
+	// the drain timer (below) starts ticking.
 	go a.pump()
 
 	// Signal-driven exit. launchd's stop (SIGTERM), Ctrl-C (SIGINT), a hangup
@@ -1760,7 +1722,7 @@ func main() {
 	// signal is never dropped before the handler is scheduled.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go a.watchSignals(sigs, func() { fyne.Do(a.fyneApp.Quit) })
+	go a.watchSignals(sigs, func() { a.dispatch.Post(func() { qt.QCoreApplication_Quit() }) })
 
 	// Sleep/wake-driven reconnect: a laptop resuming from sleep is the one drop
 	// openconnect's own dead-peer detection is slowest to notice (this gateway
@@ -1769,14 +1731,24 @@ func main() {
 	// macOS, PowerRegisterSuspendResumeNotification on Windows, logind's
 	// PrepareForSleep over D-Bus on Linux); onSystemWake decides whether to act.
 	watchSystemSleep(a.onSystemWake)
+	// Display-only sleep/wake: see onScreenWake's doc comment for why this is
+	// a separate hook from watchSystemSleep, not a duplicate of it.
+	//
+	// No watchMainThreadFreeze here, unlike the old fyne/glfw build: this is
+	// the core point of the Qt migration. The old watchdog existed because
+	// glfw.PollEvents() could block the UI goroutine forever after a display
+	// sleep/wake cycle, wedging every fyne.Do queued after it. The
+	// uidispatch+QTimer architecture (below) removes that failure class rather
+	// than detecting and recovering from it: nothing here ever blocks on a
+	// call into Qt from another goroutine.
+	watchScreenWake(a.onScreenWake)
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a
 	// new cookie clears the stale FortiGate session that would otherwise reject
 	// the cookie in a loop. On the direct path (Windows) ReapStale is a no-op.
 	// The connect is marshalled back onto the UI goroutine (a.Connect touches the
-	// settings window when the active profile is unconfigured); it queues onto
-	// fyne's main-loop queue and runs as soon as Run starts.
+	// settings window when the active profile is unconfigured) via a.dispatch.
 	// resumed is a SEPARATE question from cfg.Autostart: it is set for exactly one
 	// launch, right after an update restart that tore down a tunnel which was
 	// actually connected — see consumeResumeMarker. Without it, a user who
@@ -1787,7 +1759,7 @@ func main() {
 		log.Print("openfortitray: resuming the VPN session that was up before this update restart")
 	}
 	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
-	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, func() { fyne.Do(a.Connect) })
+	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, func() { a.dispatch.Post(a.Connect) })
 
 	// Background update checker: polls GitHub for a newer release and, if found,
 	// surfaces a one-click "Update … & Restart" item on the tray. Fully best-effort
@@ -1795,17 +1767,32 @@ func main() {
 	// checker treats as never-newer, so local runs never prompt.
 	go a.startUpdateChecker(context.Background())
 
-	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's Quit
-	// item and the signal handler both drive only after the tunnel has been torn
-	// down (see app.shutdown). A tray-only fyne app (no window ever shown) stays
-	// alive here and exits cleanly on Quit — verified against fyne v2.8's glfw
-	// run loop.
-	log.Print("entering fyne run loop")
-	a.fyneApp.Run()
-	log.Print("fyne run loop returned; waiting for the tunnel teardown")
-	// fyne quits the run loop from its own signal handler, so arriving here does
-	// NOT mean the tunnel is down. Block until it is (see awaitShutdown) —
-	// otherwise the process exits mid-teardown and leaks the server-side session.
+	// The drain timer is what actually pumps a.dispatch's queued work onto the
+	// Qt main thread — the one piece with no fyne.Do-era counterpart. 30ms is
+	// frequent enough that a posted UI mutation renders as though synchronous
+	// to a human, while staying cheap when idle.
+	// drain is intentionally never freed (no DeleteLater/GoGC call anywhere)
+	// — it lives for the whole process, ticking until qt.QCoreApplication_Quit()
+	// stops the event loop below. Freeing it while Exec's loop is still
+	// running would risk a use-after-free the next time the loop tries to
+	// fire its already-registered timeout, for no benefit: the process is
+	// exiting either way once Exec returns.
+	drain := qt.NewQTimer2(nil)
+	drain.SetInterval(30)
+	drain.OnTimeout(a.dispatch.Drain)
+	drain.Start(30)
+
+	// Exec blocks the main goroutine until qt.QCoreApplication_Quit(), which the
+	// tray's Quit item and the signal handler both drive only after the tunnel
+	// has been torn down (see app.shutdown). A tray-only app (no window ever
+	// shown) stays alive here and exits cleanly on Quit.
+	log.Print("entering Qt event loop")
+	execQApplication()
+	log.Print("Qt event loop returned; waiting for the tunnel teardown")
+	// Quit can be driven from outside app.shutdown (e.g. a desktop session
+	// logout), so arriving here does NOT by itself mean the tunnel is down.
+	// Block until it is (see awaitShutdown) — otherwise the process exits
+	// mid-teardown and leaks the server-side session.
 	a.awaitShutdown()
 	log.Print("app exiting")
 }
