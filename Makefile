@@ -72,27 +72,29 @@ LDFLAGS_VER := -X main.version=$(VERSION)
 # build on EVERY OS. That kills the old pure cross-compile model
 # (CGO_ENABLED=0 for linux/windows from any host). Each OS must now build on
 # its own native toolchain:
-#   - darwin: cgo via the Xcode CLT. The amd64 slice still cross-builds from an
-#     Apple Silicon mac because the macOS SDK is a fat SDK; if a future SDK
-#     drops x86_64, delete that line — it only serves pre-2020 Intel macs.
+#   - darwin: cgo via the Xcode CLT, arm64 only. Intel (amd64) macOS support
+#     was dropped: it required a second, x86_64 Homebrew/Qt6 install
+#     cross-built under Rosetta, and Homebrew has stopped shipping precompiled
+#     Intel bottles for some of Qt6's own dependencies (confirmed live:
+#     "openssl@3: no bottle available!", Tier 3/community-support-only) — the
+#     x86_64 leg can no longer reliably build in CI at all, independent of
+#     anything in this repo.
 #   - linux: cgo needs gcc + the Qt6 dev headers (qt6-base-dev).
 #   - windows: cgo needs a MinGW gcc; -H=windowsgui suppresses the console
 #     window. Cannot be cross-built from a non-windows host without a MinGW
 #     cross-toolchain.
 #
 # Consequently a LOCAL `make release` can only build what THIS host's toolchain
-# supports: on macOS both darwin slices (arm64 native + amd64 via the fat SDK),
-# on linux the linux binary, on windows the windows exe. The full three-OS
-# matrix is produced by CI (.github/workflows/release.yml), one native runner
-# per OS. This target builds the host-appropriate subset and says so.
+# supports: on macOS the darwin/arm64 binary, on linux the linux binary, on
+# windows the windows exe. The full OS matrix is produced by CI
+# (.github/workflows/release.yml), one native runner per OS. This target
+# builds the host-appropriate subset and says so.
 release: clean
 	mkdir -p $(DIST)
 ifeq ($(shell uname -s),Darwin)
 	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
-	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-amd64 $(PKG)
 	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
-	@file $(DIST)/$(BIN)-darwin-amd64 | grep -q 'x86_64'
-	@echo "make release: built darwin arm64 + amd64. linux/windows come from CI (native runners)."
+	@echo "make release: built darwin arm64. linux/windows come from CI (native runners)."
 else ifeq ($(shell uname -s),Linux)
 	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."

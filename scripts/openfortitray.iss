@@ -46,14 +46,6 @@
   #define MyAppExe "..\dist\openfortitray-windows-amd64.exe"
 #endif
 
-; Directory holding the bundled Mesa llvmpipe GL DLLs (opengl32.dll +
-; libgallium_wgl.dll). CI's "Bundle Mesa software OpenGL" step extracts them
-; into dist/ before ISCC runs, so they sit beside the exe. Override with
-; /DMyMesaDir if they live elsewhere.
-#ifndef MyMesaDir
-  #define MyMesaDir "..\dist"
-#endif
-
 ; Directory holding the Qt6 runtime DLLs + platform plugin that CI's "Bundle
 ; Qt6 runtime DLLs" step (windeployqt6) drops next to the exe (miqt
 ; migration; the exe now links Qt6 at runtime, unlike the old static-binary
@@ -114,30 +106,25 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; The CI-built tray exe, renamed to openfortitray.exe at the install target
 ; (matches install.ps1's %ProgramFiles%\openfortitray\openfortitray.exe).
 Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: ignoreversion
-; Bundled Mesa llvmpipe software OpenGL, installed into {app} beside the exe.
-; Windows loads an app-directory opengl32.dll before the system one, so the tray
-; renders in software on GPU-less machines (VMs/RDP) that have no GL driver.
-; opengl32.dll is a thin WGL front-end that loads its driver from
-; libgallium_wgl.dll, so BOTH must ship. Removed automatically on uninstall
-; (Inno tracks [Files] it installs). Mesa is MIT-style — see THIRD_PARTY_LICENSES.
-Source: "{#MyMesaDir}\opengl32.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#MyMesaDir}\libgallium_wgl.dll"; DestDir: "{app}"; Flags: ignoreversion
-; Bundled Qt6 runtime (miqt migration): windeployqt6 drops the Qt*.dll files
-; flat beside the exe and the platform plugin (qwindows.dll) into a
-; platforms\ subdirectory. Both are required at runtime now that the exe
-; links Qt6 (see cmd/openfortitray/qtapp.go). Tracked by Inno, so uninstall
-; removes them.
-Source: "{#MyQtDir}\Qt6*.dll"; DestDir: "{app}"; Flags: ignoreversion
+; Every DLL CI leaves flat in dist\: Mesa's llvmpipe software OpenGL
+; (opengl32.dll + libgallium_wgl.dll — Windows loads an app-directory
+; opengl32.dll before the system one, so the tray renders in software on
+; GPU-less machines with no GL driver; Mesa is MIT-style, see
+; THIRD_PARTY_LICENSES), the Qt6 runtime windeployqt6 drops beside the exe,
+; and the full transitive MinGW/UCRT64 dependency closure CI's "Bundle
+; transitive Qt6/MinGW DLL closure" step walks and copies there (compiler
+; runtime like libgcc_s_seh-1.dll, and Qt's own third-party deps like
+; libdouble-conversion.dll, libpcre2-*.dll, libharfbuzz-0.dll, ... — Qt6 on
+; this MSYS2 build links these as separate shared packages rather than
+; privately bundling them, and neither windeployqt6 nor --compiler-runtime
+; know to bundle any of them). One wildcard instead of naming each
+; individually: the exact set has already changed twice as new transitive
+; deps surfaced as real "$X.dll was not found" crashes, and will again.
+; Tracked by Inno, so uninstall removes them.
+Source: "{#MyQtDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+; The Qt platform plugin (qwindows.dll), required at runtime now that the
+; exe links Qt6 (see cmd/openfortitray/qtapp.go).
 Source: "{#MyQtDir}\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion
-; The MinGW/UCRT64 compiler runtime both cgo's own object code and the
-; MinGW-built Qt6 DLLs above need at load time. windeployqt6 does not bundle
-; these (verified: its --compiler-runtime flag copies nothing on this UCRT64
-; setup), so CI's "Bundle Qt6 runtime DLLs" step copies them next to the exe
-; explicitly, the same as the Qt DLLs above. Without them: "The code
-; execution cannot proceed because libgcc_s_seh-1.dll was not found."
-Source: "{#MyQtDir}\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#MyQtDir}\libstdc++-6.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#MyQtDir}\libwinpthread-1.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
 ; installed into {app}\openconnect. The tray resolves this path at runtime
 ; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config

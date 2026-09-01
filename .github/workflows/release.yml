@@ -28,13 +28,16 @@ defaults:
     shell: bash
 
 jobs:
-  # darwin needs cgo (Qt6/miqt drives the Cocoa status bar and window), so
-  # both slices must be built on a macOS runner. macos-14 is Apple Silicon:
-  # arm64 is native and the amd64 slice cross-builds because the macOS SDK is a
-  # fat SDK. If a future SDK drops x86_64, delete the amd64 step and the arch
-  # guard — it only serves pre-2020 Intel macs.
+  # darwin needs cgo (Qt6/miqt drives the Cocoa status bar and window), so it
+  # must build on a macOS runner. macos-14 is Apple Silicon, so this is arm64
+  # only — the amd64 (Intel) leg was dropped: it required a second, x86_64
+  # Homebrew/Qt6 install cross-built under Rosetta, and Homebrew has stopped
+  # shipping precompiled Intel bottles for some of Qt6's own dependencies
+  # (confirmed live: "openssl@3: no bottle available!", now Tier
+  # 3/community-support-only) — the x86_64 leg can no longer reliably build in
+  # CI at all, independent of anything in this repo.
   build-darwin:
-    name: Build darwin (arm64 + amd64 + .dmg)
+    name: Build darwin (arm64 + .dmg)
     runs-on: macos-14
     env:
       CGO_ENABLED: '1'
@@ -58,48 +61,25 @@ jobs:
           xcrun --sdk macosx --show-sdk-path
 
       # macos-14 is Apple Silicon, so Homebrew's arm64-native `qt` bottle lives
-      # under /opt/homebrew. The amd64 build leg below needs a second,
-      # x86_64 Qt6 install: macos-14 runners ship a parallel x86_64 Homebrew
-      # at /usr/local (under Rosetta) for exactly this cross-arch case.
-      - name: Install Qt6 (arm64 + x86_64, for both build legs)
-        run: |
-          brew install qt pkg-config
-          # macos-14 (Apple Silicon) runners do not ship a working x86_64
-          # Homebrew at /usr/local — confirmed live (v0.2.0's first release
-          # attempt failed here with "arch: /usr/local/bin/brew isn't
-          # executable"). Bootstrap one fresh under Rosetta if it's not
-          # already a real executable, matching Homebrew's own documented
-          # x86_64-on-Apple-Silicon install path.
-          softwareupdate --install-rosetta --agree-to-license || true
-          if [ ! -x /usr/local/bin/brew ]; then
-            arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          fi
-          arch -x86_64 /usr/local/bin/brew install qt pkg-config
+      # under /opt/homebrew — the only Qt6 install this job needs now.
+      - name: Install Qt6
+        run: brew install qt pkg-config
 
       # The build version is stamped into main.version (shown in the tray header)
       # via -X main.version=${GITHUB_REF_NAME}, merged into the -ldflags below
-      # (alongside -s -w, and -H=windowsgui on the windows job). PKG_CONFIG_PATH
-      # is set explicitly per architecture: with both the arm64 (/opt/homebrew)
-      # and x86_64 (/usr/local, Rosetta) Qt6 installs present on the runner,
-      # pkg-config's default search path must not resolve the wrong one for
-      # either leg.
-      - name: Build darwin binaries
+      # (alongside -s -w, and -H=windowsgui on the windows job).
+      - name: Build darwin binary
         # -s -w strips the symbol table and DWARF to trim the binary's size.
         run: |
           mkdir -p dist
-          PKG_CONFIG_PATH="$(/opt/homebrew/bin/brew --prefix qt)/lib/pkgconfig" \
+          PKG_CONFIG_PATH="$(brew --prefix qt)/lib/pkgconfig" \
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
             go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
-          PKG_CONFIG_PATH="$(arch -x86_64 /usr/local/bin/brew --prefix qt)/lib/pkgconfig" \
-          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
-            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-amd64 ./cmd/openfortitray
           ls -l dist
 
-      - name: Verify architectures
-        # Cheap guard against a silently-native amd64 build.
-        run: |
-          file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
-          file dist/openfortitray-darwin-amd64 | grep -q 'x86_64'
+      - name: Verify architecture
+        # Cheap guard against a silently-wrong build.
+        run: file dist/openfortitray-darwin-arm64 | grep -q 'arm64'
 
       # A menu-bar app needs a real .app bundle (Info.plist + LSUIElement) to
       # host the status item reliably and stay off the Dock. `make dmg`
@@ -126,7 +106,6 @@ jobs:
         run: |
           shasum -a 256 \
             openfortitray-darwin-arm64 \
-            openfortitray-darwin-amd64 \
             "OpenFortiTray-${GITHUB_REF_NAME}.dmg" > SHA256SUMS.darwin
           cat SHA256SUMS.darwin
 
@@ -136,7 +115,6 @@ jobs:
           name: binaries-darwin
           path: |
             dist/openfortitray-darwin-arm64
-            dist/openfortitray-darwin-amd64
             dist/OpenFortiTray-${{ github.ref_name }}.dmg
             dist/SHA256SUMS.darwin
           if-no-files-found: error
@@ -345,6 +323,47 @@ jobs:
           test -s dist/libstdc++-6.dll
           test -s dist/libwinpthread-1.dll
 
+      # windeployqt6 only walks Qt's OWN module graph (Qt6Core, Qt6Gui, ...)
+      # and, per above, not even the MinGW compiler runtime. It has no idea
+      # that this Qt6 was itself built by MSYS2 UCRT64 as a bunch of SEPARATE
+      # dynamically-linked packages (double-conversion, pcre2, harfbuzz,
+      # freetype, icu, glib2, zstd, brotli, ...) rather than Qt's usual
+      # privately-bundled copies — so none of THOSE get bundled either.
+      # Naming them one at a time as each is discovered by a real crash
+      # (libgcc_s_seh-1.dll, then libdouble-conversion.dll, ...) is
+      # whack-a-mole; this walks the REAL dependency closure instead: starting
+      # from the exe and every DLL windeployqt6 already dropped (including
+      # its plugin subdirectories), read each file's imported DLL names via
+      # objdump (from mingw-w64-ucrt-x86_64-binutils, already on PATH), and
+      # for every name that resolves under the MSYS2 ucrt64 bin dir (a
+      # genuine Windows system DLL like kernel32.dll never does, so the `cp`
+      # for those silently fails and is skipped) copy it flat into dist/ and
+      # queue it too, since IT may have further dependencies of its own.
+      # Windows' default search order includes the main exe's directory for
+      # every LoadLibrary in the process, so a flat dist/ copy is found even
+      # by a DLL loaded from a subdirectory like dist/platforms/.
+      - name: Bundle transitive Qt6/MinGW DLL closure
+        run: |
+          set -euo pipefail
+          ucrt_bin="${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+          declare -A seen
+          queue=("dist/openfortitray-windows-amd64.exe")
+          while IFS= read -r -d '' f; do queue+=("$f"); done < <(find dist -iname '*.dll' -print0)
+          while [ ${#queue[@]} -gt 0 ]; do
+            f="${queue[-1]}"
+            unset 'queue[-1]'
+            [ -n "${seen[$f]:-}" ] && continue
+            seen[$f]=1
+            for dep in $(objdump -p "$f" 2>/dev/null | awk '/DLL Name:/ {print $3}'); do
+              target="dist/$dep"
+              [ -f "$target" ] && continue
+              if cp "$ucrt_bin\\$dep" "$target" 2>/dev/null; then
+                echo "bundled transitive dependency: $dep"
+                queue+=("$target")
+              fi
+            done
+          done
+
       # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
       # the app so Windows is turnkey. There is no reliable way to install
       # openconnect on a locked-down Cloud PC (winget is a dead stub; MSYS2 has no
@@ -478,7 +497,7 @@ jobs:
         # cosmetic, but verifying the artifacts exactly as received is clearer.
         # The .dmg (a disk image) and the .exe are left alone.
         working-directory: dist
-        run: chmod +x openfortitray-darwin-arm64 openfortitray-darwin-amd64 openfortitray-linux-amd64
+        run: chmod +x openfortitray-darwin-arm64 openfortitray-linux-amd64
 
       - name: Create GitHub Release
         # `gh release create` over softprops/action-gh-release: gh is preinstalled
@@ -501,7 +520,6 @@ jobs:
             "dist/OpenFortiTray-${GITHUB_REF_NAME}.dmg" \
             "dist/OpenFortiTray-${SETUP_VERSION}-Setup.exe" \
             dist/openfortitray-darwin-arm64 \
-            dist/openfortitray-darwin-amd64 \
             dist/openfortitray-linux-amd64 \
             dist/openfortitray-windows-amd64.exe \
             dist/opengl32.dll \
