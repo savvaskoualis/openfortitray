@@ -368,6 +368,41 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 	}
 }
 
+// The Power Nap case: a second wake arriving inside wakeReconnectCooldown of
+// the last forced reconnect must NOT force another one — diagnosed live from
+// a 380-cycle overnight reconnect storm caused by macOS waking the machine
+// every 60-90s on AC power despite the tunnel never actually going down. A
+// wake further apart than the cooldown (the real-sleep case) is already
+// covered by TestOnSystemWakeForcesReconnectWhenWantConnected.
+func TestOnSystemWakeDebouncesRapidWakes(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+
+	drainDispatchAsync(t, a, a.onSystemWake)
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first wake did not force a reconnect")
+	}
+
+	// A second wake, seconds later, is well inside wakeReconnectCooldown.
+	drainDispatchAsync(t, a, a.onSystemWake)
+	select {
+	case <-authCalled:
+		t.Error("second wake within the cooldown forced another reconnect — Power Nap storm not debounced")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !a.wantConnected.Load() {
+		t.Error("wantConnected must still be true — debouncing a wake must not disconnect")
+	}
+}
+
 // A display wake must never touch the tunnel — it exists purely to
 // re-assert the tray icon (a.tray stays nil in this test setup, so there's
 // nothing to observe there beyond "does not panic"), unlike onSystemWake,

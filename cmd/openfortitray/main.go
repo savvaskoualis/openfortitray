@@ -152,6 +152,11 @@ type app struct {
 	// race-free answer to "should this reconnect" without touching pump-goroutine-
 	// only state.
 	wantConnected atomic.Bool
+	// lastWakeReconnectAt is when onSystemWake last forced a Disconnect+Connect.
+	// It is read and written only inside onSystemWake's a.dispatch.Post closure
+	// (the UI goroutine), so it needs no synchronization of its own — like
+	// lastNotified, it is dispatch-goroutine-only state.
+	lastWakeReconnectAt time.Time
 	// cookieGet/cookieSet/cookieDelete are the credstore seam. They default to the
 	// package funcs in main(); tests substitute an in-memory fake so the cache-first
 	// flow is exercised without touching the real keychain. samlAuth is the SAML
@@ -396,14 +401,26 @@ func (a *app) startTunnel() {
 	a.sup.Connect()
 }
 
+// wakeReconnectCooldown bounds how often onSystemWake will force a
+// Disconnect+Connect. macOS Power Nap wakes the machine every 60-90s on AC
+// power even though the network and VPN session never actually went down —
+// diagnosed live from a 380-cycle overnight reconnect storm, one full
+// Disconnect+Connect per Power Nap wake, all night. A wake inside the
+// cooldown is treated as one of those and left alone, trusting the still-live
+// session; a wake further apart than this is treated as a real sleep (lid
+// closed, laptop put away) and still forces the reconnect exactly as before.
+const wakeReconnectCooldown = 5 * time.Minute
+
 // onSystemWake forces a fresh reconnect after the OS reports the machine resumed
-// from sleep — see watchSystemSleep. It exists because openconnect's own dead-peer
-// detection is comparatively slow (this gateway explicitly disables openconnect's
-// self-managed reconnect, so a stale post-sleep tunnel is only caught once a
-// keepalive round trip times out), which can leave the tray looking "Connected" to
-// a session that has been dead since before the laptop went to sleep. Forcing an
-// immediate Disconnect+Connect is exactly what the tray's own Disconnect-then-
-// Connect already does when a user does it manually — this only automates that.
+// from sleep — see watchSystemSleep — but only outside wakeReconnectCooldown of
+// the last one (see its doc comment). It exists because openconnect's own
+// dead-peer detection is comparatively slow (this gateway explicitly disables
+// openconnect's self-managed reconnect, so a stale post-sleep tunnel is only
+// caught once a keepalive round trip times out), which can leave the tray
+// looking "Connected" to a session that has been dead since before the laptop
+// went to sleep. Forcing an immediate Disconnect+Connect is exactly what the
+// tray's own Disconnect-then-Connect already does when a user does it
+// manually — this only automates that, for a REAL sleep.
 //
 // It also unconditionally re-asserts the tray icon and menu, regardless of
 // wantConnected: a sleep/wake cycle can silently drop the NSStatusItem (the same
@@ -430,6 +447,11 @@ func (a *app) onSystemWake() {
 		if !wantConnected {
 			return
 		}
+		if since := time.Since(a.lastWakeReconnectAt); !a.lastWakeReconnectAt.IsZero() && since < wakeReconnectCooldown {
+			log.Printf("openfortitray: woke %v after the last forced reconnect (Power Nap?); leaving the session alone", since.Round(time.Second))
+			return
+		}
+		a.lastWakeReconnectAt = time.Now()
 		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
 		a.Connect()
