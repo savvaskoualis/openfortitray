@@ -345,6 +345,47 @@ jobs:
           test -s dist/libstdc++-6.dll
           test -s dist/libwinpthread-1.dll
 
+      # windeployqt6 only walks Qt's OWN module graph (Qt6Core, Qt6Gui, ...)
+      # and, per above, not even the MinGW compiler runtime. It has no idea
+      # that this Qt6 was itself built by MSYS2 UCRT64 as a bunch of SEPARATE
+      # dynamically-linked packages (double-conversion, pcre2, harfbuzz,
+      # freetype, icu, glib2, zstd, brotli, ...) rather than Qt's usual
+      # privately-bundled copies — so none of THOSE get bundled either.
+      # Naming them one at a time as each is discovered by a real crash
+      # (libgcc_s_seh-1.dll, then libdouble-conversion.dll, ...) is
+      # whack-a-mole; this walks the REAL dependency closure instead: starting
+      # from the exe and every DLL windeployqt6 already dropped (including
+      # its plugin subdirectories), read each file's imported DLL names via
+      # objdump (from mingw-w64-ucrt-x86_64-binutils, already on PATH), and
+      # for every name that resolves under the MSYS2 ucrt64 bin dir (a
+      # genuine Windows system DLL like kernel32.dll never does, so the `cp`
+      # for those silently fails and is skipped) copy it flat into dist/ and
+      # queue it too, since IT may have further dependencies of its own.
+      # Windows' default search order includes the main exe's directory for
+      # every LoadLibrary in the process, so a flat dist/ copy is found even
+      # by a DLL loaded from a subdirectory like dist/platforms/.
+      - name: Bundle transitive Qt6/MinGW DLL closure
+        run: |
+          set -euo pipefail
+          ucrt_bin="${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+          declare -A seen
+          queue=("dist/openfortitray-windows-amd64.exe")
+          while IFS= read -r -d '' f; do queue+=("$f"); done < <(find dist -iname '*.dll' -print0)
+          while [ ${#queue[@]} -gt 0 ]; do
+            f="${queue[-1]}"
+            unset 'queue[-1]'
+            [ -n "${seen[$f]:-}" ] && continue
+            seen[$f]=1
+            for dep in $(objdump -p "$f" 2>/dev/null | awk '/DLL Name:/ {print $3}'); do
+              target="dist/$dep"
+              [ -f "$target" ] && continue
+              if cp "$ucrt_bin\\$dep" "$target" 2>/dev/null; then
+                echo "bundled transitive dependency: $dep"
+                queue+=("$target")
+              fi
+            done
+          done
+
       # Bundle openconnect + its full DLL closure + wintun + vpnc-script next to
       # the app so Windows is turnkey. There is no reliable way to install
       # openconnect on a locked-down Cloud PC (winget is a dead stub; MSYS2 has no
