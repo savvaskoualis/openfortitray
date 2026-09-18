@@ -34,11 +34,12 @@ const (
 // per-platform native code to query icon geometry, which would reintroduce
 // exactly the platform-specific complexity this migration removes.
 //
-// It only moves the window; it does not show it — tray.Setup's SetOnClick
-// wiring calls this and then app.ShowStatus, which does the actual
-// WindowShow + nav:status emit.
+// It only moves the window; it does not show it — onTrayClick (tray.Setup's
+// onIconClick callback) calls this and then app.ShowStatus, which does the
+// actual WindowShow + nav:status emit.
 func (a *app) positionWindow() {
-	if a.ctx == nil {
+	ctx := a.ctxSnapshot()
+	if ctx == nil {
 		return
 	}
 
@@ -52,7 +53,7 @@ func (a *app) positionWindow() {
 	// still places the window sanely rather than leaving it off-screen or
 	// crashing.
 	screenW, screenH := 1440, 900
-	if screens, err := wailsruntime.ScreenGetAll(a.ctx); err == nil {
+	if screens, err := wailsruntime.ScreenGetAll(ctx); err == nil {
 		for _, s := range screens {
 			if s.IsPrimary {
 				screenW, screenH = s.Size.Width, s.Size.Height
@@ -62,5 +63,5 @@ func (a *app) positionWindow() {
 	}
 
 	x, y := tray.CornerPosition(corner, screenW, screenH, windowW, windowH, positionMargin)
-	wailsruntime.WindowSetPosition(a.ctx, x, y)
+	wailsruntime.WindowSetPosition(ctx, x, y)
 }

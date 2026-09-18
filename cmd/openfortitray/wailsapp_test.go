@@ -2,10 +2,12 @@ package main
 
 import (
 	"embed"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 )
@@ -25,6 +27,9 @@ func TestBuildAppOptionsFrameless380x600(t *testing.T) {
 	}
 	if opts.Title != "OpenFortiTray" {
 		t.Errorf("expected title OpenFortiTray, got %q", opts.Title)
+	}
+	if !opts.StartHidden {
+		t.Error("expected StartHidden: true — a tray app must not pop its window up unasked at every launch")
 	}
 	if len(opts.Bind) != 1 {
 		t.Fatalf("expected exactly one bound object, got %d", len(opts.Bind))
@@ -61,6 +66,76 @@ func TestBridgeRecentActivityNilRing(t *testing.T) {
 	b := &Bridge{a: &app{}}
 	if got := b.RecentActivity(); got != nil {
 		t.Errorf("expected nil, got %+v", got)
+	}
+}
+
+// TestBridgeSaveConfigValidationFailures proves SaveConfig routes an invalid
+// config to its validation-failure path (settings.Validate) rather than ever
+// reaching Commit — the one place untrusted-shaped JS data reaches Go, so a
+// malformed value here must never fall through to being persisted. Each case
+// uses a bare &app{} (a.cfg stays nil): validation happens on the *passed-in*
+// cfg, before settingsHost().Commit is ever called, so an invalid cfg never
+// needs a working Commit path.
+func TestBridgeSaveConfigValidationFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		cfg        config.Config
+		wantSubstr string
+	}{
+		{
+			name:       "no profiles at all",
+			cfg:        config.Config{},
+			wantSubstr: "at least one profile",
+		},
+		{
+			name: "gateway carries a scheme/port instead of a bare host",
+			cfg: config.Config{Profiles: []config.Profile{
+				{Name: "Default", Gateway: "https://vpn.example.com:10443"},
+			}},
+			wantSubstr: "host only",
+		},
+		{
+			name: "custom port out of range",
+			cfg: config.Config{Profiles: []config.Profile{
+				{Name: "Default", Gateway: "vpn.example.com", CustomPort: true, Port: 70000},
+			}},
+			wantSubstr: "port must be between",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &Bridge{a: &app{}}
+			issue := b.SaveConfig(tt.cfg)
+			if issue == nil {
+				t.Fatal("expected a validation issue, got nil")
+			}
+			if !strings.Contains(issue.Message, tt.wantSubstr) {
+				t.Errorf("issue.Message = %q, want a substring %q", issue.Message, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestBridgeGatewayLabelDTLSLabelVersionDelegate proves the Finding 7/10
+// Bridge accessors are plain delegations to the existing app methods
+// (GatewayLabel/DTLSLabel already have their own thorough table tests in
+// main_test.go; this only proves Bridge forwards to them, and to Version,
+// without transforming the result).
+func TestBridgeGatewayLabelDTLSLabelVersionDelegate(t *testing.T) {
+	a := &app{cfg: &config.Config{
+		ActiveProfile: "p",
+		Profiles:      []config.Profile{{Name: "p", Gateway: "vpn.example.com", Port: 10443, DTLS: true}},
+	}}
+	b := &Bridge{a: a}
+
+	if got, want := b.GatewayLabel(), a.GatewayLabel(); got != want {
+		t.Errorf("Bridge.GatewayLabel() = %q, want %q (a.GatewayLabel())", got, want)
+	}
+	if got, want := b.DTLSLabel(), a.DTLSLabel(); got != want {
+		t.Errorf("Bridge.DTLSLabel() = %q, want %q (a.DTLSLabel())", got, want)
+	}
+	if got, want := b.Version(), a.Version(); got != want {
+		t.Errorf("Bridge.Version() = %q, want %q (a.Version())", got, want)
 	}
 }
 

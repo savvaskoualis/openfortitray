@@ -141,8 +141,12 @@ type Entry struct {
 }
 
 // Ring is a fixed-capacity history of state transitions, newest first. It is not
-// safe for concurrent use: every caller runs on the fyne UI goroutine, and adding
-// a mutex would only hide a threading mistake rather than prevent one.
+// safe for concurrent use on its own — no internal mutex, by design, so a
+// caller can't rely on Ring to hide a threading mistake. cmd/openfortitray's
+// app.activity is a *Ring, and pump()'s Add now races Bridge.RecentActivity's
+// Entries() from an arbitrary goroutine, so that caller guards every access
+// with its own app.mu (see Ruling 18 / app.recentActivity) — external locking
+// is required there, not optional.
 type Ring struct {
 	buf  []Entry
 	n    int // number of live entries

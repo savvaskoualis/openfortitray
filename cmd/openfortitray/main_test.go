@@ -1086,3 +1086,96 @@ func TestGatewayLabelAndDTLSLabel(t *testing.T) {
 		})
 	}
 }
+
+// TestSetCtxCtxSnapshotRoundTrip proves the mu-guarded ctx accessors
+// round-trip (Finding 6): a fresh app's ctx is nil, and whatever setCtx
+// records is exactly what ctxSnapshot returns.
+func TestSetCtxCtxSnapshotRoundTrip(t *testing.T) {
+	a := &app{}
+	if got := a.ctxSnapshot(); got != nil {
+		t.Fatalf("expected a fresh app's ctxSnapshot() to be nil, got %v", got)
+	}
+
+	ctx := context.Background()
+	a.setCtx(ctx)
+	if got := a.ctxSnapshot(); got != ctx {
+		t.Errorf("ctxSnapshot() = %v, want the context set by setCtx", got)
+	}
+}
+
+// TestCtxSnapshotConcurrentWithSetCtx exercises the exact hazard Finding 6
+// describes: go a.pump() (or any other goroutine) reading a.ctx while
+// OnStartup's goroutine writes it via setCtx. Run with -race to confirm
+// a.mu genuinely serializes the two.
+func TestCtxSnapshotConcurrentWithSetCtx(t *testing.T) {
+	a := &app{}
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		a.setCtx(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = a.ctxSnapshot()
+		}
+	}()
+	wg.Wait()
+
+	if got := a.ctxSnapshot(); got != ctx {
+		t.Errorf("ctxSnapshot() after setCtx = %v, want %v", got, ctx)
+	}
+}
+
+// TestOnTrayClickTogglesVisibility proves Finding 9's fix: a tray-icon click
+// positions+reveals the window when it is hidden, and hides it (rather than
+// re-showing it) when it is already visible — a Tailscale-style toggle,
+// instead of the old always-show behaviour that raced the frontend's
+// blur-to-hide handler. a.ctx stays nil here (no live Wails runtime in a
+// test), so positionWindow/WindowHide are no-ops, but the windowVisible
+// bookkeeping onTrayClick drives is exercised directly.
+func TestOnTrayClickTogglesVisibility(t *testing.T) {
+	a := &app{}
+
+	if a.windowVisibleSnapshot() {
+		t.Fatal("expected a fresh app to start not-visible")
+	}
+
+	a.onTrayClick() // hidden -> position + reveal (ShowStatus)
+	if !a.windowVisibleSnapshot() {
+		t.Error("onTrayClick from hidden must mark the window visible")
+	}
+
+	a.onTrayClick() // visible -> hide
+	if a.windowVisibleSnapshot() {
+		t.Error("onTrayClick from visible must mark the window hidden, not show it again")
+	}
+}
+
+// TestShowSettingsShowStatusHideWindowTrackVisibility proves the other half
+// of Finding 9: any path that shows or hides the window — not just the tray
+// icon click — keeps windowVisible in sync, so a window opened via the
+// "Open"/Settings… tray menu items is still correctly "visible" for the next
+// tray-icon click's toggle decision.
+func TestShowSettingsShowStatusHideWindowTrackVisibility(t *testing.T) {
+	a := &app{}
+
+	a.ShowStatus()
+	if !a.windowVisibleSnapshot() {
+		t.Error("ShowStatus must mark the window visible")
+	}
+
+	b := &Bridge{a: a}
+	b.HideWindow()
+	if a.windowVisibleSnapshot() {
+		t.Error("HideWindow (the frontend's blur handler) must mark the window not-visible")
+	}
+
+	a.ShowSettings()
+	if !a.windowVisibleSnapshot() {
+		t.Error("ShowSettings must mark the window visible")
+	}
+}

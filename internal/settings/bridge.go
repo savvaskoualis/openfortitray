@@ -7,12 +7,13 @@ package settings
 import "github.com/savvaskoualis/openfortitray/internal/config"
 
 // Host is implemented by the app adapter (cmd/openfortitray/main.go) and is
-// the only way this package's consumers reach live configuration.
+// the only way this package's consumers reach live configuration. Connect/
+// Disconnect were dropped from this interface (nothing in this package calls
+// them through it — app's real Connect/Disconnect are reached directly, not
+// via settings.Host) rather than left dead.
 type Host interface {
 	Config() *config.Config
 	Commit(c *config.Config) error
-	Connect()
-	Disconnect()
 }
 
 // Validate runs the same checks Commit always ran internally, exposed for a

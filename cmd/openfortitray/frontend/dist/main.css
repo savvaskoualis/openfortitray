@@ -33,11 +33,13 @@ input { font-family: inherit; }
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 14px; border-bottom: 1px solid var(--border);
   color: var(--text); font-size: 13px; font-weight: 600;
-  -webkit-app-region: drag;
+  /* Dragging is wired via the --wails-draggable inline style in index.html
+     (Wails' own cross-platform drag mechanism, which also works on Linux
+     WebKitGTK where -webkit-app-region has no effect) — no separate
+     -webkit-app-region declaration needed here. */
 }
 .titlebar-left { display: flex; align-items: center; gap: 8px; }
 .icon-btn {
-  -webkit-app-region: no-drag;
   display: flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; border-radius: 7px; color: var(--secondary);
 }

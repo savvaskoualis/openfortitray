@@ -115,8 +115,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: ignoreversion
 ; The WebView2 Evergreen bootstrapper, staged into {tmp} for the [Run] step
 ; below rather than permanently installed into {app} — it is a one-shot
-; installer, not a runtime component the app itself loads.
-Source: "{#MyWebView2Bootstrapper}"; DestDir: "{tmp}"; Flags: dontcopy
+; installer, not a runtime component the app itself loads. deleteafterinstall
+; (not dontcopy) is what actually extracts the file into DestDir during the
+; normal install sequence — dontcopy embeds the file in the installer but
+; never extracts it without an explicit ExtractTemporaryFile call in [Code],
+; which this script has none of, so the [Run] step below could never
+; actually find the file. deleteafterinstall removes it again once install
+; finishes, matching dontcopy's "don't leave it behind" intent.
+Source: "{#MyWebView2Bootstrapper}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 ; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
 ; installed into {app}\openconnect. The tray resolves this path at runtime
 ; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config

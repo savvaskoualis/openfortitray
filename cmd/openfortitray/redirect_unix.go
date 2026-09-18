@@ -19,11 +19,12 @@ import (
 // that it did — but a bundled .app launched through LaunchServices has fd 2 wired
 // to the system-log socket, and Cocoa re-establishes that during the platform
 // toolkit's own Cocoa/NSApp init, which runs after this (originally observed
-// with fyne's driver init; the Qt/miqt QApplication constructor now plays the
-// same role and has not been separately re-verified with lsof — this is a
-// general LaunchServices/Cocoa behavior, not something specific to either
-// toolkit). Verified with lsof against the live process at the time: fd 2 was
-// back to `unix ->0x…` while the log file sat on fd 3.
+// with fyne's driver init; both the Qt/miqt QApplication constructor this
+// codebase used at the time and Wails' current WKWebView init play the same
+// role — this is a general LaunchServices/Cocoa behavior, not something
+// specific to any one toolkit, and has not been separately re-verified with
+// lsof under Wails). Verified with lsof against the live process at the
+// time: fd 2 was back to `unix ->0x…` while the log file sat on fd 3.
 //
 // So NSLog output from the native Cocoa layer — including the notification-
 // authorization failure this was written to capture — still does NOT reach

@@ -25,10 +25,11 @@ type pendingUpdate struct {
 // Qt QDialog's offer state. The frontend (frontend/dist/status.js) shows a
 // confirm() and, on yes, calls Bridge.DownloadUpdate.
 func (a *app) promptUpdate(rel *update.Release) {
-	if a.ctx == nil {
+	ctx := a.ctxSnapshot()
+	if ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "update:offer", rel.Tag)
+	wailsruntime.EventsEmit(ctx, "update:offer", rel.Tag)
 }
 
 // prepareUpdate downloads the update with the app still running (replacing
@@ -45,8 +46,8 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		p, err := update.Prepare(ctx, method, a.downloaderFor(rel))
 		if err != nil {
 			log.Printf("update: prepare failed: %v", err)
-			if a.ctx != nil {
-				wailsruntime.EventsEmit(a.ctx, "update:failed", err.Error())
+			if wctx := a.ctxSnapshot(); wctx != nil {
+				wailsruntime.EventsEmit(wctx, "update:failed", err.Error())
 			}
 			return
 		}
@@ -54,8 +55,8 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		a.pendingUpdateMu.Lock()
 		a.pendingUpdate = &pendingUpdate{method: method, prepared: p, rel: rel}
 		a.pendingUpdateMu.Unlock()
-		if a.ctx != nil {
-			wailsruntime.EventsEmit(a.ctx, "update:ready", rel.Tag)
+		if wctx := a.ctxSnapshot(); wctx != nil {
+			wailsruntime.EventsEmit(wctx, "update:ready", rel.Tag)
 		}
 	}()
 }

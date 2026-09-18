@@ -12,7 +12,7 @@ OFT.renderView = function (v) {
   ring.style.borderColor = { disconnected: "var(--secondary)", connecting: "var(--accent)", connected: "var(--green)", error: "var(--red)" }[kind];
   ring.style.color = ring.style.borderColor;
 
-  document.getElementById("state-label").textContent = v.Title || "Not Connected";
+  document.getElementById("state-label").textContent = v.Title || "Disconnected";
   document.getElementById("sub-label").textContent = v.Detail || "";
 
   const btn = document.getElementById("btn-primary");
@@ -31,6 +31,12 @@ OFT.renderView = function (v) {
   details.hidden = kind !== "connected";
   if (kind === "connected") {
     document.getElementById("d-ip").textContent = v.AssignedIP || "";
+    OFT.call("GatewayLabel").then((label) => {
+      document.getElementById("d-gateway").textContent = label || "";
+    });
+    OFT.call("DTLSLabel").then((label) => {
+      document.getElementById("d-protocol").textContent = label || "";
+    });
   }
 };
 
@@ -59,6 +65,12 @@ OFT.refreshActivity = function () {
 window.addEventListener("DOMContentLoaded", () => {
   OFT.call("CurrentView").then(OFT.renderView);
   OFT.refreshActivity();
+  // main.version is stamped from the release tag (e.g. "v1.2.3", already
+  // carrying its own "v"), or "dev" for an unstamped local build — render it
+  // as-is rather than prepending another "v".
+  OFT.call("Version").then((v) => {
+    document.getElementById("version-label").textContent = v;
+  });
 
   document.getElementById("btn-primary").addEventListener("click", () => {
     const label = document.getElementById("btn-primary").textContent;
@@ -77,11 +89,13 @@ window.addEventListener("DOMContentLoaded", () => {
     });
 
     window.runtime.EventsOn("update:offer", (tag) => {
+      document.getElementById("update-badge").hidden = false;
       if (confirm("OpenFortiTray " + tag + " is available. Download it now? (The VPN stays connected during download.)")) {
         OFT.call("DownloadUpdate");
       }
     });
     window.runtime.EventsOn("update:ready", (tag) => {
+      document.getElementById("update-badge").hidden = false;
       if (confirm("OpenFortiTray " + tag + " is ready to install. Restart now? (The app will close and reopen automatically.)")) {
         OFT.call("RestartAndInstall");
       }

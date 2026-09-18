@@ -91,9 +91,14 @@ type app struct {
 
 	tray *tray.Controller
 	// ctx is the Wails runtime context, captured by buildAppOptions' OnStartup
-	// callback once wails.Run has created the webview. Bridge's methods (and
-	// ShowSettings/ShowStatus below) nil-check it, since it stays nil until
-	// startup completes and in every test that never calls wails.Run.
+	// callback once wails.Run has created the webview. It is written once
+	// (OnStartup) but read from many goroutines (pump, the signal handler,
+	// prepareUpdate's goroutine, positionWindow, every Bridge method) — the
+	// same cross-goroutine hazard tp/lastEvent/activity above have, so it is
+	// guarded by the same a.mu via setCtx/ctxSnapshot below. Every read site
+	// nil-checks the ctxSnapshot() result, since it stays nil until startup
+	// completes and in every test that never calls wails.Run. Never read this
+	// field directly outside setCtx/ctxSnapshot.
 	ctx context.Context
 	// lastEvent is the most recent tunnel.Event, guarded by mu like tp/ipsecTP
 	// above so Bridge.CurrentView — invoked on whatever goroutine Wails
@@ -148,6 +153,14 @@ type app struct {
 	// itself is explicitly not safe for concurrent use, so this mutex is load
 	// bearing, not decorative.
 	activity *uistate.Ring
+	// windowVisible tracks whether the Wails window is currently on screen,
+	// guarded by mu like tp/lastEvent/activity above. It is the state
+	// onTrayClick's toggle decision reads, and ShowSettings/ShowStatus/
+	// HideWindow (called from the "Open"/Settings… tray menu items and the
+	// frontend's blur-to-hide handler, not just the tray icon click) all keep
+	// it in sync — so a window shown via any of those paths is still
+	// considered "visible" for the next tray-icon click's toggle decision.
+	windowVisible bool
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -263,6 +276,64 @@ func (a *app) lastEventSnapshot() tunnel.Event {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.lastEvent
+}
+
+// setCtx records the Wails runtime context. Called once, from
+// buildAppOptions' OnStartup callback, on whatever goroutine Wails invokes
+// OnStartup on.
+func (a *app) setCtx(ctx context.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ctx = ctx
+}
+
+// ctxSnapshot returns the Wails runtime context set by setCtx, or nil before
+// startup completes (and in every test that never calls wails.Run). See
+// ctx's doc comment for why this is mu-guarded rather than a direct field
+// read — go a.pump() starts before wails.Run, so the write and reads
+// genuinely race at startup without this.
+func (a *app) ctxSnapshot() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ctx
+}
+
+// setWindowVisible records whether the Wails window is currently on screen.
+// Called from ShowSettings/ShowStatus (true), HideWindow (false) and
+// onTrayClick (both directions) — every path that shows or hides the window
+// — so onTrayClick's toggle decision is never stale.
+func (a *app) setWindowVisible(v bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.windowVisible = v
+}
+
+// windowVisibleSnapshot reports whether the window is currently visible, per
+// the last setWindowVisible call. See windowVisible's doc comment.
+func (a *app) windowVisibleSnapshot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.windowVisible
+}
+
+// onTrayClick is the tray icon's own click handler (wired as tray.Setup's
+// onIconClick callback). It toggles the window: hide if already visible,
+// otherwise position + reveal — matching a Tailscale-style tray icon. This
+// also fixes a race with the frontend's blur-to-hide handler (frontend/dist/
+// app.js): without this check, clicking the icon while the window was
+// already visible would steal focus (blur fires -> HideWindow), then this
+// handler would show it again — an observable flicker, or a click that
+// appeared to do nothing.
+func (a *app) onTrayClick() {
+	if a.windowVisibleSnapshot() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.WindowHide(ctx)
+		}
+		a.setWindowVisible(false)
+		return
+	}
+	a.positionWindow()
+	a.ShowStatus()
 }
 
 // recentActivity returns a snapshot of the activity ring, safe to call from
@@ -691,19 +762,21 @@ func (a *app) Version() string { return version }
 // the settings page (tray.App / Bridge.ShowSettings). It replaces the old
 // Qt shell/settings-controller pair, which main() no longer constructs.
 func (a *app) ShowSettings() {
-	if a.ctx != nil {
-		wailsruntime.WindowShow(a.ctx)
-		wailsruntime.EventsEmit(a.ctx, "nav:settings", nil)
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:settings", nil)
 	}
+	a.setWindowVisible(true)
 }
 
 // ShowStatus reveals the Wails window and asks the frontend to navigate to
 // the status page (tray.App / the Status… item / Bridge.ShowStatus).
 func (a *app) ShowStatus() {
-	if a.ctx != nil {
-		wailsruntime.WindowShow(a.ctx)
-		wailsruntime.EventsEmit(a.ctx, "nav:status", nil)
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:status", nil)
 	}
+	a.setWindowVisible(true)
 }
 
 // OpenLog opens the log file in the platform's default handler (status.Host). The
@@ -989,14 +1062,17 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 // reportCheckResult answers a MANUAL check for updates. A click has to produce a
 // visible result whatever the answer — "no update" reported as silence is
 // indistinguishable from a menu item that does nothing, which is precisely how this
-// one read. It emits an event the frontend renders as a dismissible banner (see
-// frontend/dist/status.js) — no blocking dialog, so there is no "stuck dialog
-// blocks the whole app" failure mode the way the old QMessageBox had.
+// one read. It emits an event that frontend/dist/status.js currently renders via
+// a plain alert() — simpler than the old QMessageBox, and dismissed the same
+// way, but still a blocking JS dialog rather than the dismissible banner this
+// comment once described; that upgrade is left for later if it turns out to
+// matter.
 func (a *app) reportCheckResult(heading, body string) {
-	if a.ctx == nil {
+	ctx := a.ctxSnapshot()
+	if ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "update:check-result", struct {
+	wailsruntime.EventsEmit(ctx, "update:check-result", struct {
 		Heading string `json:"heading"`
 		Body    string `json:"body"`
 	}{heading, body})
@@ -1055,8 +1131,8 @@ func (a *app) pump() {
 			continue
 		}
 		a.tray.Apply(e)
-		if a.ctx != nil {
-			wailsruntime.EventsEmit(a.ctx, "tunnel:event", uistate.ViewFor(e))
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "tunnel:event", uistate.ViewFor(e))
 		}
 		// A terminal, broken-install failure (tunnel.ErrPermanent, whose
 		// Error() text carries "install is broken") means the privileged path
@@ -1171,8 +1247,8 @@ func (a *app) notifyFor(e tunnel.Event) {
 // down.
 func (a *app) Quit() {
 	a.shutdown(func() {
-		if a.ctx != nil {
-			wailsruntime.Quit(a.ctx)
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
 		}
 	})
 }
@@ -1585,7 +1661,7 @@ func main() {
 
 	a.sup = tunnel.New(authFn, runFn, events)
 
-	ctrl, err := tray.Setup(a, a.positionWindow)
+	ctrl, err := tray.Setup(a, a.onTrayClick)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1603,6 +1679,22 @@ func main() {
 	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
 	// where the manual scripts/install.sh path is unchanged).
 	a.installBootstrapHooks()
+
+	// Route a blocking config issue (Connect refused: no gateway configured,
+	// an invalid host/port, ...) to the settings window with a visible error,
+	// replacing the deleted Qt settings controller's ShowIssue. Without this,
+	// Connect (from the tray OR the frontend's primary button) just logs one
+	// line and returns on a fresh install — no banner, no navigation, no
+	// visible feedback at all. frontend/dist/settings.js listens for the
+	// "settings:issue" event and renders it into #settings-error, the same
+	// element SaveConfig's validation-failure path already populates.
+	a.onConnectIssue = func(i *settings.Issue) {
+		log.Print("onConnectIssue: showing settings window")
+		a.ShowSettings()
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "settings:issue", i.Message)
+		}
+	}
 
 	// Give the Dock icon an effect. Qt has no reopen-delegate hook of its own on
 	// macOS either, so without this the icon is inert: clicking it does nothing
@@ -1636,8 +1728,8 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go a.watchSignals(sigs, func() {
-		if a.ctx != nil {
-			wailsruntime.Quit(a.ctx)
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
 		}
 	})
 
@@ -1685,11 +1777,11 @@ func main() {
 	// wails.Run blocks the main goroutine until wailsruntime.Quit(a.ctx), which
 	// the tray's Quit item and the signal handler both drive only after the
 	// tunnel has been torn down (see app.shutdown).
-	log.Print("entering Qt event loop")
+	log.Print("entering Wails event loop")
 	if err := wails.Run(buildAppOptions(a, frontendAssets)); err != nil {
 		log.Fatalf("wails run: %v", err)
 	}
-	log.Print("Qt event loop returned; waiting for the tunnel teardown")
+	log.Print("Wails event loop returned; waiting for the tunnel teardown")
 	// Quit can be driven from outside app.shutdown (e.g. a desktop session
 	// logout), so arriving here does NOT by itself mean the tunnel is down.
 	// Block until it is (see awaitShutdown) — otherwise the process exits

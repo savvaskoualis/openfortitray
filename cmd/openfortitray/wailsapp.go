@@ -42,19 +42,36 @@ func (b *Bridge) SaveConfig(cfg config.Config) *settings.Issue {
 	return nil
 }
 
-func (b *Bridge) Connect()      { b.a.Connect() }
-func (b *Bridge) Disconnect()   { b.a.Disconnect() }
-func (b *Bridge) ShowSettings() { b.a.ShowSettings() }
-func (b *Bridge) ShowStatus()   { b.a.ShowStatus() }
-func (b *Bridge) Quit()         { b.a.Quit() }
+func (b *Bridge) Connect()    { b.a.Connect() }
+func (b *Bridge) Disconnect() { b.a.Disconnect() }
+
+// ShowSettings/ShowStatus/Quit are deliberately NOT exposed on Bridge: the
+// tray drives all three directly through app (see tray.Setup's App
+// interface and cmd/openfortitray's onTrayClick), and no frontend code ever
+// calls them. Quit in particular is a full-teardown method; there is no
+// reason to reach it from the least-trusted boundary (arbitrary frontend JS)
+// when nothing legitimate needs to.
 
 func (b *Bridge) HideWindow() {
-	if b.a.ctx != nil {
-		wailsruntime.WindowHide(b.a.ctx)
+	if ctx := b.a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowHide(ctx)
 	}
+	b.a.setWindowVisible(false)
 }
 
 func (b *Bridge) IsDarkMode() bool { return isDarkMode() }
+
+// GatewayLabel and DTLSLabel expose the status details card's Gateway/
+// Protocol rows (frontend/dist/status.js' #d-gateway/#d-protocol), replacing
+// the dead-code-only Go accessors left over from the deleted Qt status
+// controller.
+func (b *Bridge) GatewayLabel() string { return b.a.GatewayLabel() }
+func (b *Bridge) DTLSLabel() string    { return b.a.DTLSLabel() }
+
+// Version returns the build version string (main.version, stamped via
+// -ldflags at build time) for the frontend footer to render instead of a
+// hardcoded string.
+func (b *Bridge) Version() string { return b.a.Version() }
 
 // DownloadUpdate starts downloading the release the user was offered
 // ("update:offer"), replacing the old QDialog's "Download update" button.
@@ -111,11 +128,16 @@ func buildAppOptions(a *app, assets embed.FS) *options.App {
 		Frameless:         true,
 		DisableResize:     true,
 		HideWindowOnClose: true,
+		// StartHidden keeps the window from popping up unasked at every
+		// launch — this is a tray app: it should only appear on a deliberate
+		// tray click (see main.go's dock-activation comment for the same
+		// design intent, carried over from the Qt era).
+		StartHidden: true,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
 		OnStartup: func(ctx context.Context) {
-			a.ctx = ctx
+			a.setCtx(ctx)
 		},
 		Bind: []interface{}{bridge},
 	}

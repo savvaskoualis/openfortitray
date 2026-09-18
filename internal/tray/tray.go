@@ -102,12 +102,15 @@ type Controller struct {
 	// can re-render the current state rather than the defaults.
 	lastView uistate.View
 
-	// showAt, if non-nil, positions the app's window before it is shown by a
-	// tray-icon click. It is supplied by the caller (cmd/openfortitray) since
-	// internal/tray has no Wails import to do the positioning itself — see
-	// Setup. It only positions the window; app.ShowStatus (called alongside
-	// it) is what actually makes the window visible.
-	showAt func()
+	// onIconClick, if non-nil, is called whenever the tray icon itself
+	// (rather than a menu item) is clicked. It is supplied by the caller
+	// (cmd/openfortitray) since internal/tray has no Wails import to
+	// position/show/hide the window itself — see Setup. Unlike a menu item's
+	// Click callback, this one owns the full show-or-hide decision (a
+	// Tailscale-style toggle): the caller decides whether to position+reveal
+	// the window or hide it, based on the window's current visibility — see
+	// cmd/openfortitray's onTrayClick.
+	onIconClick func()
 }
 
 // Setup builds the tray icon and menu. energye/systray's Run(onReady, onExit)
@@ -121,13 +124,15 @@ type Controller struct {
 // systray has no construction-time failure mode analogous to fyne's headless
 // driver, so this never actually fails today.
 //
-// showAt is called (if non-nil) when the tray icon itself is clicked, before
-// app.ShowStatus reveals the window — it lets the caller position the window
-// (fixed-corner placement on the primary screen; see cmd/openfortitray's
-// positionWindow) without internal/tray importing Wails to do so itself. A
-// nil showAt (e.g. in tests) simply skips positioning.
-func Setup(app App, showAt func()) (*Controller, error) {
-	c := &Controller{app: app, currentKind: uistate.KindIdle, showAt: showAt}
+// onIconClick is called (if non-nil) whenever the tray icon itself is
+// clicked, in place of the show-then-reveal sequence a menu item like "Open"
+// uses — it lets the caller own the full toggle decision (position+reveal,
+// or hide) without internal/tray importing Wails to do so itself, or
+// tracking window-visibility state that belongs to the caller (see
+// cmd/openfortitray's onTrayClick/windowVisible). A nil onIconClick (e.g. in
+// tests) means the tray icon click does nothing.
+func Setup(app App, onIconClick func()) (*Controller, error) {
+	c := &Controller{app: app, currentKind: uistate.KindIdle, onIconClick: onIconClick}
 
 	ready := make(chan struct{})
 	var setupErr error
@@ -170,15 +175,15 @@ func Setup(app App, showAt func()) (*Controller, error) {
 
 		c.buildMenu()
 
-		// A click on the tray icon itself (not a menu item) opens the same
-		// Status view as the "Open" menu row. Position first, then reveal —
-		// showAt only moves the window, app.ShowStatus does the actual
-		// WindowShow + nav:status emit (see Setup's doc comment).
+		// A click on the tray icon itself (not a menu item) toggles the
+		// window — hide it if already visible, otherwise position+reveal it
+		// on the Status view — unlike the "Open" menu row, which always
+		// reveals. The whole decision lives in onIconClick (see Setup's doc
+		// comment); internal/tray just forwards the click.
 		systray.SetOnClick(func(menu systray.IMenu) {
-			if c.showAt != nil {
-				c.showAt()
+			if c.onIconClick != nil {
+				c.onIconClick()
 			}
-			app.ShowStatus()
 		})
 
 		close(ready)
