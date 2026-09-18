@@ -1,0 +1,12 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "openfortitray",
+  "outputfilename": "openfortitray",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dir": "frontend",
+  "wailsjsdir": "frontend",
+  "author": {
+    "name": "OpenFortiTray"
+  }
+}
