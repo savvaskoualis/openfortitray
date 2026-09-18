@@ -22,3 +22,29 @@ int oft_cursor_position(double *x, double *y) {
     *y = primary.frame.size.height - (loc.y - primary.frame.origin.y);
     return 1;
 }
+
+int oft_set_window_position(const char *title, double topLeftX, double topLeftY) {
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    if (screens.count == 0) {
+        return 0;
+    }
+    NSScreen *primary = screens[0];
+    NSString *wantTitle = [NSString stringWithUTF8String:title];
+
+    for (NSWindow *w in [NSApp windows]) {
+        if (![w.title isEqualToString:wantTitle]) {
+            continue;
+        }
+        // setFrameOrigin: takes the window's BOTTOM-LEFT corner, in
+        // AppKit's bottom-left-origin absolute space -- convert from the
+        // caller's top-left-of-primary-screen frame the same way
+        // oft_cursor_position does, then subtract the window's own height
+        // to go from "top edge" to "bottom-left corner".
+        NSRect f = w.frame;
+        double bottomLeftX = primary.frame.origin.x + topLeftX;
+        double bottomLeftY = primary.frame.origin.y + primary.frame.size.height - topLeftY - f.size.height;
+        [w setFrameOrigin:NSMakePoint(bottomLeftX, bottomLeftY)];
+        return 1;
+    }
+    return 0;
+}

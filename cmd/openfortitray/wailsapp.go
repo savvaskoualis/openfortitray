@@ -122,9 +122,15 @@ func (b *Bridge) RecentActivity() []uistate.Entry {
 func buildAppOptions(a *app, assets embed.FS) *options.App {
 	bridge := &Bridge{a: a}
 	return &options.App{
-		Title:             "OpenFortiTray",
-		Width:             380,
-		Height:            600,
+		// Title must stay in sync with position.go's windowTitle constant —
+		// tray.SetWindowPosition finds this exact window natively on
+		// macOS/Windows by title, so a drift here would silently break
+		// cursor-relative positioning (falling back to Wails' own
+		// screen-relative WindowSetPosition, not a crash — see
+		// positionWindow's doc comment).
+		Title:             windowTitle,
+		Width:             windowW,
+		Height:            windowH,
 		Frameless:         true,
 		DisableResize:     true,
 		HideWindowOnClose: true,

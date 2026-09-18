@@ -21,3 +21,14 @@ func CursorPosition() (x, y int, ok bool) {
 	}
 	return int(cx), int(cy), true
 }
+
+// SetWindowPosition always returns false on Linux: unlike macOS/Windows,
+// Wails' own runtime.WindowSetPosition already uses gtk_window_move, which
+// moves a GTK window using absolute root-window coordinates -- the exact
+// same reference frame XQueryPointer's root_x/root_y (what CursorPosition
+// returns here) already uses, with no per-monitor relativity to correct
+// for. So there is nothing to bypass on this platform; the caller falls
+// back to wailsruntime.WindowSetPosition directly.
+func SetWindowPosition(title string, x, y int) (ok bool) {
+	return false
+}

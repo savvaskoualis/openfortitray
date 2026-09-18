@@ -17,6 +17,11 @@ const (
 	windowW        = 380
 	windowH        = 600
 	positionMargin = 8
+	// windowTitle must match buildAppOptions' options.App.Title exactly --
+	// it's how tray.SetWindowPosition finds the app's own window natively
+	// on macOS/Windows (see that function's doc comment for why a native
+	// lookup is needed at all).
+	windowTitle = "OpenFortiTray"
 )
 
 // positionWindow places the app's window near the tray icon click that
@@ -26,6 +31,21 @@ const (
 // anchors the window just below it, clamped so it never renders off the edge
 // of whichever screen the cursor is actually on — the same placement a
 // native OS tray flyout uses.
+//
+// The computed (x, y) is applied via tray.SetWindowPosition first — a
+// native, per-platform window move using the SAME absolute coordinate space
+// CursorPosition reports in (see that function's doc comment) — because
+// Wails' own runtime.WindowSetPosition is relative to whichever screen/
+// monitor the window CURRENTLY occupies, not the primary screen or the
+// virtual-screen origin. On a real multi-monitor system, once the window's
+// current screen differs from primary (macOS) or its monitor's work area
+// doesn't start at (0,0) (Windows), that mismatch would silently place a
+// cursor-anchored popover on the wrong screen. tray.SetWindowPosition
+// returns false on Linux (a deliberate no-op — Wails' gtk_window_move
+// already uses the same absolute root-window coordinates XQueryPointer
+// does, so there is nothing to bypass there) and on macOS/Windows only if
+// it could not find the app's own window by title; either case falls
+// through to wailsruntime.WindowSetPosition.
 //
 // Falls back to a fixed corner of the PRIMARY screen (top-right on
 // macOS/Linux, bottom-right on Windows) only when no cursor position is
@@ -59,6 +79,9 @@ func (a *app) positionWindow() {
 
 	if cx, cy, ok := tray.CursorPosition(); ok {
 		x, y := tray.ClampToScreen(cx-windowW/2, cy+positionMargin, screenW, screenH, windowW, windowH, positionMargin)
+		if tray.SetWindowPosition(windowTitle, x, y) {
+			return
+		}
 		wailsruntime.WindowSetPosition(ctx, x, y)
 		return
 	}
