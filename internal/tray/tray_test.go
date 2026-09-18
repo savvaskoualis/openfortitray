@@ -123,21 +123,64 @@ func TestApplyUpdatesToDisconnected(t *testing.T) {
 	}
 }
 
-func TestWantedAutostartStateSuccess(t *testing.T) {
-	if got := wantedAutostartState(true, nil); got != true {
-		t.Errorf("wantedAutostartState(true, nil) = %v, want true", got)
+// fakeAutoItem stands in for *systray.MenuItem's Checked/Check/Uncheck (the
+// autostartCheckbox interface) so applyAutostartToggle — the real production
+// decision function toggleAutostart calls — can be exercised directly,
+// without a live *systray.MenuItem (which can't be constructed outside
+// systray.Run). It mirrors the real MenuItem's contract exactly: checked only
+// ever changes via an explicit Check()/Uncheck() call, never on its own.
+type fakeAutoItem struct{ checked bool }
+
+func (f *fakeAutoItem) Checked() bool { return f.checked }
+func (f *fakeAutoItem) Check()        { f.checked = true }
+func (f *fakeAutoItem) Uncheck()      { f.checked = false }
+
+// TestApplyAutostartToggleEnablesFromUnchecked proves the fix for Finding 1:
+// clicking a currently-unchecked box must call SetAutostart with true (the
+// OPPOSITE of the checkbox's pre-click state, since energye/systray never
+// flips it for us — see applyAutostartToggle's comment) and, only on
+// success, leave the checkbox checked.
+func TestApplyAutostartToggleEnablesFromUnchecked(t *testing.T) {
+	app := &fakeApp{}
+	item := &fakeAutoItem{checked: false}
+
+	applyAutostartToggle(item, app.SetAutostart)
+
+	if len(app.calls) != 1 || app.calls[0] != "SetAutostart" {
+		t.Errorf("calls = %v, want [SetAutostart]", app.calls)
 	}
-	if got := wantedAutostartState(false, nil); got != false {
-		t.Errorf("wantedAutostartState(false, nil) = %v, want false", got)
+	if !item.Checked() {
+		t.Errorf("item.Checked() = false, want true after enabling from unchecked")
 	}
 }
 
-func TestWantedAutostartStateFailureReverts(t *testing.T) {
-	errFail := errors.New("boom")
-	if got := wantedAutostartState(true, errFail); got != false {
-		t.Errorf("wantedAutostartState(true, err) = %v, want false (reverted)", got)
+// TestApplyAutostartToggleDisablesFromChecked proves the opposite direction:
+// clicking a currently-checked box must call SetAutostart with false and, on
+// success, leave the checkbox unchecked.
+func TestApplyAutostartToggleDisablesFromChecked(t *testing.T) {
+	app := &fakeApp{}
+	item := &fakeAutoItem{checked: true}
+
+	applyAutostartToggle(item, app.SetAutostart)
+
+	if len(app.calls) != 1 || app.calls[0] != "SetAutostart" {
+		t.Errorf("calls = %v, want [SetAutostart]", app.calls)
 	}
-	if got := wantedAutostartState(false, errFail); got != true {
-		t.Errorf("wantedAutostartState(false, err) = %v, want true (reverted)", got)
+	if item.Checked() {
+		t.Errorf("item.Checked() = true, want false after disabling from checked")
+	}
+}
+
+// TestApplyAutostartToggleLeavesCheckboxOnFailure proves the checkbox is left
+// exactly as it was (never optimistically flipped, so nothing to revert) when
+// SetAutostart fails.
+func TestApplyAutostartToggleLeavesCheckboxOnFailure(t *testing.T) {
+	app := &fakeApp{autostartErr: errors.New("boom")}
+	item := &fakeAutoItem{checked: false}
+
+	applyAutostartToggle(item, app.SetAutostart)
+
+	if item.Checked() {
+		t.Errorf("item.Checked() = true, want false (untouched) after a failed enable")
 	}
 }

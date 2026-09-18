@@ -117,7 +117,33 @@ func Setup(app App) (*Controller, error) {
 	c := &Controller{app: app, currentKind: uistate.KindIdle}
 
 	ready := make(chan struct{})
+	var setupErr error
 	go systray.Run(func() {
+		// The recover MUST live here, inside onReady itself, rather than
+		// wrapped around this `go systray.Run(...)` call. Verified by reading
+		// systray.go's Register (which systray.Run calls internally):
+		// `// Run onReady on separate goroutine to avoid blocking event loop
+		// go func() { <-readyCh; onReady() }()` — onReady is invoked on a
+		// goroutine spawned inside Register, independent of whatever
+		// goroutine is executing systray.Run/Register's own body (which, by
+		// the time onReady runs, is blocked deeper inside Run's nativeLoop
+		// call). A recover() around the `go systray.Run(...)` call would sit
+		// on the WRONG goroutine and never see a panic thrown from in here.
+		//
+		// If onReady panics before reaching close(ready) below (a native cgo
+		// issue, a bad app.Version() call, some future platform quirk), an
+		// unrecovered panic on its goroutine would otherwise be process-fatal
+		// in Go, or — absent that — leave Setup's caller blocked on <-ready
+		// forever. Recovering here turns either outcome into an ordinary
+		// error return, which is what Setup's signature already promises
+		// callers.
+		defer func() {
+			if r := recover(); r != nil {
+				setupErr = fmt.Errorf("tray: panic during setup: %v", r)
+				close(ready) // unblock Setup's caller even though onReady never finished
+			}
+		}()
+
 		c.icons = make(map[uistate.Kind][]byte, 4)
 		c.badgedIcons = make(map[uistate.Kind][]byte, 4)
 		for _, k := range []uistate.Kind{uistate.KindIdle, uistate.KindBusy, uistate.KindOK, uistate.KindBad} {
@@ -135,7 +161,7 @@ func Setup(app App) (*Controller, error) {
 	}, func() {})
 	<-ready
 
-	return c, nil
+	return c, setupErr
 }
 
 // SetTooltip sets the menu-bar icon's hover tooltip. Kept as a free function
@@ -222,34 +248,50 @@ func (c *Controller) buildMenu() {
 	mQuit.Click(app.Quit)
 }
 
-// toggleAutostart persists the login-item state the checkbox was already
-// switched to and, only on failure, switches it back.
-//
-// Like Qt's checkable QAction, energye/systray flips a checkbox's own Checked
-// state before the click handler runs, so the row is read, not computed by
-// negation: want is whatever the row now shows. wantedAutostartState (the
-// pure decision, extracted so it's testable without a live *MenuItem)
-// resolves what the row's final state should be.
-func (c *Controller) toggleAutostart() {
-	want := c.mAuto.Checked()
-	err := c.app.SetAutostart(want)
-	if wantedAutostartState(want, err) {
-		c.mAuto.Check()
-	} else {
-		c.mAuto.Uncheck()
-	}
+// autostartCheckbox is the subset of *systray.MenuItem's API that
+// applyAutostartToggle needs, narrowed to an interface so the full
+// click-then-persist-then-flip flow is testable with a fake in place of a
+// live *systray.MenuItem (which can't be constructed outside systray.Run).
+// *systray.MenuItem already satisfies this — Checked/Check/Uncheck are
+// exactly its own method set, unchanged.
+type autostartCheckbox interface {
+	Checked() bool
+	Check()
+	Uncheck()
 }
 
-// wantedAutostartState reports what the "Auto-connect at login" checkbox's
-// final state should be after an attempt to persist `want`: unchanged on
-// success, reverted to !want on failure. Extracted from toggleAutostart so
-// this decision is testable without a live *systray.MenuItem (which can't
-// exist outside systray.Run).
-func wantedAutostartState(want bool, err error) bool {
-	if err != nil {
-		return !want
+// toggleAutostart persists the login-item state the click just asked for and,
+// only if that succeeds, flips the checkbox to match. See
+// applyAutostartToggle for the (testable) decision itself.
+func (c *Controller) toggleAutostart() {
+	applyAutostartToggle(c.mAuto, c.app.SetAutostart)
+}
+
+// applyAutostartToggle computes the "Auto-connect at login" checkbox's
+// intended state from a click, persists it, and mutates item only on
+// success.
+//
+// Unlike Qt's checkable QAction, energye/systray never flips a checkbox's own
+// Checked state on a click — verified directly against the library's source
+// (github.com/energye/systray@v1.0.3): systray.go's systrayMenuItemSelected
+// (the single dispatch point every platform backend funnels into —
+// systray_darwin.m's menuHandler:, systray_windows.go's wndProc, and
+// systray_menu_unix.go's dbus "clicked" event all call nothing else) only
+// ever invokes `item.click()`; `checked` is mutated solely by the item's own
+// Check()/Uncheck() methods. So item.Checked() here is still the PRE-click
+// value, and the intended new state is its negation, not the field itself.
+// There is nothing to revert to on failure since the checkbox is never
+// touched until setAutostart has already succeeded.
+func applyAutostartToggle(item autostartCheckbox, setAutostart func(bool) error) {
+	want := !item.Checked()
+	if err := setAutostart(want); err != nil {
+		return
 	}
-	return want
+	if want {
+		item.Check()
+	} else {
+		item.Uncheck()
+	}
 }
 
 // Apply renders one tunnel event onto the tray: icon, status label, and the
