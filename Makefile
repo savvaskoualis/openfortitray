@@ -74,12 +74,16 @@ LDFLAGS_VER := -X main.version=$(VERSION)
 #   - darwin: cgo via the Xcode CLT drives the Cocoa glue in this repo's own
 #     darkmode_darwin.go/dockpolicy_darwin.go/wake_darwin.go, and Wails'
 #     darwin frontend itself links Cocoa/WebKit through cgo too. arm64 only —
-#     Intel (amd64) macOS support was dropped: it required a second, x86_64
-#     Homebrew install cross-built under Rosetta, and Homebrew has stopped
-#     shipping precompiled Intel bottles for some dependencies (confirmed
-#     live: "openssl@3: no bottle available!", Tier 3/community-support-only)
-#     — the x86_64 leg can no longer reliably build in CI at all, independent
-#     of anything in this repo.
+#     Intel (amd64) macOS support was dropped earlier in the Qt6->Wails
+#     migration, back when darwin still built via a Homebrew Qt6 install: that
+#     required a second, x86_64 Homebrew install cross-built under Rosetta,
+#     and Homebrew had stopped shipping precompiled Intel bottles for some of
+#     Qt6's own dependencies (confirmed live: "openssl@3: no bottle
+#     available!", Tier 3/community-support-only). This task removed the
+#     Homebrew/Qt6 install from the darwin path entirely, so that specific
+#     blocker is now gone — but re-adding Intel/amd64 macOS support is a
+#     separate decision this task doesn't make, so darwin stays arm64-only
+#     pending that future call.
 #   - linux: cgo needs gcc + GTK3/WebKitGTK dev headers (libgtk-3-dev,
 #     libwebkit2gtk-4.1-dev on current distros) — Wails' linux frontend embeds
 #     GTK/WebKit2GTK via cgo+pkg-config directives.

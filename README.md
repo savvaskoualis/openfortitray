@@ -213,11 +213,11 @@ Remove-Item -Recurse -Force "$env:ProgramFiles\openfortitray","$env:APPDATA\open
 ## Building from source
 
 The UI (Wails v2) renders through cgo + a native webview on macOS and Linux, so those two
-build on their own native toolchain (macOS: Xcode CLT; Linux: `gcc` + `libwebkit2gtk-4.1-dev`
-+ `libgtk-3-dev`, built with `-tags webkit2_41` on current distros). Windows needs no cgo at
-all (its webview binding and the tray backend are pure Go) and builds with `CGO_ENABLED=0`.
-CI builds the full three-OS release matrix; a `v*` tag publishes signed-per-runner
-`SHA256SUMS`, the `.dmg`, and the `Setup.exe`.
+build on their own native toolchain (macOS: Xcode CLT; Linux: `gcc` + `libgtk-3-dev` +
+`libwebkit2gtk-4.0-dev`, Wails' default). Windows needs no cgo at all (its webview binding
+and the tray backend are pure Go) and builds with `CGO_ENABLED=0`. CI builds the full
+three-OS release matrix; a `v*` tag publishes signed-per-runner `SHA256SUMS`, the `.dmg`,
+and the `Setup.exe`.
 
 ```sh
 make build    # go build -o openfortitray ./cmd/openfortitray
@@ -225,6 +225,11 @@ make test     # go vet ./... && go test -race ./...
 make app      # macOS: assemble dist/OpenFortiTray.app
 make dmg      # macOS: build the drag-to-Applications .dmg
 ```
+
+On distros that no longer ship `libwebkit2gtk-4.0-dev` (Ubuntu 24.04+ and others), install
+`libwebkit2gtk-4.1-dev` instead and pass `-tags webkit2_41` yourself — `make build`/`make
+test` do not add it automatically: `go build -tags webkit2_41 ./cmd/openfortitray`, or
+`GOFLAGS='-tags=webkit2_41' make build` / `GOFLAGS='-tags=webkit2_41' make test`.
 
 ## License
 

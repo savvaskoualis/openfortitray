@@ -37,11 +37,15 @@ jobs:
   # darkmode_darwin.go/dockpolicy_darwin.go/wake_darwin.go drive the Cocoa
   # status bar and window via cgo), so it must build on a macOS runner.
   # macos-14 is Apple Silicon, so this is arm64 only — the amd64 (Intel) leg
-  # was dropped: it required a second, x86_64 Homebrew install cross-built
-  # under Rosetta, and Homebrew has stopped shipping precompiled Intel bottles
-  # for some dependencies (confirmed live: "openssl@3: no bottle available!",
-  # now Tier 3/community-support-only) — the x86_64 leg can no longer reliably
-  # build in CI at all, independent of anything in this repo.
+  # was dropped earlier in the Qt6->Wails migration, back when this job still
+  # installed Qt6 via Homebrew: that required a second, x86_64 Homebrew
+  # install cross-built under Rosetta, and Homebrew had stopped shipping
+  # precompiled Intel bottles for some of Qt6's own dependencies (confirmed
+  # live: "openssl@3: no bottle available!", now Tier 3/community-support-
+  # only). This task removed the Homebrew/Qt6 install step from this job
+  # entirely, so that specific blocker is now gone — but re-adding Intel/
+  # amd64 macOS support is a separate decision this task doesn't make, so
+  # build-darwin stays arm64-only pending that future call.
   build-darwin:
     name: Build darwin (arm64 + .dmg)
     runs-on: macos-14
@@ -291,9 +295,9 @@ jobs:
       # window renders inside WebView2 — an OS-provided component, present by
       # default on Windows 11 and most updated Windows 10 machines). Fetched
       # from Microsoft's own documented Evergreen Bootstrapper URL. Unlike the
-      # openconnect/Mesa bundles above, this is intentionally NOT sha256-
-      # pinned: it is *designed* to always be Microsoft's current stub —
-      # pinning it to one hash would defeat the point and go stale.
+      # openconnect bundle above, this is intentionally NOT sha256-pinned: it
+      # is *designed* to always be Microsoft's current stub — pinning it to
+      # one hash would defeat the point and go stale.
       # openfortitray.iss stages it into {tmp} (Flags: dontcopy) and only runs
       # it when WebView2 is not already present (IsWebView2Installed).
       - name: Download WebView2 Bootstrapper
