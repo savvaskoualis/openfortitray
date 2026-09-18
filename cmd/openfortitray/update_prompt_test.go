@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -11,6 +12,46 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/uitheme"
 	"github.com/savvaskoualis/openfortitray/internal/update"
 )
+
+// The QApplication test harness below used to live in qtapp_test.go
+// (cmd/openfortitray/qtapp.go's own test), deleted in the Wails migration
+// (Task 2) along with the newQApplication wrapper it called. It is relocated
+// here, calling qt.NewQApplication directly, because this file's tests below
+// still build real Qt widget trees (the update-prompt dialog content,
+// internal/updateflow.go — untouched by the Wails migration so far) and need
+// a live *qt.QApplication to exist in the process before doing so.
+
+func init() {
+	// Qt's Cocoa integration on macOS requires QApplication to be constructed
+	// on the process's real initial OS thread, or it aborts with "API misuse:
+	// setting the main menu on a non-main thread" — but `go test` always runs
+	// every Test function, top-level ones included, on a goroutine it spawns
+	// fresh via t.Run -> go tRunner(...), never on the initial goroutine.
+	// init() runs on the initial goroutine before any other goroutine exists,
+	// so locking here keeps that goroutine — and TestMain below, which
+	// testing calls directly rather than through tRunner — pinned to the real
+	// main OS thread for the life of the process.
+	runtime.LockOSThread()
+}
+
+// qApplicationOK records whether TestMain's construction succeeded, so the
+// actual Test functions (which testing runs on a different goroutine, see
+// init() above) can just check the answer.
+var qApplicationOK bool
+
+// TestMain constructs the QApplication here, on the real main OS thread
+// pinned by init(), rather than in a Test function — see init() for why a
+// Test function is the wrong place for this call on macOS.
+func TestMain(m *testing.M) {
+	// The offscreen platform plugin is Qt's own documented mechanism for
+	// headless test/CI environments — GitHub Actions runners have no logged-in
+	// GUI session, so constructing real native windows without it risks a
+	// crash during teardown (reproduced directly on two machines before this
+	// was added).
+	os.Setenv("QT_QPA_PLATFORM", "offscreen")
+	qApplicationOK = qt.NewQApplication(os.Args) != nil
+	os.Exit(m.Run())
+}
 
 // buttonsIn collects every QPushButton in a widget tree, so the assertions are
 // about what the user can click rather than about the layout nesting. It walks

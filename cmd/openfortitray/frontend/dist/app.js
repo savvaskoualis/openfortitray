@@ -22,4 +22,9 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   window.addEventListener("blur", () => OFT.call("HideWindow"));
+
+  if (window.runtime && window.runtime.EventsOn) {
+    window.runtime.EventsOn("nav:settings", () => OFT.showPage("page-settings"));
+    window.runtime.EventsOn("nav:status", () => OFT.showPage("page-main"));
+  }
 });
