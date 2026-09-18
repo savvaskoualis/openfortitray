@@ -4,9 +4,12 @@ package tray
 
 /*
 #cgo LDFLAGS: -lX11
+#include <stdlib.h>
 #include "cursor_linux.h"
 */
 import "C"
+
+import "unsafe"
 
 // CursorPosition returns the mouse cursor's current position via X11's
 // XQueryPointer, top-left-origin (X11's native convention, matching what
@@ -22,13 +25,24 @@ func CursorPosition() (x, y int, ok bool) {
 	return int(cx), int(cy), true
 }
 
-// SetWindowPosition always returns false on Linux: unlike macOS/Windows,
-// Wails' own runtime.WindowSetPosition already uses gtk_window_move, which
-// moves a GTK window using absolute root-window coordinates -- the exact
-// same reference frame XQueryPointer's root_x/root_y (what CursorPosition
-// returns here) already uses, with no per-monitor relativity to correct
-// for. So there is nothing to bypass on this platform; the caller falls
-// back to wailsruntime.WindowSetPosition directly.
+// SetWindowPosition moves the top-level window whose title matches title
+// to an absolute root-window position (x, y) -- the same coordinate space
+// CursorPosition already returns -- via the EWMH _NET_MOVERESIZE_WINDOW
+// client message (see cursor_linux.c). This deliberately bypasses Wails'
+// own runtime.WindowSetPosition: Wails' Linux SetPosition (window.c) adds
+// the offset of whichever monitor the window is CURRENTLY on
+// (gdk_display_get_monitor_at_window) before calling gtk_window_move --
+// the same "relative to current screen/monitor, not absolute" bug class
+// this whole feature exists to work around on macOS/Windows, not the
+// already-absolute behavior an earlier pass through this code assumed.
+// ok is false if no X server is reachable, no window with that title was
+// found, or the window manager doesn't support the EWMH properties this
+// depends on (_NET_CLIENT_LIST, _NET_MOVERESIZE_WINDOW) — in any of those
+// cases the caller falls back to wailsruntime.WindowSetPosition, which is
+// still correct on a single-monitor Linux session (the case this bypass
+// doesn't change).
 func SetWindowPosition(title string, x, y int) (ok bool) {
-	return false
+	ctitle := C.CString(title)
+	defer C.free(unsafe.Pointer(ctitle))
+	return C.oft_set_window_position(ctitle, C.int(x), C.int(y)) != 0
 }

@@ -39,7 +39,10 @@ int oft_set_window_position(const char *title, double topLeftX, double topLeftY)
         // AppKit's bottom-left-origin absolute space -- convert from the
         // caller's top-left-of-primary-screen frame the same way
         // oft_cursor_position does, then subtract the window's own height
-        // to go from "top edge" to "bottom-left corner".
+        // to go from "top edge" to "bottom-left corner". This exact
+        // formula is duplicated (and unit-tested) as tray.MacOSFrameOrigin
+        // in position.go/position_test.go -- keep both in sync by hand if
+        // this ever changes.
         NSRect f = w.frame;
         double bottomLeftX = primary.frame.origin.x + topLeftX;
         double bottomLeftY = primary.frame.origin.y + primary.frame.size.height - topLeftY - f.size.height;

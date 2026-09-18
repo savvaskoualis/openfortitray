@@ -37,15 +37,20 @@ const (
 // CursorPosition reports in (see that function's doc comment) — because
 // Wails' own runtime.WindowSetPosition is relative to whichever screen/
 // monitor the window CURRENTLY occupies, not the primary screen or the
-// virtual-screen origin. On a real multi-monitor system, once the window's
-// current screen differs from primary (macOS) or its monitor's work area
-// doesn't start at (0,0) (Windows), that mismatch would silently place a
-// cursor-anchored popover on the wrong screen. tray.SetWindowPosition
-// returns false on Linux (a deliberate no-op — Wails' gtk_window_move
-// already uses the same absolute root-window coordinates XQueryPointer
-// does, so there is nothing to bypass there) and on macOS/Windows only if
-// it could not find the app's own window by title; either case falls
-// through to wailsruntime.WindowSetPosition.
+// virtual-screen origin, on ALL THREE platforms (an earlier pass through
+// this code assumed Linux's gtk_window_move was already absolute; it
+// isn't — Wails' own window.c adds the current monitor's offset there
+// too). On a real multi-monitor system, once the window's current screen
+// differs from primary (macOS), its monitor's work area doesn't start at
+// (0,0) (Windows), or its current GDK monitor geometry isn't (0,0)
+// (Linux), that mismatch would silently place a cursor-anchored popover on
+// the wrong screen. tray.SetWindowPosition returns false only if it could
+// not find the app's own window (by title on macOS/Windows, by EWMH
+// _NET_CLIENT_LIST on Linux) or the platform lacks what the bypass needs
+// (e.g. a non-EWMH Linux window manager) — in which case the caller falls
+// through to wailsruntime.WindowSetPosition, which is still correct on a
+// single-monitor session on any platform (the case this bypass doesn't
+// change).
 //
 // Falls back to a fixed corner of the PRIMARY screen (top-right on
 // macOS/Linux, bottom-right on Windows) only when no cursor position is

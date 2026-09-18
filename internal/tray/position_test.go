@@ -112,6 +112,48 @@ func TestClampToScreenPullsBackFromNegativeOrigin(t *testing.T) {
 	}
 }
 
+func TestMacOSFrameOriginRoundTripsWithCursorPositionFormula(t *testing.T) {
+	// Mirrors the worked example from this code's own review: feed a point
+	// through the SAME conversion oft_cursor_position uses (primary origin
+	// (0,0), height 1080, AppKit point (500,800) -> top-left-relative
+	// (500,280)), then back through MacOSFrameOrigin with a 200px-tall
+	// window, and confirm the window's reconstructed TOP edge lands back
+	// on the original AppKit y (800), not just some arbitrary value.
+	const primaryOriginX, primaryOriginY, primaryHeight = 0.0, 0.0, 1080.0
+	const appKitX, appKitY = 500.0, 800.0
+	const windowHeight = 200.0
+
+	// oft_cursor_position's own formula, inlined here as the "given":
+	topLeftX := appKitX - primaryOriginX
+	topLeftY := primaryHeight - (appKitY - primaryOriginY)
+
+	bottomLeftX, bottomLeftY := MacOSFrameOrigin(topLeftX, topLeftY, primaryOriginX, primaryOriginY, primaryHeight, windowHeight)
+
+	if bottomLeftX != appKitX {
+		t.Errorf("bottomLeftX = %v, want %v (the original AppKit x)", bottomLeftX, appKitX)
+	}
+	reconstructedTopY := bottomLeftY + windowHeight
+	if reconstructedTopY != appKitY {
+		t.Errorf("reconstructed top edge y = %v, want %v (the original AppKit y)", reconstructedTopY, appKitY)
+	}
+}
+
+func TestMacOSFrameOriginNonZeroPrimaryOrigin(t *testing.T) {
+	// The formula must stay correct even if AppKit's own guarantee that
+	// screens[0]'s origin is always (0,0) ever turned out to be violated
+	// on some future macOS version -- exercise it with a non-zero origin
+	// so the test isn't silently relying on that guarantee too.
+	bottomLeftX, bottomLeftY := MacOSFrameOrigin(50, 30, 10, 20, 900, 200)
+	wantX := 10.0 + 50.0
+	wantY := 20.0 + 900.0 - 30.0 - 200.0
+	if bottomLeftX != wantX {
+		t.Errorf("bottomLeftX = %v, want %v", bottomLeftX, wantX)
+	}
+	if bottomLeftY != wantY {
+		t.Errorf("bottomLeftY = %v, want %v", bottomLeftY, wantY)
+	}
+}
+
 func TestClampToScreenWindowBiggerThanScreen(t *testing.T) {
 	x, y := ClampToScreen(100, 100, 300, 200, 380, 600, 8)
 	if x < 0 {

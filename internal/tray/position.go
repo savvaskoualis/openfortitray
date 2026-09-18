@@ -21,6 +21,27 @@ func ClampToScreen(x, y, screenW, screenH, windowW, windowH, margin int) (int, i
 	return x, y
 }
 
+// MacOSFrameOrigin converts a desired top-left window position
+// (topLeftX, topLeftY, in pixels from the top-left of the primary screen —
+// CursorPosition's coordinate frame) into the AppKit frame origin (the
+// window's bottom-left corner, in AppKit's own bottom-left-origin absolute
+// coordinate space) that setFrameOrigin: needs, given the primary screen's
+// AppKit frame origin/height and the target window's height.
+//
+// This is a pure re-derivation of the exact formula cursor_darwin.m's
+// oft_set_window_position applies in Objective-C — duplicated here,
+// deliberately, because the real implementation lives inside an AppKit
+// call that only behaves correctly on the Cocoa main thread and can't be
+// exercised by go test without crashing (see SetWindowPosition's doc
+// comment). The two must be kept in sync by hand; this function's tests
+// are what catch a regression in the ARITHMETIC, even though they can
+// never exercise the real cgo/AppKit call itself.
+func MacOSFrameOrigin(topLeftX, topLeftY, primaryOriginX, primaryOriginY, primaryHeight, windowHeight float64) (bottomLeftX, bottomLeftY float64) {
+	bottomLeftX = primaryOriginX + topLeftX
+	bottomLeftY = primaryOriginY + primaryHeight - topLeftY - windowHeight
+	return bottomLeftX, bottomLeftY
+}
+
 // CornerPosition returns the top-left (x, y) for a windowW x windowH window
 // placed in the given corner of a screenW x screenH primary screen, offset
 // inward by margin on both axes so the window never touches the screen edge.
