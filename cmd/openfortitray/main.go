@@ -1646,7 +1646,7 @@ func main() {
 
 	a.sup = tunnel.New(authFn, runFn, events)
 
-	ctrl, err := tray.Setup(a)
+	ctrl, err := tray.Setup(a, a.positionWindow)
 	if err != nil {
 		log.Fatal(err)
 	}

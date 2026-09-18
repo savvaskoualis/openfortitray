@@ -101,6 +101,13 @@ type Controller struct {
 	// lastView is the view most recently applied. Kept so a future re-assert
 	// can re-render the current state rather than the defaults.
 	lastView uistate.View
+
+	// showAt, if non-nil, positions the app's window before it is shown by a
+	// tray-icon click. It is supplied by the caller (cmd/openfortitray) since
+	// internal/tray has no Wails import to do the positioning itself — see
+	// Setup. It only positions the window; app.ShowStatus (called alongside
+	// it) is what actually makes the window visible.
+	showAt func()
 }
 
 // Setup builds the tray icon and menu. energye/systray's Run(onReady, onExit)
@@ -113,8 +120,14 @@ type Controller struct {
 // The error return is kept for API compatibility with the pre-Wails shape;
 // systray has no construction-time failure mode analogous to fyne's headless
 // driver, so this never actually fails today.
-func Setup(app App) (*Controller, error) {
-	c := &Controller{app: app, currentKind: uistate.KindIdle}
+//
+// showAt is called (if non-nil) when the tray icon itself is clicked, before
+// app.ShowStatus reveals the window — it lets the caller position the window
+// (fixed-corner placement on the primary screen; see cmd/openfortitray's
+// positionWindow) without internal/tray importing Wails to do so itself. A
+// nil showAt (e.g. in tests) simply skips positioning.
+func Setup(app App, showAt func()) (*Controller, error) {
+	c := &Controller{app: app, currentKind: uistate.KindIdle, showAt: showAt}
 
 	ready := make(chan struct{})
 	var setupErr error
@@ -156,6 +169,17 @@ func Setup(app App) (*Controller, error) {
 		systray.SetTooltip("OpenFortiTray")
 
 		c.buildMenu()
+
+		// A click on the tray icon itself (not a menu item) opens the same
+		// Status view as the "Open" menu row. Position first, then reveal —
+		// showAt only moves the window, app.ShowStatus does the actual
+		// WindowShow + nav:status emit (see Setup's doc comment).
+		systray.SetOnClick(func(menu systray.IMenu) {
+			if c.showAt != nil {
+				c.showAt()
+			}
+			app.ShowStatus()
+		})
 
 		close(ready)
 	}, func() {})
