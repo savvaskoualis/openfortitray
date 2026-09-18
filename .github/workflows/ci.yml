@@ -105,10 +105,16 @@ jobs:
             go vet ./...
           fi
 
+      # -race requires cgo, and windows runs with CGO_ENABLED=0 (see the note
+      # above this job's env block) — go build/test itself would refuse a
+      # -race invocation there ("go: -race requires cgo"), not just skip it
+      # silently, so windows runs the plain (non-race) suite instead.
       - name: go test -race
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             go test -race -tags webkit2_41 ./...
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            go test ./...
           else
             go test -race ./...
           fi

@@ -24,7 +24,16 @@ window.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("blur", () => OFT.call("HideWindow"));
 
   if (window.runtime && window.runtime.EventsOn) {
-    window.runtime.EventsOn("nav:settings", () => OFT.showPage("page-settings"));
+    window.runtime.EventsOn("nav:settings", () => {
+      OFT.showPage("page-settings");
+      // A connect-issue error (or anything else navigating here directly,
+      // bypassing the gear-icon button's own click handler) still needs the
+      // form populated — otherwise Save operates on OFT.settingsState.cfg
+      // while it's still null.
+      if (typeof OFT.loadSettings === "function") {
+        OFT.loadSettings();
+      }
+    });
     window.runtime.EventsOn("nav:status", () => OFT.showPage("page-main"));
   }
 });
