@@ -132,9 +132,14 @@ int oft_set_window_position(const char *title, int x, int y) {
     event.xclient.data.l[4] = 0;
 
     Window root = DefaultRootWindow(d);
-    XSendEvent(d, root, False,
-               SubstructureNotifyMask | SubstructureRedirectMask, &event);
+    Status sent = XSendEvent(d, root, False,
+                              SubstructureNotifyMask | SubstructureRedirectMask, &event);
     XFlush(d);
     XCloseDisplay(d);
-    return 1;
+    // XSendEvent's Status is nonzero on success (matching Xlib's general
+    // convention, unlike XQueryPointer's Bool above) -- checked so a rare
+    // failure here genuinely falls back to wailsruntime.WindowSetPosition
+    // in the Go caller, rather than being reported as a success that never
+    // actually moved anything.
+    return sent != 0;
 }

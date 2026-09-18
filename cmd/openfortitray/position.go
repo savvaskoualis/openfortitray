@@ -19,8 +19,9 @@ const (
 	positionMargin = 8
 	// windowTitle must match buildAppOptions' options.App.Title exactly --
 	// it's how tray.SetWindowPosition finds the app's own window natively
-	// on macOS/Windows (see that function's doc comment for why a native
-	// lookup is needed at all).
+	// on ALL THREE platforms ([NSApp windows] on macOS, FindWindowW on
+	// Windows, EWMH _NET_WM_NAME/WM_NAME on Linux — see that function's
+	// doc comment for why a native lookup is needed at all).
 	windowTitle = "OpenFortiTray"
 )
 
