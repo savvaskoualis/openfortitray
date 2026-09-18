@@ -92,8 +92,7 @@ type app struct {
 	events        chan tunnel.Event
 	logPath       string
 
-	tray     *tray.Controller
-	settings *settings.Controller
+	tray *tray.Controller
 	// status is the connection panel; the shell decides when it is on screen.
 	status *status.Controller
 	// shell owns the single window and which section of it is visible.
@@ -741,6 +740,10 @@ func (a *app) DTLSLabel() string {
 // Config returns the live configuration for the settings window to clone
 // (settings.Host). It runs on the UI goroutine.
 func (a *app) Config() *config.Config { return a.cfg }
+
+// settingsHost exposes a as a settings.Host to Bridge, so it does not need to
+// know app satisfies that interface structurally.
+func (a *app) settingsHost() settings.Host { return a }
 
 // Commit takes the settings window's edited config, syncs the OS autostart login
 // item to c.Autostart, persists c, and makes it the live config (settings.Host).

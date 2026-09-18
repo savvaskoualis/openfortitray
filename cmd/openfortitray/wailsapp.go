@@ -4,6 +4,8 @@ import (
 	"context"
 	"embed"
 
+	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -14,10 +16,30 @@ import (
 // logic of its own — every method delegates to app, mirroring the existing
 // tray.App/status.Host/settings.Host adapter pattern. app itself stays
 // unexported; Wails requires an exported bound type, so Bridge is that type.
-// Task 4 adds GetConfig/SaveConfig once their dependencies (settings.Validate,
-// the settingsHost() accessor) exist.
 type Bridge struct {
 	a *app
+}
+
+// GetConfig returns a copy of the live configuration for the frontend to
+// render and edit. The frontend edits its own copy and only writes back
+// through SaveConfig.
+func (b *Bridge) GetConfig() config.Config {
+	return *b.a.settingsHost().Config()
+}
+
+// SaveConfig validates cfg and, if valid, commits it as the live
+// configuration. It returns nil on success or a *settings.Issue describing
+// what is wrong — either a validation failure or a Commit error (e.g.
+// autostart/persist failure) reported the same way so the frontend has one
+// error shape to handle.
+func (b *Bridge) SaveConfig(cfg config.Config) *settings.Issue {
+	if issue := settings.Validate(&cfg); issue != nil {
+		return issue
+	}
+	if err := b.a.settingsHost().Commit(&cfg); err != nil {
+		return &settings.Issue{Message: err.Error()}
+	}
+	return nil
 }
 
 func (b *Bridge) Connect()      { b.a.Connect() }
