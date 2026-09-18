@@ -52,6 +52,10 @@ func (a *app) connectWithBootstrap() {
 // standard practice, exactly as internal/settings' delete-profile confirm
 // already does.
 func (a *app) offerBootstrapInstall() {
+	if a.win == nil {
+		log.Print("offerBootstrapInstall: no window available yet (Qt UI removed pending Task 8's Wails rewrite of this dialog); skipping the helper-install prompt — run scripts/install-helper.sh manually in the meantime")
+		return
+	}
 	// Bring the window forward so the dialog has a visible parent (Connect can be
 	// invoked from the tray while the window is hidden).
 	a.win.Show()
