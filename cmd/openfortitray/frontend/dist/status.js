@@ -47,8 +47,18 @@ OFT.renderActivity = function (events) {
   });
 };
 
+// refreshActivity pulls the current activity log from the backend and
+// renders it. Called once on load and again on every "tunnel:event" push,
+// since a new event means pump() just appended a new entry server-side.
+OFT.refreshActivity = function () {
+  OFT.call("RecentActivity").then((entries) => {
+    OFT.renderActivity((entries || []).map((e) => ({ time: new Date(e.At).toLocaleTimeString(), msg: e.Text })));
+  });
+};
+
 window.addEventListener("DOMContentLoaded", () => {
   OFT.call("CurrentView").then(OFT.renderView);
+  OFT.refreshActivity();
 
   document.getElementById("btn-primary").addEventListener("click", () => {
     const label = document.getElementById("btn-primary").textContent;
@@ -57,7 +67,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   if (window.runtime && window.runtime.EventsOn) {
-    window.runtime.EventsOn("tunnel:event", OFT.renderView);
+    window.runtime.EventsOn("tunnel:event", (v) => {
+      OFT.renderView(v);
+      OFT.refreshActivity();
+    });
 
     window.runtime.EventsOn("update:check-result", (r) => {
       alert(r.heading + "\n\n" + r.body);

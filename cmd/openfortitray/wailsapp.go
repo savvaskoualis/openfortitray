@@ -91,6 +91,14 @@ func (b *Bridge) CurrentView() uistate.View {
 	return uistate.ViewFor(b.a.lastEventSnapshot())
 }
 
+// RecentActivity returns the status window's activity log, newest first, for
+// the frontend to render on load and after every "tunnel:event" push.
+// a.recentActivity() is mu-guarded, so this is safe to call from whatever
+// goroutine Wails dispatches a bound JS call on.
+func (b *Bridge) RecentActivity() []uistate.Entry {
+	return b.a.recentActivity()
+}
+
 // buildAppOptions is the testable seam between app/Bridge construction and
 // wails.Run: it returns the options struct without invoking the webview, so
 // its shape (frameless, fixed size, bound object) is unit-testable.

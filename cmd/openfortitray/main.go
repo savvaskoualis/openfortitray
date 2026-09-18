@@ -154,6 +154,14 @@ type app struct {
 	// newly edited settings (Connect re-snapshots the now-updated active profile).
 	mu sync.Mutex
 	tp tunnelParams
+	// activity is a short history of recent tunnel events for the status
+	// window's activity log (Bridge.RecentActivity). Guarded by mu, the same
+	// lock as tp/lastEvent above: pump() appends to it (see pump), while
+	// Bridge.RecentActivity reads it from whatever goroutine Wails' JS bridge
+	// calls it on, which is not necessarily the pump goroutine. uistate.Ring
+	// itself is explicitly not safe for concurrent use, so this mutex is load
+	// bearing, not decorative.
+	activity *uistate.Ring
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -269,6 +277,17 @@ func (a *app) lastEventSnapshot() tunnel.Event {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.lastEvent
+}
+
+// recentActivity returns a snapshot of the activity ring, safe to call from
+// any goroutine (guarded by a.mu, the same lock pump() uses to Add).
+func (a *app) recentActivity() []uistate.Entry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activity == nil {
+		return nil
+	}
+	return a.activity.Entries()
 }
 
 // ipsecParams is the IPsec counterpart of tunnelParams: the profile and PSK
@@ -1078,6 +1097,9 @@ func (a *app) pump() {
 		// Record the live event for Bridge.CurrentView before anything else —
 		// mu-guarded, so it is safe to read from a goroutine outside this pump.
 		a.setLastEvent(e)
+		a.mu.Lock()
+		a.activity.Add(e, time.Now())
+		a.mu.Unlock()
 		// Notify before emitting the UI event: notifyFor is pure bookkeeping
 		// plus one notification post.
 		a.notifyFor(e)
@@ -1534,10 +1556,11 @@ func main() {
 
 	events := make(chan tunnel.Event, 16)
 	a := &app{
-		cfg:     cfg,
-		cfgDir:  cfgDir,
-		events:  events,
-		logPath: logPath,
+		cfg:      cfg,
+		cfgDir:   cfgDir,
+		events:   events,
+		logPath:  logPath,
+		activity: uistate.NewRing(50),
 		// The credstore seam: real platform-native store in production, an
 		// in-memory fake in tests.
 		cookieGet:    credstore.Get,
