@@ -34,6 +34,30 @@ func (b *Bridge) HideWindow() {
 
 func (b *Bridge) IsDarkMode() bool { return isDarkMode() }
 
+// DownloadUpdate starts downloading the release the user was offered
+// ("update:offer"), replacing the old QDialog's "Download update" button.
+func (b *Bridge) DownloadUpdate() {
+	b.a.updateMu.Lock()
+	rel := b.a.updateRel
+	b.a.updateMu.Unlock()
+	if rel == nil {
+		return
+	}
+	b.a.prepareUpdate(rel)
+}
+
+// RestartAndInstall applies the update prepared by prepareUpdate,
+// replacing the old QDialog's "Restart now" button.
+func (b *Bridge) RestartAndInstall() {
+	b.a.pendingUpdateMu.Lock()
+	pu := b.a.pendingUpdate
+	b.a.pendingUpdateMu.Unlock()
+	if pu == nil {
+		return
+	}
+	b.a.finishUpdate(pu.method, pu.prepared, pu.rel)
+}
+
 // CurrentView reports the live tunnel view for the frontend to render on
 // load (before the first "tunnel:event"-style push exists — that wiring is a
 // later task). uistate.ViewFor takes a tunnel.Event, not the tunnelParams

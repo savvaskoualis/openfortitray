@@ -24,13 +24,13 @@ func (a *app) installBootstrapHooks() {
 
 // connectWithBootstrap is the Connect gate on macOS. It probes helper readiness
 // OFF the UI thread (the probe spawns `sudo -n`), then either dials or offers the
-// one-time install — both marshalled back onto the UI goroutine via a.dispatch.
-// Called on the UI goroutine from Connect (after the config-issue check has
-// passed).
+// one-time install directly — no cross-thread marshaling is needed any more,
+// since nothing here touches a Qt widget tree. Called on the UI goroutine from
+// Connect (after the config-issue check has passed).
 func (a *app) connectWithBootstrap() {
 	go func() {
 		if oft.HelperReady() {
-			a.dispatch.Post(a.startTunnel)
+			a.startTunnel()
 			return
 		}
 		// Say why Connect did not dial. Without this the app simply sits there
@@ -38,19 +38,20 @@ func (a *app) connectWithBootstrap() {
 		// app with no explanation is indistinguishable from a hang.
 		log.Printf("helper: not ready for this build (need ABI %d); offering to install it",
 			oft.RequiredHelperABI)
-		a.dispatch.Post(a.offerBootstrapInstall)
+		a.offerBootstrapInstall()
 	}()
 }
 
 // offerBootstrapInstall shows the confirm dialog and, on OK, runs the privileged
 // install off the UI thread, then dials on success or explains the failure and
-// points at the manual installer. It runs on the UI goroutine (it mutates
-// widgets). A dismissed password prompt (ErrUserCancelled) is intentionally
-// silent — the user chose not to install. QMessageBox.Exec() is a blocking
-// modal, which is fine here: this closure already runs on the Qt UI thread (via
-// a.dispatch's drain timer), and a nested Qt event loop during exec() is
-// standard practice, exactly as internal/settings' delete-profile confirm
-// already does.
+// points at the manual installer. A dismissed password prompt
+// (ErrUserCancelled) is intentionally silent — the user chose not to install.
+//
+// Dormant since the Wails migration: a.win is never set any more (Task 2
+// stopped constructing a Qt window), so the nil-guard below always returns
+// before the QMessageBox code beneath it is reached. Left in place — and its
+// remaining a.dispatch.Post call converted to a direct call so it compiles —
+// until Task 8 or a later task rewrites this dialog onto Wails.
 func (a *app) offerBootstrapInstall() {
 	if a.win == nil {
 		log.Print("offerBootstrapInstall: no window available yet (Qt UI removed pending Task 8's Wails rewrite of this dialog); skipping the helper-install prompt — run scripts/install-helper.sh manually in the meantime")
@@ -81,18 +82,16 @@ func (a *app) offerBootstrapInstall() {
 
 	go func() {
 		err := oft.Install()
-		a.dispatch.Post(func() {
-			switch {
-			case err == nil:
-				a.startTunnel()
-			case errors.Is(err, oft.ErrUserCancelled):
-				// User dismissed the password prompt; nothing to report.
-			default:
-				errBox := qt.NewQMessageBox3(qt.QMessageBox__Critical, "Could not install the VPN helper",
-					fmt.Sprintf("%v\n\nYou can install it manually by running scripts/install-helper.sh in a Terminal.", err))
-				errBox.SetStandardButtons(qt.QMessageBox__Ok)
-				errBox.Exec()
-			}
-		})
+		switch {
+		case err == nil:
+			a.startTunnel()
+		case errors.Is(err, oft.ErrUserCancelled):
+			// User dismissed the password prompt; nothing to report.
+		default:
+			errBox := qt.NewQMessageBox3(qt.QMessageBox__Critical, "Could not install the VPN helper",
+				fmt.Sprintf("%v\n\nYou can install it manually by running scripts/install-helper.sh in a Terminal.", err))
+			errBox.SetStandardButtons(qt.QMessageBox__Ok)
+			errBox.Exec()
+		}
 	}()
 }

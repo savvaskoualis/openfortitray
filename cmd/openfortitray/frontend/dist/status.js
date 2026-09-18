@@ -58,5 +58,23 @@ window.addEventListener("DOMContentLoaded", () => {
 
   if (window.runtime && window.runtime.EventsOn) {
     window.runtime.EventsOn("tunnel:event", OFT.renderView);
+
+    window.runtime.EventsOn("update:check-result", (r) => {
+      alert(r.heading + "\n\n" + r.body);
+    });
+
+    window.runtime.EventsOn("update:offer", (tag) => {
+      if (confirm("OpenFortiTray " + tag + " is available. Download it now? (The VPN stays connected during download.)")) {
+        OFT.call("DownloadUpdate");
+      }
+    });
+    window.runtime.EventsOn("update:ready", (tag) => {
+      if (confirm("OpenFortiTray " + tag + " is ready to install. Restart now? (The app will close and reopen automatically.)")) {
+        OFT.call("RestartAndInstall");
+      }
+    });
+    window.runtime.EventsOn("update:failed", (err) => {
+      alert("The update could not be downloaded. Nothing has changed.\n\n" + err);
+    });
   }
 });

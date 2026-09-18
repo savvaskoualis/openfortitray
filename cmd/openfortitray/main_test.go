@@ -16,32 +16,7 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
-	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
 )
-
-// drainDispatchAsync runs fn — an onSystemWake/onScreenWake-style callback —
-// and asserts it returns immediately, WITHOUT blocking the caller: in
-// production, both callbacks are invoked by the OS on the very same thread
-// that drains a.dispatch (see onSystemWake/onScreenWake's doc comments), so
-// they must only Post their work, never PostAndWait — PostAndWait there
-// would deadlock forever, since Drain can never run while the calling thread
-// is stuck waiting inside the callback it is supposed to be draining for.
-// Once fn has returned, a.dispatch.Drain() actually runs the posted work so
-// callers can assert on its effects.
-func drainDispatchAsync(t *testing.T, a *app, fn func()) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		fn()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("fn blocked instead of returning immediately — it must only Post its work (never PostAndWait), since in production it runs on the very thread that drains the queue")
-	}
-	a.dispatch.Drain()
-}
 
 // newTestApp builds an app whose supervisor records whether it was ever asked to
 // authenticate — i.e. whether a connection attempt actually started.
@@ -66,10 +41,9 @@ func newTestApp(t *testing.T, gateway, cfgDir string) (*app, chan struct{}) {
 			ActiveProfile: "Default",
 			Profiles:      []config.Profile{{Name: "Default", Gateway: gateway, Port: 10443}},
 		},
-		cfgDir:   cfgDir,
-		sup:      tunnel.New(authFn, runFn, events),
-		events:   events,
-		dispatch: uidispatch.New(),
+		cfgDir: cfgDir,
+		sup:    tunnel.New(authFn, runFn, events),
+		events: events,
 		// The credstore seam: an empty in-memory fake, so a test that switches the
 		// active profile to an IPsec backend (startTunnel then reads the PSK
 		// through this) never touches the real keychain, and a fast bounded retry
@@ -334,7 +308,7 @@ func TestStartTunnelRetriesIPsecPSKReadOnBusyStore(t *testing.T) {
 func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
-	drainDispatchAsync(t, a, a.onSystemWake)
+	a.onSystemWake()
 
 	select {
 	case <-authCalled:
@@ -356,7 +330,7 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 		t.Fatal("supervisor never started authenticating")
 	}
 
-	drainDispatchAsync(t, a, a.onSystemWake)
+	a.onSystemWake()
 
 	select {
 	case <-authCalled:
@@ -384,7 +358,7 @@ func TestOnSystemWakeDebouncesRapidWakes(t *testing.T) {
 		t.Fatal("supervisor never started authenticating")
 	}
 
-	drainDispatchAsync(t, a, a.onSystemWake)
+	a.onSystemWake()
 	select {
 	case <-authCalled:
 	case <-time.After(2 * time.Second):
@@ -392,7 +366,7 @@ func TestOnSystemWakeDebouncesRapidWakes(t *testing.T) {
 	}
 
 	// A second wake, seconds later, is well inside wakeReconnectCooldown.
-	drainDispatchAsync(t, a, a.onSystemWake)
+	a.onSystemWake()
 	select {
 	case <-authCalled:
 		t.Error("second wake within the cooldown forced another reconnect — Power Nap storm not debounced")
@@ -424,11 +398,10 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	default:
 	}
 
-	// Proves onScreenWake actually posted its tray-reassert work to
-	// a.dispatch (rather than touching the tunnel directly): it must return
-	// immediately without blocking, and once the queue is drained, no auth
-	// attempt fired.
-	drainDispatchAsync(t, a, a.onScreenWake)
+	// Proves onScreenWake only re-asserts the tray (rather than touching the
+	// tunnel directly): it must return immediately without blocking, and no
+	// auth attempt fires even once its internal goroutine has run.
+	a.onScreenWake()
 
 	select {
 	case <-authCalled:
