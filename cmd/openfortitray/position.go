@@ -8,31 +8,31 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 )
 
-// windowW/windowH/positionMargin size the fixed-corner placement
-// positionWindow computes. They mirror the Wails window's own configured
-// size (see buildAppOptions) rather than querying it at runtime — Wails
-// exposes no WindowGetSize-before-WindowSetPosition ordering guarantee worth
-// depending on here, and the window's size is fixed at startup anyway.
+// windowW/windowH/positionMargin size the popover positionWindow computes.
+// They mirror the Wails window's own configured size (see buildAppOptions)
+// rather than querying it at runtime — Wails exposes no WindowGetSize-
+// before-WindowSetPosition ordering guarantee worth depending on here, and
+// the window's size is fixed at startup anyway.
 const (
 	windowW        = 380
 	windowH        = 600
 	positionMargin = 8
 )
 
-// positionWindow places the app's window at a fixed corner of the PRIMARY
-// screen: top-right on macOS/Linux (mirroring where a menu-bar/system-tray
-// icon conventionally lives), bottom-right on Windows (mirroring the
-// taskbar's tray corner).
+// positionWindow places the app's window near the tray icon click that
+// triggered it: it reads the OS cursor position (internal/tray.
+// CursorPosition — real per-platform native calls: NSEvent.mouseLocation on
+// macOS, GetCursorPos on Windows, XQueryPointer on X11/XWayland Linux) and
+// anchors the window just below it, clamped so it never renders off the edge
+// of whichever screen the cursor is actually on — the same placement a
+// native OS tray flyout uses.
 //
-// This is a deliberate scope reduction from true tray-icon-relative
-// positioning: neither github.com/energye/systray v1.0.3 nor Wails'
-// runtime.ScreenGetAll expose the tray icon's actual on-screen position (no
-// icon-geometry query exists in systray's API, and runtime.Screen carries
-// only Size/PhysicalSize + IsCurrent/IsPrimary — no origin/X/Y field), so
-// there is nothing to position "relative to" the icon. Fixed-corner
-// placement is the closest achievable approximation without adding
-// per-platform native code to query icon geometry, which would reintroduce
-// exactly the platform-specific complexity this migration removes.
+// Falls back to a fixed corner of the PRIMARY screen (top-right on
+// macOS/Linux, bottom-right on Windows) only when no cursor position is
+// obtainable at all — in practice, only a pure-Wayland Linux session, which
+// deliberately forbids any client from querying the global cursor position
+// (a Wayland security-model restriction, not a library gap: see
+// internal/tray/cursor_linux.c).
 //
 // It only moves the window; it does not show it — onTrayClick (tray.Setup's
 // onIconClick callback) calls this and then app.ShowStatus, which does the
@@ -41,11 +41,6 @@ func (a *app) positionWindow() {
 	ctx := a.ctxSnapshot()
 	if ctx == nil {
 		return
-	}
-
-	corner := "top-right"
-	if runtime.GOOS == "windows" {
-		corner = "bottom-right"
 	}
 
 	// Safe fallback (a common 1440x900 display) used if ScreenGetAll errors,
@@ -62,6 +57,16 @@ func (a *app) positionWindow() {
 		}
 	}
 
+	if cx, cy, ok := tray.CursorPosition(); ok {
+		x, y := tray.ClampToScreen(cx-windowW/2, cy+positionMargin, screenW, screenH, windowW, windowH, positionMargin)
+		wailsruntime.WindowSetPosition(ctx, x, y)
+		return
+	}
+
+	corner := "top-right"
+	if runtime.GOOS == "windows" {
+		corner = "bottom-right"
+	}
 	x, y := tray.CornerPosition(corner, screenW, screenH, windowW, windowH, positionMargin)
 	wailsruntime.WindowSetPosition(ctx, x, y)
 }
