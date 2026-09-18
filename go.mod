@@ -6,7 +6,6 @@ require (
 	github.com/energye/systray v1.0.3
 	github.com/gen2brain/beeep v0.11.2
 	github.com/godbus/dbus/v5 v5.2.2
-	github.com/mappu/miqt v0.14.0
 	github.com/wailsapp/wails/v2 v2.9.2
 	golang.org/x/sys v0.30.0
 )

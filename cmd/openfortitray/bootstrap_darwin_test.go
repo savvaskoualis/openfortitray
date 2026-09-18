@@ -4,11 +4,12 @@ package main
 
 import "testing"
 
-// TestOfferBootstrapInstallNilWindowDoesNotPanic guards the fix for the
-// Task 2 review finding: main() no longer constructs a.win (nil permanently,
-// pending Task 8's Wails rewrite of this dialog), so offerBootstrapInstall
-// must return early instead of dereferencing it.
-func TestOfferBootstrapInstallNilWindowDoesNotPanic(t *testing.T) {
+// TestOfferBootstrapInstallDoesNotPanicOnBareApp guards offerBootstrapInstall's
+// Task 8 Qt-free rewrite: it no longer touches any app field (it only checks
+// os.Stat(oft.HelperPath) and calls the package-level tray.ShowMessage, which
+// nil-guards itself), so a bare &app{} — as used here, and as main() would
+// never actually construct one — must still be safe to call this on.
+func TestOfferBootstrapInstallDoesNotPanicOnBareApp(t *testing.T) {
 	a := &app{}
 	a.offerBootstrapInstall() // must not panic
 }

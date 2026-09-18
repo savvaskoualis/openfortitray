@@ -3,14 +3,12 @@
 package main
 
 import (
-	"errors"
-	"fmt"
 	"log"
 	"os"
 
-	qt "github.com/mappu/miqt/qt6"
-
 	oft "github.com/savvaskoualis/openfortitray"
+
+	"github.com/savvaskoualis/openfortitray/internal/tray"
 )
 
 // installBootstrapHooks wires the first-run privileged-helper install into the
@@ -42,56 +40,22 @@ func (a *app) connectWithBootstrap() {
 	}()
 }
 
-// offerBootstrapInstall shows the confirm dialog and, on OK, runs the privileged
-// install off the UI thread, then dials on success or explains the failure and
-// points at the manual installer. A dismissed password prompt
-// (ErrUserCancelled) is intentionally silent — the user chose not to install.
-//
-// Dormant since the Wails migration: a.win is never set any more (Task 2
-// stopped constructing a Qt window), so the nil-guard below always returns
-// before the QMessageBox code beneath it is reached. Left in place — and its
-// remaining a.dispatch.Post call converted to a direct call so it compiles —
-// until Task 8 or a later task rewrites this dialog onto Wails.
+// offerBootstrapInstall tells the user a privileged helper install/update is
+// needed, via a native OS notification, and points at the manual install
+// script. It does NOT attempt an automated install or show a confirmation
+// dialog — that UX decision (a real one-click install flow through the
+// Wails UI) is out of scope here; this only keeps the existing "tell them
+// to run scripts/install-helper.sh" behavior working now that the Qt
+// dialog it used to show cannot exist anymore.
 func (a *app) offerBootstrapInstall() {
-	if a.win == nil {
-		log.Print("offerBootstrapInstall: no window available yet (Qt UI removed pending Task 8's Wails rewrite of this dialog); skipping the helper-install prompt — run scripts/install-helper.sh manually in the meantime")
-		return
-	}
-	// Bring the window forward so the dialog has a visible parent (Connect can be
-	// invoked from the tray while the window is hidden).
-	a.win.Show()
-	a.win.Raise()
-	a.win.ActivateWindow()
-	// The same gate covers a first install and an upgrade of an existing helper, so
-	// the wording has to fit both: telling someone who has used the app for weeks
-	// that it "needs to install" a helper reads like a mistake.
-	title, body := "Install VPN helper",
-		"OpenFortiTray needs to install a small helper to run the VPN.\n"+
-			"This will ask for your Mac password. Install now?"
+	title, body := "VPN helper needed",
+		"OpenFortiTray needs to install a small helper to run the VPN. "+
+			"Run scripts/install-helper.sh in a Terminal, then try connecting again."
 	if _, err := os.Stat(oft.HelperPath); err == nil {
-		title = "Update VPN helper"
-		body = "OpenFortiTray needs to update its VPN helper before it can connect.\n" +
-			"This will ask for your Mac password. Update now?"
+		title = "VPN helper needs updating"
+		body = "OpenFortiTray needs to update its VPN helper before it can connect. " +
+			"Run scripts/install-helper.sh in a Terminal, then try connecting again."
 	}
-
-	mb := qt.NewQMessageBox3(qt.QMessageBox__Question, title, body)
-	mb.SetStandardButtons(qt.QMessageBox__Yes | qt.QMessageBox__No)
-	if mb.Exec() != int(qt.QMessageBox__Yes) {
-		return
-	}
-
-	go func() {
-		err := oft.Install()
-		switch {
-		case err == nil:
-			a.startTunnel()
-		case errors.Is(err, oft.ErrUserCancelled):
-			// User dismissed the password prompt; nothing to report.
-		default:
-			errBox := qt.NewQMessageBox3(qt.QMessageBox__Critical, "Could not install the VPN helper",
-				fmt.Sprintf("%v\n\nYou can install it manually by running scripts/install-helper.sh in a Terminal.", err))
-			errBox.SetStandardButtons(qt.QMessageBox__Ok)
-			errBox.Exec()
-		}
-	}()
+	log.Printf("bootstrap: %s — %s", title, body)
+	tray.ShowMessage(title, body)
 }

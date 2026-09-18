@@ -21,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	qt "github.com/mappu/miqt/qt6"
 	"github.com/wailsapp/wails/v2"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -31,8 +30,6 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
-	"github.com/savvaskoualis/openfortitray/internal/shell"
-	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
@@ -93,17 +90,6 @@ type app struct {
 	logPath       string
 
 	tray *tray.Controller
-	// status is the connection panel; the shell decides when it is on screen.
-	status *status.Controller
-	// shell owns the single window and which section of it is visible.
-	shell *shell.Shell
-	// stopTick stops the 1 Hz uptime ticker that drives the status window's clock.
-	// nil until the ticker is started in OnStarted; called once during teardown so
-	// the goroutine cannot outlive the UI it posts to.
-	stopTick func()
-	// win is the (initially hidden) single window, reused as the parent for the
-	// first-run bootstrap dialogs. Set once in main after the window is built.
-	win *qt.QMainWindow
 	// ctx is the Wails runtime context, captured by buildAppOptions' OnStartup
 	// callback once wails.Run has created the webview. Bridge's methods (and
 	// ShowSettings/ShowStatus below) nil-check it, since it stays nil until
@@ -1044,44 +1030,6 @@ func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
 	return setup, sums
 }
 
-// startUptimeTicker drives the status window's session clock, the one thing on
-// screen that changes without a tunnel event.
-//
-// It is stopped during teardown: a ticker goroutine that outlived the UI would
-// touch a driver Quit is destroying — the same hazard the pump's quitting flag
-// guards against, so it reads that flag too.
-//
-// Dead code as of Task 2: a.status is never constructed any more (nil is the
-// permanent value), so the guard below always returns immediately and this
-// function is unreachable. Left in place, converted to a direct call so it
-// compiles without a.dispatch, until Task 8 deletes it along with
-// internal/status.
-//
-// status.Tick returns on a branch when no session is up, so an idle app pays for
-// a channel receive per second and nothing else.
-func (a *app) startUptimeTicker() {
-	if a.status == nil || a.stopTick != nil {
-		return
-	}
-	t := time.NewTicker(time.Second)
-	done := make(chan struct{})
-	a.stopTick = func() { close(done) }
-	go func() {
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if a.quitting.Load() || a.status == nil {
-					return
-				}
-				a.status.Tick()
-			}
-		}
-	}()
-}
-
 // pump is the one goroutine that reads tunnel events and drives the UI.
 // Wails' runtime calls are safe from any goroutine, so this runs everything
 // inline rather than marshalling onto a separate UI goroutine. Once quitting
@@ -1256,15 +1204,6 @@ func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
 		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
-		// Stop the uptime ticker before the teardown begins, so it cannot queue
-		// work against a driver that is about to be destroyed. quitting is
-		// already set, so an in-flight tick returns without touching the UI
-		// either way; this just stops the goroutine rather than leaving it
-		// running to no purpose.
-		if a.stopTick != nil {
-			a.stopTick()
-			a.stopTick = nil
-		}
 		go func() {
 			// Signal completion no matter how this returns, so awaitShutdown (which
 			// keeps the process alive for exactly this work) can never wait out its
@@ -1662,8 +1601,7 @@ func main() {
 	setDockActivationPolicy()
 
 	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
-	// where the manual scripts/install.sh path is unchanged). Must be after a.win
-	// and a.settings are set — the bootstrap dialogs parent on a.win.
+	// where the manual scripts/install.sh path is unchanged).
 	a.installBootstrapHooks()
 
 	// Give the Dock icon an effect. Qt has no reopen-delegate hook of its own on
@@ -1684,7 +1622,6 @@ func main() {
 		log.Print("dock: activated — showing the status window")
 		a.ShowStatus()
 	})
-	a.startUptimeTicker()
 
 	// The one event pump. Started before the event loop so events emitted by
 	// the connect-on-launch below are ready to render as soon as the window
