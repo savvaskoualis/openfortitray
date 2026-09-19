@@ -432,6 +432,38 @@ install_openconnect() {
 	esac
 }
 
+# install_webview_runtime installs the GTK3/WebKit2GTK runtime libraries the
+# Linux binary links against (Wails migration; see
+# cmd/openfortitray/wailsapp.go). This runs unconditionally on Linux —
+# deliberately NOT folded into install_openconnect, which returns early when
+# openconnect is already present. Every EXISTING Linux user upgrading already
+# has openconnect installed by definition, so nesting this install inside
+# install_openconnect would mean upgraders never get it and the new
+# Wails-linked binary fails to start with a dynamic-linker error — the exact
+# hazard the old Qt6 runtime step (miqt migration) existed to prevent, now
+# reapplied to libwebkit2gtk/libgtk-3. macOS needs no equivalent step:
+# WebKit/Cocoa are system frameworks.
+install_webview_runtime() {
+	[[ "$OS" == Linux ]] || return
+	# Prefer the 4.1 runtime package (matches what CI/release builds link
+	# against — see .github/workflows/release.yml's build-linux job; Ubuntu
+	# 24.04+ dropped the 4.0 dev package entirely, and current Fedora/Arch
+	# package 4.1 too), falling back to the 4.0-named runtime package for
+	# older distros (e.g. Ubuntu 22.04/Debian 11, older Fedora) that don't
+	# package 4.1.
+	if command -v apt-get >/dev/null 2>&1; then
+		sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 \
+			|| sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.0-37
+	elif command -v dnf >/dev/null 2>&1; then
+		sudo dnf install -y gtk3 webkit2gtk4.1 \
+			|| sudo dnf install -y gtk3 webkit2gtk3
+	elif command -v pacman >/dev/null 2>&1; then
+		sudo pacman -S --noconfirm gtk3 webkit2gtk-4.1 \
+			|| sudo pacman -S --noconfirm gtk3 webkit2gtk
+	else die "no supported package manager found; install the GTK3/WebKit2GTK runtime manually"
+	fi
+}
+
 # resolve_openconnect picks the absolute openconnect path to bake into the helper
 # and verifies nothing writable sits on the way to it.
 #
@@ -464,14 +496,16 @@ resolve_openconnect() {
 }
 
 # install_app_bundle builds the macOS .app (make app) and installs it to
-# /Applications so LSUIElement=1 is honoured — a bare /usr/local/bin binary would
-# render the fyne status item unreliably and show a Dock icon. The LaunchAgent
-# points its ProgramArguments at "$APP_EXEC", so login-launch reads the same
-# Info.plist. Prebuilt bundle downloads are deferred to the Fyne 5 packaging work.
+# /Applications so LSUIElement=1 is honoured — a bare /usr/local/bin binary
+# would render the status item unreliably and show a Dock icon. The
+# LaunchAgent points its ProgramArguments at "$APP_EXEC", so login-launch
+# reads the same Info.plist. There is no prebuilt-.dmg download path here yet
+# (see install_binary's RELEASE_URL handling for the non-macOS equivalent);
+# the .app is always built fresh from the checkout.
 install_app_bundle() {
 	local src="$REPO_DIR/dist/OpenFortiTray.app"
 	if [[ -n "$RELEASE_URL" ]]; then
-		warn "OPENFORTITRAY_RELEASE_URL is ignored on macOS; building the .app from the checkout (prebuilt bundles arrive with Fyne 5 packaging)."
+		warn "OPENFORTITRAY_RELEASE_URL is ignored on macOS; building the .app from the checkout (no prebuilt-.dmg download path yet)."
 	fi
 	(cd "$REPO_DIR" && make app)
 	[[ -d "$src" ]] || die "make app did not produce $src"
@@ -628,6 +662,7 @@ validate_helper_dir
 install_config
 preflight_paths
 install_openconnect
+install_webview_runtime
 resolve_openconnect
 install_binary
 install_helper

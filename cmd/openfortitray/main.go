@@ -2,9 +2,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"embed"
 	"errors"
 	"fmt"
 	"log"
@@ -22,14 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"fyne.io/fyne/v2"
-	fyneapp "fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
-	"github.com/go-gl/glfw/v3.4/glfw"
+	"github.com/wailsapp/wails/v2"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -37,14 +30,22 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
-	"github.com/savvaskoualis/openfortitray/internal/shell"
-	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
-	"github.com/savvaskoualis/openfortitray/internal/uitheme"
+	"github.com/savvaskoualis/openfortitray/internal/uistate"
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
+
+// frontendAssets embeds the Wails frontend built by Task 1
+// (cmd/openfortitray/frontend/dist). It lives here, not at the repo root,
+// because a //go:embed pattern may not contain ".." path elements — it can
+// only reach into subdirectories of the package that declares it — so the
+// frontend/ and wails.json Task 1 placed at the repo root were moved under
+// cmd/openfortitray/ in this task to make this embeddable at all.
+//
+//go:embed all:frontend/dist
+var frontendAssets embed.FS
 
 // supervisor is the slice of *tunnel.Supervisor the app drives. Naming it as an
 // interface lets the tests substitute a fake that records the teardown calls the
@@ -88,20 +89,22 @@ type app struct {
 	events        chan tunnel.Event
 	logPath       string
 
-	fyneApp  fyne.App
-	tray     *tray.Controller
-	settings *settings.Controller
-	// status is the connection panel; the shell decides when it is on screen.
-	status *status.Controller
-	// shell owns the single window and which section of it is visible.
-	shell *shell.Shell
-	// stopTick stops the 1 Hz uptime ticker that drives the status window's clock.
-	// nil until the ticker is started in OnStarted; called once during teardown so
-	// the goroutine cannot outlive the UI it posts to.
-	stopTick func()
-	// win is the (initially hidden) settings window, reused as the parent for the
-	// first-run bootstrap dialogs. Set once in main after the window is built.
-	win fyne.Window
+	tray *tray.Controller
+	// ctx is the Wails runtime context, captured by buildAppOptions' OnStartup
+	// callback once wails.Run has created the webview. It is written once
+	// (OnStartup) but read from many goroutines (pump, the signal handler,
+	// prepareUpdate's goroutine, positionWindow, every Bridge method) — the
+	// same cross-goroutine hazard tp/lastEvent/activity above have, so it is
+	// guarded by the same a.mu via setCtx/ctxSnapshot below. Every read site
+	// nil-checks the ctxSnapshot() result, since it stays nil until startup
+	// completes and in every test that never calls wails.Run. Never read this
+	// field directly outside setCtx/ctxSnapshot.
+	ctx context.Context
+	// lastEvent is the most recent tunnel.Event, guarded by mu like tp/ipsecTP
+	// above so Bridge.CurrentView — invoked on whatever goroutine Wails
+	// dispatches a bound JS call on, not necessarily the pump goroutine — can
+	// read the live state without racing pump's write of it.
+	lastEvent tunnel.Event
 	// connectBootstrap, when non-nil, runs the macOS first-run helper-install gate
 	// before dialing: a passwordless-helper readiness probe, and — if the helper is
 	// not yet installed — an admin-password prompt that installs it, then a dial. It
@@ -120,8 +123,8 @@ type app struct {
 	onConnectIssue func(*settings.Issue)
 	// quitting stops the event pump touching a tearing-down UI. It is set once,
 	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
-	// drains events without calling fyne.Do — so no fyne.Do is ever queued
-	// against a UI that a.fyneApp.Quit() is about to destroy.
+	// drains events without emitting any further UI events — so no UI work is
+	// ever dispatched against a UI that wailsruntime.Quit is about to destroy.
 	quitting atomic.Bool
 	// shutdownDone is closed once the teardown goroutine has finished, so
 	// awaitShutdown can hold the process open until the tunnel is really down. It
@@ -142,6 +145,22 @@ type app struct {
 	// newly edited settings (Connect re-snapshots the now-updated active profile).
 	mu sync.Mutex
 	tp tunnelParams
+	// activity is a short history of recent tunnel events for the status
+	// window's activity log (Bridge.RecentActivity). Guarded by mu, the same
+	// lock as tp/lastEvent above: pump() appends to it (see pump), while
+	// Bridge.RecentActivity reads it from whatever goroutine Wails' JS bridge
+	// calls it on, which is not necessarily the pump goroutine. uistate.Ring
+	// itself is explicitly not safe for concurrent use, so this mutex is load
+	// bearing, not decorative.
+	activity *uistate.Ring
+	// windowVisible tracks whether the Wails window is currently on screen,
+	// guarded by mu like tp/lastEvent/activity above. It is the state
+	// onTrayClick's toggle decision reads, and ShowSettings/ShowStatus/
+	// HideWindow (called from the "Open"/Settings… tray menu items and the
+	// frontend's blur-to-hide handler, not just the tray icon click) all keep
+	// it in sync — so a window shown via any of those paths is still
+	// considered "visible" for the next tray-icon click's toggle decision.
+	windowVisible bool
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -157,6 +176,11 @@ type app struct {
 	// race-free answer to "should this reconnect" without touching pump-goroutine-
 	// only state.
 	wantConnected atomic.Bool
+	// lastWakeReconnectAt is when onSystemWake last forced a Disconnect+Connect.
+	// It is read and written only inside onSystemWake's internal goroutine, so
+	// it needs no synchronization of its own — like lastNotified, it is
+	// confined to that one goroutine's sequential execution.
+	lastWakeReconnectAt time.Time
 	// cookieGet/cookieSet/cookieDelete are the credstore seam. They default to the
 	// package funcs in main(); tests substitute an in-memory fake so the cache-first
 	// flow is exercised without touching the real keychain. samlAuth is the SAML
@@ -172,10 +196,11 @@ type app struct {
 	cookieRetryInterval time.Duration
 	cookieRetryWindow   time.Duration
 
-	// notify posts a desktop notification. It is the fyne app's
-	// SendNotification in production and a recorder in tests; nil means "no
-	// notifications" (the pump null-checks it). Only the pump goroutine calls
-	// it, via notifyFor, so no extra synchronisation is needed.
+	// notify posts a desktop notification. It is tray.ShowMessage (via the
+	// system tray icon's native balloon/banner) in production and a recorder
+	// in tests; nil means "no notifications" (the pump null-checks it). Only
+	// the pump goroutine calls it, via notifyFor, so no extra synchronisation
+	// is needed.
 	notify func(title, body string)
 	// lastNotified is the state the last notification described, so the pump
 	// notifies on TRANSITIONS only — the supervisor re-emits the same state on
@@ -199,6 +224,13 @@ type app struct {
 	// badge + menu item update every check; the dialog does not nag). Guarded by
 	// updateMu; consulted via shouldPromptUpdate.
 	lastPromptedTag string
+
+	// pendingUpdateMu guards pendingUpdate: the release prepareUpdate has
+	// finished downloading and is waiting for the user to confirm the restart
+	// (see update.go). nil until prepareUpdate succeeds; read once by
+	// Bridge.RestartAndInstall.
+	pendingUpdateMu sync.Mutex
+	pendingUpdate   *pendingUpdate
 
 	// ipsecRunFunc builds the platform IPsec RunFunc for a profile/PSK — the
 	// package's newIPsecRunFunc (ipsecrun_unix.go / ipsecrun_windows.go) when
@@ -227,6 +259,92 @@ func (a *app) setSnapshot(tp tunnelParams) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.tp = tp
+}
+
+// setLastEvent records the most recent tunnel.Event for lastEventSnapshot to
+// read. Called from pump on every event, on the pump goroutine.
+func (a *app) setLastEvent(e tunnel.Event) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastEvent = e
+}
+
+// lastEventSnapshot returns the most recent tunnel.Event pump has seen, for
+// Bridge.CurrentView. See lastEvent's doc comment for why this is mu-guarded
+// rather than pump-goroutine-only like lastNotified.
+func (a *app) lastEventSnapshot() tunnel.Event {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastEvent
+}
+
+// setCtx records the Wails runtime context. Called once, from
+// buildAppOptions' OnStartup callback, on whatever goroutine Wails invokes
+// OnStartup on.
+func (a *app) setCtx(ctx context.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ctx = ctx
+}
+
+// ctxSnapshot returns the Wails runtime context set by setCtx, or nil before
+// startup completes (and in every test that never calls wails.Run). See
+// ctx's doc comment for why this is mu-guarded rather than a direct field
+// read — go a.pump() starts before wails.Run, so the write and reads
+// genuinely race at startup without this.
+func (a *app) ctxSnapshot() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ctx
+}
+
+// setWindowVisible records whether the Wails window is currently on screen.
+// Called from ShowSettings/ShowStatus (true), HideWindow (false) and
+// onTrayClick (both directions) — every path that shows or hides the window
+// — so onTrayClick's toggle decision is never stale.
+func (a *app) setWindowVisible(v bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.windowVisible = v
+}
+
+// windowVisibleSnapshot reports whether the window is currently visible, per
+// the last setWindowVisible call. See windowVisible's doc comment.
+func (a *app) windowVisibleSnapshot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.windowVisible
+}
+
+// onTrayClick is the tray icon's own click handler (wired as tray.Setup's
+// onIconClick callback). It toggles the window: hide if already visible,
+// otherwise position + reveal — matching a Tailscale-style tray icon. This
+// also fixes a race with the frontend's blur-to-hide handler (frontend/dist/
+// app.js): without this check, clicking the icon while the window was
+// already visible would steal focus (blur fires -> HideWindow), then this
+// handler would show it again — an observable flicker, or a click that
+// appeared to do nothing.
+func (a *app) onTrayClick() {
+	if a.windowVisibleSnapshot() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.WindowHide(ctx)
+		}
+		a.setWindowVisible(false)
+		return
+	}
+	a.positionWindow()
+	a.ShowStatus()
+}
+
+// recentActivity returns a snapshot of the activity ring, safe to call from
+// any goroutine (guarded by a.mu, the same lock pump() uses to Add).
+func (a *app) recentActivity() []uistate.Entry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activity == nil {
+		return nil
+	}
+	return a.activity.Entries()
 }
 
 // ipsecParams is the IPsec counterpart of tunnelParams: the profile and PSK
@@ -400,14 +518,26 @@ func (a *app) startTunnel() {
 	a.sup.Connect()
 }
 
+// wakeReconnectCooldown bounds how often onSystemWake will force a
+// Disconnect+Connect. macOS Power Nap wakes the machine every 60-90s on AC
+// power even though the network and VPN session never actually went down —
+// diagnosed live from a 380-cycle overnight reconnect storm, one full
+// Disconnect+Connect per Power Nap wake, all night. A wake inside the
+// cooldown is treated as one of those and left alone, trusting the still-live
+// session; a wake further apart than this is treated as a real sleep (lid
+// closed, laptop put away) and still forces the reconnect exactly as before.
+const wakeReconnectCooldown = 5 * time.Minute
+
 // onSystemWake forces a fresh reconnect after the OS reports the machine resumed
-// from sleep — see watchSystemSleep. It exists because openconnect's own dead-peer
-// detection is comparatively slow (this gateway explicitly disables openconnect's
-// self-managed reconnect, so a stale post-sleep tunnel is only caught once a
-// keepalive round trip times out), which can leave the tray looking "Connected" to
-// a session that has been dead since before the laptop went to sleep. Forcing an
-// immediate Disconnect+Connect is exactly what the tray's own Disconnect-then-
-// Connect already does when a user does it manually — this only automates that.
+// from sleep — see watchSystemSleep — but only outside wakeReconnectCooldown of
+// the last one (see its doc comment). It exists because openconnect's own
+// dead-peer detection is comparatively slow (this gateway explicitly disables
+// openconnect's self-managed reconnect, so a stale post-sleep tunnel is only
+// caught once a keepalive round trip times out), which can leave the tray
+// looking "Connected" to a session that has been dead since before the laptop
+// went to sleep. Forcing an immediate Disconnect+Connect is exactly what the
+// tray's own Disconnect-then-Connect already does when a user does it
+// manually — this only automates that, for a REAL sleep.
 //
 // It also unconditionally re-asserts the tray icon and menu, regardless of
 // wantConnected: a sleep/wake cycle can silently drop the NSStatusItem (the same
@@ -420,17 +550,26 @@ func (a *app) startTunnel() {
 // goroutine) — never the pump.
 func (a *app) onSystemWake() {
 	wantConnected := a.wantConnected.Load()
-	fyne.DoAndWait(func() {
+	// Spawn a goroutine, don't block: this callback is invoked by NSWorkspace's
+	// notification center on the main queue (see wake_darwin.m), and the OS
+	// expects the callback to return promptly. There is nothing here that
+	// needs the mutation to be visibly complete before returning to the OS.
+	go func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
 		if !wantConnected {
 			return
 		}
+		if since := time.Since(a.lastWakeReconnectAt); !a.lastWakeReconnectAt.IsZero() && since < wakeReconnectCooldown {
+			log.Printf("openfortitray: woke %v after the last forced reconnect (Power Nap?); leaving the session alone", since.Round(time.Second))
+			return
+		}
+		a.lastWakeReconnectAt = time.Now()
 		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
 		a.Connect()
-	})
+	}()
 }
 
 // onScreenWake re-asserts the tray icon and menu every time the display
@@ -443,133 +582,15 @@ func (a *app) onSystemWake() {
 // already guard against, just on a much more frequent trigger.
 func (a *app) onScreenWake() {
 	log.Print("openfortitray: display woke; re-asserting tray")
-	fyne.DoAndWait(func() {
+	// Spawn a goroutine, don't block — same reasoning as onSystemWake: this
+	// callback is invoked by the OS on its own thread and must return
+	// promptly.
+	go func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
 		log.Print("openfortitray: tray re-assert after display wake done")
-	})
-}
-
-// freezePingInterval, freezePingTimeout and freezeMaxMisses tune
-// watchMainThreadFreeze: how often it checks, how long one check waits, and
-// how many consecutive misses it takes before declaring the app frozen.
-// Diagnosed live: Fyne's own glfw.PollEvents() can block forever on this
-// app's single macOS event loop after a display sleep/wake cycle (Fyne's own
-// source comment already admits it can block during a window resize — this
-// project traced a second, permanent trigger tied to display power-cycling).
-// Once it blocks, EVERY fyne.Do/DoAndWait queued after it — including a
-// normal Quit — never runs again; nothing on that thread can recover itself.
-// freezeMaxMisses*freezePingInterval (here, 3*20s = 60s) is deliberately not
-// aggressive: a real user resize can legitimately block PollEvents for a few
-// seconds, and this must never mistake that for a permanent freeze.
-const (
-	freezePingInterval = 20 * time.Second
-	freezePingTimeout  = 10 * time.Second
-	freezeMaxMisses    = 3
-)
-
-// mainThreadResponsive reports whether the UI goroutine processes a queued
-// fyne.Do call within timeout. It never itself blocks on the UI goroutine —
-// fyne.Do only enqueues — so this is safe to call even when the UI goroutine
-// is genuinely wedged forever; unlike fyne.DoAndWait, which would wedge the
-// caller too.
-func (a *app) mainThreadResponsive(timeout time.Duration) bool {
-	done := make(chan struct{}, 1)
-	fyne.Do(func() {
-		select {
-		case done <- struct{}{}:
-		default:
-		}
-	})
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
-}
-
-// watchMainThreadFreeze pings the UI goroutine on its own schedule and, after
-// freezeMaxMisses consecutive misses, calls recoverFromFreeze. Runs for the
-// life of the process; exits early once a normal shutdown has already begun
-// (a.quitting), so it never fights a clean quit that just happens to be
-// taking a while.
-func (a *app) watchMainThreadFreeze() {
-	misses := 0
-	for {
-		time.Sleep(freezePingInterval)
-		if a.quitting.Load() {
-			return
-		}
-		if a.mainThreadResponsive(freezePingTimeout) {
-			misses = 0
-			continue
-		}
-		misses++
-		log.Printf("openfortitray: main thread unresponsive (%d/%d)", misses, freezeMaxMisses)
-		if misses >= freezeMaxMisses {
-			a.recoverFromFreeze()
-			return
-		}
-	}
-}
-
-// recoverFromFreeze is the last resort when the UI goroutine is confirmed
-// wedged: nothing running ON that goroutine can ever fix it, so this runs
-// entirely on the watchdog's own goroutine, tears the tunnel down the same
-// way a normal shutdown does (Supervisor.Disconnect/Wait do not depend on the
-// UI goroutine at all), leaves the same resume marker an update-triggered
-// restart already uses so the fresh process reconnects automatically, starts
-// a fresh copy of the app, and force-exits this one — os.Exit needs no
-// cooperation from the frozen thread, and terminating the process is what
-// actually releases the single-instance lock the new copy is waiting on.
-func (a *app) recoverFromFreeze() {
-	log.Print("openfortitray: main thread frozen; restarting")
-	if a.wantConnected.Load() {
-		if err := writeResumeMarker(a.cfgDir); err != nil {
-			log.Printf("openfortitray: could not write resume marker before a freeze restart: %v", err)
-		}
-	}
-
-	// Reuses shutdown's existing teardown exactly as a signal would, just
-	// with a no-op done: there is no UI left to hand off to, and the fresh
-	// copy about to be started is this launch's replacement, not this
-	// process continuing.
-	a.shutdown(func() {})
-	select {
-	case <-a.shutdownDone:
-	case <-time.After(shutdownWait + 5*time.Second):
-		log.Print("openfortitray: teardown did not finish before a freeze restart; continuing anyway")
-	}
-
-	exe, err := os.Executable()
-	if err != nil {
-		log.Printf("openfortitray: could not find my own executable to restart: %v", err)
-		os.Exit(1)
-	}
-	if err := relaunchSelf(os.Getpid(), exe); err != nil {
-		log.Printf("openfortitray: could not start a fresh copy: %v", err)
-	}
-	os.Exit(1)
-}
-
-// relaunchSelf spawns a detached helper that waits for pid to actually exit —
-// releasing the single-instance lock is what a fresh launch is waiting on —
-// then starts exe fresh. It never waits itself; the helper outlives this
-// process. Mirrors internal/update's own "wait for the old PID, then
-// relaunch" scripts (see apply.go's buildBrewScript/buildWindowsScript) —
-// same problem, same shape of fix, kept local here since recoverFromFreeze
-// has no update in progress and nothing else to do first.
-func relaunchSelf(pid int, exe string) error {
-	cmd, err := relaunchCommand(pid, exe)
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	return cmd.Process.Release()
+	}()
 }
 
 // cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
@@ -737,24 +758,25 @@ var version = "dev"
 // Version returns the build version string shown in the tray header.
 func (a *app) Version() string { return version }
 
-// ShowSettings reveals the settings window (tray.App). It is built once at
-// startup; this only shows the existing, hidden window.
+// ShowSettings reveals the Wails window and asks the frontend to navigate to
+// the settings page (tray.App / Bridge.ShowSettings). It replaces the old
+// Qt shell/settings-controller pair, which main() no longer constructs.
 func (a *app) ShowSettings() {
-	if a.settings == nil || a.shell == nil {
-		return
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:settings", nil)
 	}
-	// Re-sync the form from the live config before it is shown, discarding edits
-	// abandoned last time.
-	a.settings.Show()
-	a.shell.Reveal(shell.SectionConnection)
+	a.setWindowVisible(true)
 }
 
-// ShowStatus reveals the status window (tray.App / the Status… item). Like the
-// settings window it is built once at startup and hidden.
+// ShowStatus reveals the Wails window and asks the frontend to navigate to
+// the status page (tray.App / the Status… item / Bridge.ShowStatus).
 func (a *app) ShowStatus() {
-	if a.shell != nil {
-		a.shell.Reveal(shell.SectionStatus)
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:status", nil)
 	}
+	a.setWindowVisible(true)
 }
 
 // OpenLog opens the log file in the platform's default handler (status.Host). The
@@ -796,6 +818,10 @@ func (a *app) DTLSLabel() string {
 // Config returns the live configuration for the settings window to clone
 // (settings.Host). It runs on the UI goroutine.
 func (a *app) Config() *config.Config { return a.cfg }
+
+// settingsHost exposes a as a settings.Host to Bridge, so it does not need to
+// know app satisfies that interface structurally.
+func (a *app) settingsHost() settings.Host { return a }
 
 // Commit takes the settings window's edited config, syncs the OS autostart login
 // item to c.Autostart, persists c, and makes it the live config (settings.Host).
@@ -1009,25 +1035,20 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 		return
 	}
 	prompt := manual || a.shouldPromptUpdate(rel.Tag)
-	fyne.Do(func() {
-		if a.quitting.Load() {
-			return
-		}
-		if a.tray != nil {
-			a.tray.SetUpdateAvailable(rel.Tag)
-		}
-		if prompt {
-			a.promptUpdate(rel)
-		}
-	})
+	if a.tray != nil {
+		a.tray.SetUpdateAvailable(rel.Tag)
+	}
+	if prompt {
+		a.promptUpdate(rel)
+	}
 }
 
 // shouldPromptUpdate reports whether the update dialog should be shown for tag,
 // recording it so the same version is never prompted twice. A new (distinct,
 // non-empty) tag prompts once; a repeat of the last-prompted tag, or an empty
 // tag, does not. It is a pure decision guarded by updateMu, unit-tested directly
-// (wiring a headless fyne dialog in a test is impractical, so the actual
-// dialog.Show lives in the thin promptUpdate wrapper).
+// (wiring a real update dialog in a test is impractical, so the actual
+// dlg.Show lives in the thin promptUpdate wrapper).
 func (a *app) shouldPromptUpdate(tag string) bool {
 	a.updateMu.Lock()
 	defer a.updateMu.Unlock()
@@ -1038,51 +1059,23 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 	return true
 }
 
-// promptUpdate opens the update flow: the offer, then the download, then the
-// request to restart. See updateflow.go.
-func (a *app) promptUpdate(rel *update.Release) {
-	if a.fyneApp == nil {
-		return
-	}
-	newUpdateFlow(a, rel).start()
-}
-
 // reportCheckResult answers a MANUAL check for updates. A click has to produce a
 // visible result whatever the answer — "no update" reported as silence is
 // indistinguishable from a menu item that does nothing, which is precisely how this
-// one read.
+// one read. It emits an event that frontend/dist/status.js currently renders via
+// a plain alert() — simpler than the old QMessageBox, and dismissed the same
+// way, but still a blocking JS dialog rather than the dismissible banner this
+// comment once described; that upgrade is left for later if it turns out to
+// matter.
 func (a *app) reportCheckResult(heading, body string) {
-	if a.fyneApp == nil {
+	ctx := a.ctxSnapshot()
+	if ctx == nil {
 		return
 	}
-	fyne.Do(func() {
-		if a.quitting.Load() {
-			return
-		}
-		glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
-		w := a.fyneApp.NewWindow("OpenFortiTray Update")
-		w.SetFixedSize(true)
-		w.Resize(fyne.NewSize(420, 200))
-		w.CenterOnScreen()
-		w.SetCloseIntercept(w.Hide)
-
-		h := canvas.NewText(heading, theme.Color(theme.ColorNameForeground))
-		h.TextSize = theme.Size(theme.SizeNameSubHeadingText)
-		h.TextStyle = fyne.TextStyle{Bold: true}
-		msg := widget.NewLabel(body)
-		msg.Wrapping = fyne.TextWrapWord
-		msg.Importance = widget.LowImportance
-		ok := widget.NewButton("OK", func() { w.Hide() })
-		ok.Importance = widget.HighImportance
-
-		w.SetContent(container.NewPadded(container.NewVBox(
-			h, msg, layout.NewSpacer(),
-			container.NewHBox(layout.NewSpacer(), ok),
-		)))
-		w.Show()
-		attachGlass(w)
-		w.RequestFocus()
-	})
+	wailsruntime.EventsEmit(ctx, "update:check-result", struct {
+		Heading string `json:"heading"`
+		Body    string `json:"body"`
+	}{heading, body})
 }
 
 // UpdateClicked is the tray update item's action (UI goroutine). With a pending
@@ -1113,89 +1106,42 @@ func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
 	return setup, sums
 }
 
-// startUptimeTicker drives the status window's session clock, the one thing on
-// screen that changes without a tunnel event.
-//
-// It is started from OnStarted rather than from main because it posts through
-// fyne.Do, and it is stopped during teardown: a ticker goroutine that outlived
-// the UI would queue work against a driver Quit is destroying — the same hazard
-// the pump's quitting flag guards against, so it reads that flag too.
-//
-// status.Tick returns on a branch when no session is up, so an idle app pays for
-// a channel receive per second and nothing else.
-func (a *app) startUptimeTicker() {
-	if a.status == nil || a.stopTick != nil {
-		return
-	}
-	t := time.NewTicker(time.Second)
-	done := make(chan struct{})
-	a.stopTick = func() { close(done) }
-	go func() {
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if a.quitting.Load() {
-					return
-				}
-				fyne.Do(func() {
-					if a.quitting.Load() || a.status == nil {
-						return
-					}
-					a.status.Tick()
-				})
-			}
-		}
-	}()
-}
-
-// pump is the one goroutine that reads tunnel events and drives the UI. fyne
-// owns the main thread, so every mutation of a fyne object from here is
-// marshalled onto the UI goroutine with fyne.Do. Once quitting is set the pump
-// keeps draining the channel (so the supervisor's teardown events never block)
-// but stops touching the UI, which a.fyneApp.Quit() is about to destroy.
+// pump is the one goroutine that reads tunnel events and drives the UI.
+// Wails' runtime calls are safe from any goroutine, so this runs everything
+// inline rather than marshalling onto a separate UI goroutine. Once quitting
+// is set the pump keeps draining the channel (so the supervisor's teardown
+// events never block) but stops touching the UI, which wailsruntime.Quit is
+// about to destroy.
 func (a *app) pump() {
 	for e := range a.events {
 		if a.quitting.Load() {
 			continue
 		}
 		e := e
-		// Notify before the UI hop: notifyFor is pure bookkeeping plus one
-		// SendNotification, both safe off the UI goroutine, and doing it here
-		// keeps it out of the fyne.Do closure that a teardown can skip.
+		// Record the live event for Bridge.CurrentView before anything else —
+		// mu-guarded, so it is safe to read from a goroutine outside this pump.
+		a.setLastEvent(e)
+		a.mu.Lock()
+		a.activity.Add(e, time.Now())
+		a.mu.Unlock()
+		// Notify before emitting the UI event: notifyFor is pure bookkeeping
+		// plus one notification post.
 		a.notifyFor(e)
-		fyne.Do(func() {
-			// Re-check inside the closure: the pre-check above is not atomic with
-			// fyne.Do, and once fyne has drained its queue fyne.Do runs the closure
-			// inline on this goroutine, so an event slipping past the pre-check just
-			// as Quit tears the driver down could otherwise call Apply against a
-			// terminated UI (§7.8). Belt-and-suspenders with the pre-check.
-			if a.quitting.Load() {
-				return
-			}
-			a.tray.Apply(e)
-			// Same consumer, same fyne.Do: mirror the status onto the settings
-			// window's live strip. Safe whether the window is shown or hidden.
-			if a.settings != nil {
-				a.settings.Apply(e)
-			}
-			// And onto the status window, in the SAME closure as the other two, so
-			// all three surfaces render one event or none of them do. Updating a
-			// hidden window's widgets is safe and cheap.
-			if a.status != nil {
-				a.status.Apply(e)
-			}
-			// A terminal, broken-install failure (tunnel.ErrPermanent, whose
-			// Error() text carries "install is broken") means the privileged path
-			// is not set up — on macOS, offer the same one-prompt install rather
-			// than leaving the user staring at a red Error. onPermanentError is nil
-			// off darwin and in tests, so this is a no-op there.
-			if a.onPermanentError != nil && e.State == tunnel.Error && strings.Contains(e.Detail, "install is broken") {
-				a.onPermanentError()
-			}
-		})
+		if a.quitting.Load() {
+			continue
+		}
+		a.tray.Apply(e)
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "tunnel:event", uistate.ViewFor(e))
+		}
+		// A terminal, broken-install failure (tunnel.ErrPermanent, whose
+		// Error() text carries "install is broken") means the privileged path
+		// is not set up — on macOS, offer the same one-prompt install rather
+		// than leaving the user staring at a red Error. onPermanentError is nil
+		// off darwin and in tests, so this is a no-op there.
+		if a.onPermanentError != nil && e.State == tunnel.Error && strings.Contains(e.Detail, "install is broken") {
+			a.onPermanentError()
+		}
 	}
 }
 
@@ -1287,18 +1233,25 @@ func (a *app) notifyFor(e tunnel.Event) {
 		return
 	}
 
-	// Logged because SendNotification reports nothing back: it cannot fail visibly,
+	// Logged because ShowMessage reports nothing back: it cannot fail visibly,
 	// so without this line a missing toast is indistinguishable from a toast the app
-	// never tried to post. That ambiguity cost real debugging time — on macOS the
-	// authorization failure is logged by fyne through NSLog, which only reaches this
-	// file because redirectStderr repoints fd 2 (see redirect_unix.go).
+	// never tried to post. That ambiguity cost real debugging time — on macOS an
+	// authorization failure is logged through NSLog, which only reaches this file
+	// because redirectStderr repoints fd 2 (see redirect_unix.go).
 	log.Printf("notify: posting %q — %q", title, body)
 	a.notify(title, body)
 }
 
 // Quit is invoked from the tray's Quit item on the UI goroutine. It routes to the
-// shared graceful shutdown, which quits the fyne app once the tunnel is down.
-func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
+// shared graceful shutdown, which quits the Wails application once the tunnel is
+// down.
+func (a *app) Quit() {
+	a.shutdown(func() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
+		}
+	})
+}
 
 // shutdown tears the tunnel down and then calls done to leave the process. It is
 // the one graceful-exit path: the tray's Quit item and the OS-signal handler both
@@ -1313,8 +1266,8 @@ func (a *app) Quit() { a.shutdown(func() { fyne.Do(a.fyneApp.Quit) }) }
 // goroutine (blocking that would freeze the menu bar); quitting is set first so
 // the event pump stops touching a UI that is about to be destroyed; and the
 // teardown runs at most once (shutdownOnce). done differs by caller only in how
-// the process is left — the tray and signal paths both quit the fyne app, which
-// unblocks a.fyneApp.Run() in main.
+// the process is left — the tray and signal paths both quit the Qt application,
+// which unblocks execQApplication() in main.
 //
 // Residual limitation: a true SIGKILL (or power loss) of the APP cannot run any
 // in-process teardown, so this path never executes and the root openconnect is
@@ -1327,14 +1280,6 @@ func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
 		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
-		// Stop the uptime ticker before the teardown begins, so it cannot queue a
-		// fyne.Do against a driver that is about to be destroyed. quitting is already
-		// set, so an in-flight tick returns without touching the UI either way; this
-		// just stops the goroutine rather than leaving it running to no purpose.
-		if a.stopTick != nil {
-			a.stopTick()
-			a.stopTick = nil
-		}
 		go func() {
 			// Signal completion no matter how this returns, so awaitShutdown (which
 			// keeps the process alive for exactly this work) can never wait out its
@@ -1386,21 +1331,23 @@ func (a *app) shutdown(done func()) {
 // awaitShutdown blocks until the tunnel teardown has finished, starting it if
 // nothing has yet.
 //
-// It exists because fyne installs its OWN SIGINT/SIGTERM handler
-// (gLDriver.catchTerm) which calls Quit as soon as a signal arrives. Go delivers a
-// signal to every registered channel, so a SIGTERM reaches both handlers at once:
-// ours begins the graceful teardown on a goroutine, while fyne's ends the run
-// loop. main then returned and the process died mid-teardown — openconnect never
-// got to send its clean logout, so the FortiGate kept the session and refused
-// every new cookie (for minutes) until it timed the session out server-side. That
-// looked exactly like "we get logged out a lot" and like a connect that will not
-// connect. The observable symptom in the log was a "tearing down" line with no
-// matching "tunnel: exited" or "exiting" line after it.
+// It exists because shutdown() itself does not block: it launches the actual
+// teardown — concurrently Disconnect()+Wait()ing BOTH supervisors (SSL and
+// IPsec) via a shared WaitGroup, bounded by one shutdownWait deadline (see
+// shutdown's own doc comment) — on a worker goroutine and returns immediately,
+// so the run loop is never blocked waiting for openconnect to exit. Something
+// still has to keep the PROCESS alive for that worker to finish, or main would
+// return and the process would die mid-teardown: openconnect would never get
+// to send its clean logout, so the FortiGate would keep the session and refuse
+// every new cookie (for minutes) until it timed the session out server-side —
+// indistinguishable from "we get logged out a lot" and a connect that will not
+// connect. awaitShutdown is that wait, called after Run/Exec returns so the
+// process outlives the UI by as long as the teardown needs.
 //
-// Called after Run returns, so the process outlives the UI by as long as the
-// teardown needs. shutdown is once-guarded, so calling it here is safe whether
-// the exit came from the tray's Quit, a signal, or fyne's own handler; the done
-// callback is a no-op because the run loop has already ended.
+// shutdown is once-guarded, so calling it here is always safe, whether the
+// exit came from the tray's Quit, a signal (watchSignals), or (defensively)
+// neither; the done callback is a no-op here because the run loop has already
+// ended.
 func (a *app) awaitShutdown() {
 	a.shutdown(func() {})
 	select {
@@ -1418,7 +1365,7 @@ func (a *app) awaitShutdown() {
 // a root openconnect the unprivileged parent cannot signal. It loops rather than
 // returning after the first signal so a second signal is observed too — though
 // shutdown is once-guarded, so the second is a no-op. quit is what leaves the
-// process (a.fyneApp.Quit in production).
+// process (wailsruntime.Quit, in production).
 func (a *app) watchSignals(sigs <-chan os.Signal, quit func()) {
 	for s := range sigs {
 		log.Printf("openfortitray: received signal %s, tearing down", s)
@@ -1511,44 +1458,6 @@ func (a *app) SetAutostart(on bool) error {
 	return nil
 }
 
-// fyneRootConfigDir mirrors fyne's own internal/app.rootConfigDir (v2.8): fyne
-// stores preferences.json under <root>/<appID>/. It is reimplemented here rather
-// than imported because fyne's is in an internal package. Kept in step with the
-// fyne version pinned in go.mod.
-func fyneRootConfigDir() string {
-	home, _ := os.UserHomeDir()
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Preferences", "fyne")
-	case "windows":
-		return filepath.Join(home, "AppData", "Roaming", "fyne")
-	default:
-		base, _ := os.UserConfigDir()
-		return filepath.Join(base, "fyne")
-	}
-}
-
-// sanitizeFynePreferences removes fyne's preferences.json for appID when it is
-// empty or not valid JSON, so fyne's loader sees a missing (clean, empty) store
-// instead of logging "Fyne Preferences load error: EOF". A file that parses as
-// JSON is left untouched. Best-effort: every error is logged and swallowed —
-// this is cosmetic, never a reason to fail startup.
-func sanitizeFynePreferences(appID string) {
-	path := filepath.Join(fyneRootConfigDir(), appID, "preferences.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return // missing (the common case) or unreadable: fyne handles missing itself
-	}
-	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && json.Valid(trimmed) {
-		return // real preferences: leave them alone
-	}
-	if err := os.Remove(path); err != nil {
-		log.Printf("openfortitray: could not clear corrupt fyne preferences %s: %v", path, err)
-		return
-	}
-	log.Printf("openfortitray: cleared corrupt/empty fyne preferences %s (%d bytes)", path, len(data))
-}
-
 // setLoginItem installs or removes the per-user login item for this executable.
 func setLoginItem(on bool) error {
 	if !on {
@@ -1595,17 +1504,11 @@ const (
 )
 
 func main() {
-	// Windows ships a bundled Mesa software OpenGL (the app-dir opengl32.dll
-	// shadows the system one), whose default gallium driver is llvmpipe. llvmpipe
-	// JITs with LLVM and uses CPU vector instructions, and on some GPU-less hosts
-	// (locked-down Cloud PCs / RDP) that hard-crashes on the first window draw —
-	// the tray survives (no GL surface) but opening any window kills the process
-	// with no WER/crash record. Force the pure-C softpipe driver, which renders
-	// this light UI fine and does not crash there. Must be set before any GL call
-	// (i.e. before fyne creates its driver). No-op off Windows.
-	if runtime.GOOS == "windows" {
-		_ = os.Setenv("GALLIUM_DRIVER", "softpipe")
-	}
+	// The old Fyne/glfw build forced GALLIUM_DRIVER=softpipe on Windows to work
+	// around a Mesa/llvmpipe crash on GPU-less Cloud PCs — Mesa/OpenGL-specific
+	// software-rendering plumbing with no Qt equivalent verified this session.
+	// Dropped rather than ported: if a future report surfaces a GPU-less-Windows
+	// RDP crash, this is the first place to look (see the Task 10 report).
 
 	cfgDir, err := config.DefaultDir()
 	if err != nil {
@@ -1668,10 +1571,11 @@ func main() {
 
 	events := make(chan tunnel.Event, 16)
 	a := &app{
-		cfg:     cfg,
-		cfgDir:  cfgDir,
-		events:  events,
-		logPath: logPath,
+		cfg:      cfg,
+		cfgDir:   cfgDir,
+		events:   events,
+		logPath:  logPath,
+		activity: uistate.NewRing(50),
 		// The credstore seam: real platform-native store in production, an
 		// in-memory fake in tests.
 		cookieGet:    credstore.Get,
@@ -1757,139 +1661,63 @@ func main() {
 
 	a.sup = tunnel.New(authFn, runFn, events)
 
-	// fyne owns the main thread: NewWithID (not bare New) so tray/preferences
-	// plumbing has a stable app identity. The tray must be built before Run.
-	//
-	// Migrations["fyneDo"] declares that this app already marshals every
-	// cross-goroutine UI mutation through fyne.Do (the event pump does; menu
-	// Actions run on the UI goroutine). Without it fyne v2.8 logs a standing
-	// "not migrated to the fyne.Do threading model" advisory at Run(). The
-	// thread-safety checks themselves stay active.
-	fyneapp.SetMetadata(fyne.AppMetadata{
-		ID:         "io.github.savvaskoualis.openfortitray",
-		Name:       "OpenFortiTray",
-		Migrations: map[string]bool{"fyneDo": true},
-	})
-	// A previous unclean write can leave fyne's preferences.json empty or corrupt,
-	// which makes fyne log a scary "Fyne Preferences load error: EOF" at startup.
-	// Clear it first (the app keeps its real settings in internal/config, not in
-	// fyne preferences, so this loses nothing) so fyne sees a clean, empty store.
-	sanitizeFynePreferences("io.github.savvaskoualis.openfortitray")
-	a.fyneApp = fyneapp.NewWithID("io.github.savvaskoualis.openfortitray")
-	// The app theme, installed before any window is built so nothing is ever laid
-	// out against the default palette and then re-laid out. It tracks the OS
-	// light/dark setting: fyne resolves the variant and hands it to Color.
-	a.fyneApp.Settings().SetTheme(uitheme.New())
-	ctrl, err := tray.Setup(a.fyneApp, a)
+	ctrl, err := tray.Setup(a, a.onTrayClick)
 	if err != nil {
 		log.Fatal(err)
 	}
 	a.tray = ctrl
 	log.Print("tray: system tray menu installed")
+	tray.SetTooltip("OpenFortiTray")
 
 	// Desktop notifications for the transitions worth interrupting for (see
-	// notifyFor). Wired only now that the fyne app exists; before this the pump
-	// would have had nothing to send through, and a.notify == nil is a no-op.
-	a.notify = func(title, body string) {
-		a.fyneApp.SendNotification(fyne.NewNotification(title, body))
-	}
+	// notifyFor), via the tray icon's own native balloon/banner.
+	a.notify = tray.ShowMessage
 
-	// Best-effort menu-bar tooltip. fyne has no tooltip API, so this reaches the
-	// systray singleton fyne drives. It must run after the tray is live: fyne
-	// starts the tray during Run and then fires OnStarted (on the UI goroutine),
-	// which is the first moment the native status item exists. tray.SetTooltip is
-	// guarded, so a not-ready tray or unsupported platform is a silent no-op.
-	a.fyneApp.Lifecycle().SetOnStarted(func() {
-		log.Print("fyne lifecycle: OnStarted (tray live)")
-		// Re-assert the tray icon + menu now that the native systray exists. On
-		// Windows the initial set in tray.Setup (before the run loop) logs "tray not
-		// ready yet" and no icon appears; setting it again here makes it stick.
-		a.tray.ReassertTray()
-		log.Print("tray: re-asserted icon+menu after OnStarted")
-		tray.SetTooltip("OpenFortiTray")
-		// Assert the Dock-visible (Regular) activation policy. fyne/glfw sets its
-		// own policy while initializing NSApp during Run, so the policy the app
-		// wants has to be set AFTER that — OnStarted fires on the UI/main goroutine
-		// once NSApp exists, which is both late enough and on the right thread.
-		// No-op off darwin.
-		setDockActivationPolicy()
-		// Give the Dock icon an effect. fyne does not implement AppKit's reopen
-		// delegate method, so without this the icon is inert: clicking it does
-		// nothing at all, which is worse than having no icon.
-		//
-		// The FIRST activation is ignored on purpose. Launching the app activates it,
-		// and a window appearing unasked at every login is exactly the behaviour a
-		// tray app should not have. Every activation after that is a deliberate
-		// "bring this up" — a Dock click or a Cmd-Tab — and shows the window.
-		firstActivation := true
-		watchDockActivation(func() {
-			if firstActivation {
-				firstActivation = false
-				log.Print("dock: first activation (launch) — leaving the window hidden")
-				return
-			}
-			log.Print("dock: activated — showing the status window")
-			a.ShowStatus()
-		})
-		a.startUptimeTicker()
-	})
-	// OnStopped fires when fyne itself tears the run loop down. If this appears in
-	// the log (rather than the "run loop returned" line, or nothing), the app is
-	// being quit by fyne — e.g. a tray-only app the driver did not keep alive —
-	// not crashing. The distinction drives the fix.
-	a.fyneApp.Lifecycle().SetOnStopped(func() {
-		log.Print("fyne lifecycle: OnStopped (fyne is quitting the run loop)")
-	})
+	// Assert the Dock-visible (Regular) activation policy. No-op off darwin.
+	setDockActivationPolicy()
 
-	// ONE window, built once and left hidden. It is never ShowAndRun'd, so it cannot
-	// be the master window whose close quits the app; the shell intercepts its close
-	// to Hide.
-	//
-	// Status and Settings were two separate windows: two things to find, two to
-	// arrange, and — once the app grew a Dock icon — an ambiguous answer to "bring
-	// this app up". The controllers still take the window, because dialogs and focus
-	// need one, but they no longer decide what it contains or when it appears.
-	glfw.WindowHint(glfw.TransparentFramebuffer, glfw.True)
-	win := a.fyneApp.NewWindow("OpenFortiTray")
-	a.win = win
-	a.settings = settings.New(a, win)
-	a.status = status.New(a, win)
-
-	a.shell = shell.New(win, shell.Parts{
-		Status:     a.status.Content(),
-		Connection: a.settings.ConnectionContent(),
-		Advanced:   a.settings.AdvancedContent(),
-		ProfileBar: a.settings.ProfileBar(),
-		Banner:     a.settings.Banner(),
-		Footer:     a.settings.Footer(),
-	})
-	a.shell.AttachGlass = attachGlass
-	// Settings asks the shell to navigate when a refused Connect points at a field.
-	a.settings.SetNavigator(func(tab string) {
-		if tab == settings.TabAdvanced {
-			a.shell.Reveal(shell.SectionAdvanced)
-			return
-		}
-		a.shell.Reveal(shell.SectionConnection)
-	})
-	// Revealing the activity history needs a taller window; the shell owns the size.
-	a.status.OnHeightRequest = a.shell.RequestHeight
-
-	// Route a refused Connect (invalid active profile) to the settings window,
-	// which opens on the offending field with a banner naming the fix.
-	a.onConnectIssue = func(i *settings.Issue) {
-		log.Print("onConnectIssue: showing settings window")
-		a.settings.ShowIssue(i)
-		log.Print("onConnectIssue: settings window shown")
-	}
 	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
-	// where the manual scripts/install.sh path is unchanged). Must be after a.win
-	// and a.settings are set — the bootstrap dialogs parent on a.win.
+	// where the manual scripts/install.sh path is unchanged).
 	a.installBootstrapHooks()
 
-	// The one event pump. Started before Run so events emitted by the
-	// connect-on-launch below queue onto fyne's (unbounded) main-loop queue and
-	// render as soon as Run starts.
+	// Route a blocking config issue (Connect refused: no gateway configured,
+	// an invalid host/port, ...) to the settings window with a visible error,
+	// replacing the deleted Qt settings controller's ShowIssue. Without this,
+	// Connect (from the tray OR the frontend's primary button) just logs one
+	// line and returns on a fresh install — no banner, no navigation, no
+	// visible feedback at all. frontend/dist/settings.js listens for the
+	// "settings:issue" event and renders it into #settings-error, the same
+	// element SaveConfig's validation-failure path already populates.
+	a.onConnectIssue = func(i *settings.Issue) {
+		log.Print("onConnectIssue: showing settings window")
+		a.ShowSettings()
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "settings:issue", i.Message)
+		}
+	}
+
+	// Give the Dock icon an effect. Qt has no reopen-delegate hook of its own on
+	// macOS either, so without this the icon is inert: clicking it does nothing
+	// at all, which is worse than having no icon.
+	//
+	// The FIRST activation is ignored on purpose. Launching the app activates it,
+	// and a window appearing unasked at every login is exactly the behaviour a
+	// tray app should not have. Every activation after that is a deliberate
+	// "bring this up" — a Dock click or a Cmd-Tab — and shows the window.
+	firstActivation := true
+	watchDockActivation(func() {
+		if firstActivation {
+			firstActivation = false
+			log.Print("dock: first activation (launch) — leaving the window hidden")
+			return
+		}
+		log.Print("dock: activated — showing the status window")
+		a.ShowStatus()
+	})
+
+	// The one event pump. Started before the event loop so events emitted by
+	// the connect-on-launch below are ready to render as soon as the window
+	// exists.
 	go a.pump()
 
 	// Signal-driven exit. launchd's stop (SIGTERM), Ctrl-C (SIGINT), a hangup
@@ -1899,7 +1727,11 @@ func main() {
 	// signal is never dropped before the handler is scheduled.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go a.watchSignals(sigs, func() { fyne.Do(a.fyneApp.Quit) })
+	go a.watchSignals(sigs, func() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
+		}
+	})
 
 	// Sleep/wake-driven reconnect: a laptop resuming from sleep is the one drop
 	// openconnect's own dead-peer detection is slowest to notice (this gateway
@@ -1910,19 +1742,20 @@ func main() {
 	watchSystemSleep(a.onSystemWake)
 	// Display-only sleep/wake: see onScreenWake's doc comment for why this is
 	// a separate hook from watchSystemSleep, not a duplicate of it.
+	//
+	// No watchMainThreadFreeze here, unlike the old fyne/glfw build: this is
+	// the core point of the Wails migration. The old watchdog existed because
+	// glfw.PollEvents() could block the UI goroutine forever after a display
+	// sleep/wake cycle, wedging every fyne.Do queued after it. Wails' runtime
+	// calls are documented safe from any goroutine, which removes that failure
+	// class rather than detecting and recovering from it: nothing here ever
+	// blocks on a call into the UI from another goroutine.
 	watchScreenWake(a.onScreenWake)
-	// Last-resort recovery from a permanently wedged UI goroutine (see
-	// watchMainThreadFreeze's own doc comment) — a real, reproducible
-	// failure mode on macOS, diagnosed live via a native debugger attach.
-	go a.watchMainThreadFreeze()
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a
 	// new cookie clears the stale FortiGate session that would otherwise reject
 	// the cookie in a loop. On the direct path (Windows) ReapStale is a no-op.
-	// The connect is marshalled back onto the UI goroutine (a.Connect touches the
-	// settings window when the active profile is unconfigured); it queues onto
-	// fyne's main-loop queue and runs as soon as Run starts.
 	// resumed is a SEPARATE question from cfg.Autostart: it is set for exactly one
 	// launch, right after an update restart that tore down a tunnel which was
 	// actually connected — see consumeResumeMarker. Without it, a user who
@@ -1933,7 +1766,7 @@ func main() {
 		log.Print("openfortitray: resuming the VPN session that was up before this update restart")
 	}
 	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
-	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, func() { fyne.Do(a.Connect) })
+	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, a.Connect)
 
 	// Background update checker: polls GitHub for a newer release and, if found,
 	// surfaces a one-click "Update … & Restart" item on the tray. Fully best-effort
@@ -1941,17 +1774,18 @@ func main() {
 	// checker treats as never-newer, so local runs never prompt.
 	go a.startUpdateChecker(context.Background())
 
-	// Run blocks the main goroutine until a.fyneApp.Quit(), which the tray's Quit
-	// item and the signal handler both drive only after the tunnel has been torn
-	// down (see app.shutdown). A tray-only fyne app (no window ever shown) stays
-	// alive here and exits cleanly on Quit — verified against fyne v2.8's glfw
-	// run loop.
-	log.Print("entering fyne run loop")
-	a.fyneApp.Run()
-	log.Print("fyne run loop returned; waiting for the tunnel teardown")
-	// fyne quits the run loop from its own signal handler, so arriving here does
-	// NOT mean the tunnel is down. Block until it is (see awaitShutdown) —
-	// otherwise the process exits mid-teardown and leaks the server-side session.
+	// wails.Run blocks the main goroutine until wailsruntime.Quit(a.ctx), which
+	// the tray's Quit item and the signal handler both drive only after the
+	// tunnel has been torn down (see app.shutdown).
+	log.Print("entering Wails event loop")
+	if err := wails.Run(buildAppOptions(a, frontendAssets)); err != nil {
+		log.Fatalf("wails run: %v", err)
+	}
+	log.Print("Wails event loop returned; waiting for the tunnel teardown")
+	// Quit can be driven from outside app.shutdown (e.g. a desktop session
+	// logout), so arriving here does NOT by itself mean the tunnel is down.
+	// Block until it is (see awaitShutdown) — otherwise the process exits
+	// mid-teardown and leaks the server-side session.
 	a.awaitShutdown()
 	log.Print("app exiting")
 }

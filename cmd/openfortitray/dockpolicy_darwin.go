@@ -29,16 +29,17 @@ func oftDockActivated() {
 // activation policy to Regular.
 //
 // It has to be asserted at runtime rather than left to Info.plist because
-// fyne/glfw sets its own policy while initializing NSApp at Run(). It must
-// therefore run after that and on the main/UI thread — fyne's Lifecycle
-// OnStarted hook satisfies both.
+// Wails' own webview sets up its own Cocoa/NSApp integration when wails.Run
+// starts, and that integration may assert its own activation policy. main()
+// calls this directly on the main/UI thread, before calling wails.Run, so
+// this policy is the one that ends up set.
 func setDockActivationPolicy() {
 	C.oft_set_regular_policy()
 }
 
 // watchDockActivation makes fn run whenever the app is activated, which is the
-// only way to give a Dock icon any effect: fyne does not implement the reopen
-// delegate method, so without this the icon is inert.
+// only way to give a Dock icon any effect: Qt does not implement the reopen
+// delegate method either, so without this the icon is inert.
 func watchDockActivation(fn func()) {
 	onDockActivate = fn
 	C.oft_watch_activation()

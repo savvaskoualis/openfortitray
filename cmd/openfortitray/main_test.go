@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2/test"
-
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
@@ -308,7 +306,6 @@ func TestStartTunnelRetriesIPsecPSKReadOnBusyStore(t *testing.T) {
 // not dial — a wake notification arriving while the user is deliberately
 // disconnected must never surprise them with a connection attempt.
 func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.onSystemWake()
@@ -324,7 +321,6 @@ func TestOnSystemWakeNoopWhenNotConnected(t *testing.T) {
 // Disconnect+Connect rather than trust a tunnel that may have died silently
 // while the machine slept.
 func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.Connect()
@@ -346,13 +342,47 @@ func TestOnSystemWakeForcesReconnectWhenWantConnected(t *testing.T) {
 	}
 }
 
+// The Power Nap case: a second wake arriving inside wakeReconnectCooldown of
+// the last forced reconnect must NOT force another one — diagnosed live from
+// a 380-cycle overnight reconnect storm caused by macOS waking the machine
+// every 60-90s on AC power despite the tunnel never actually going down. A
+// wake further apart than the cooldown (the real-sleep case) is already
+// covered by TestOnSystemWakeForcesReconnectWhenWantConnected.
+func TestOnSystemWakeDebouncesRapidWakes(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+
+	a.onSystemWake()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first wake did not force a reconnect")
+	}
+
+	// A second wake, seconds later, is well inside wakeReconnectCooldown.
+	a.onSystemWake()
+	select {
+	case <-authCalled:
+		t.Error("second wake within the cooldown forced another reconnect — Power Nap storm not debounced")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if !a.wantConnected.Load() {
+		t.Error("wantConnected must still be true — debouncing a wake must not disconnect")
+	}
+}
+
 // A display wake must never touch the tunnel — it exists purely to
 // re-assert the tray icon (a.tray stays nil in this test setup, so there's
 // nothing to observe there beyond "does not panic"), unlike onSystemWake,
 // which forces a reconnect. Connected before a screen wake, still connected
 // after, with no extra auth attempt.
 func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
-	test.NewApp()
 	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
 
 	a.Connect()
@@ -368,6 +398,9 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	default:
 	}
 
+	// Proves onScreenWake only re-asserts the tray (rather than touching the
+	// tunnel directly): it must return immediately without blocking, and no
+	// auth attempt fires even once its internal goroutine has run.
 	a.onScreenWake()
 
 	select {
@@ -377,26 +410,10 @@ func TestOnScreenWakeNeverTouchesTheTunnel(t *testing.T) {
 	}
 }
 
-// mainThreadResponsive must report true when the UI goroutine actually
-// services the queued fyne.Do call — the ordinary case. The genuine-timeout
-// path (a wedged UI goroutine that never runs the closure) is not
-// practically testable here: fyne's own test driver runs DoFromGoroutine's
-// function immediately, synchronously, regardless of the wait flag ("our
-// threading is simple" — see fyne.io/fyne/v2/test/driver.go), so a fake
-// "never responds" case cannot be constructed without a real GLFW driver.
-func TestMainThreadResponsiveTruePath(t *testing.T) {
-	test.NewApp()
-	a := &app{}
-
-	if !a.mainThreadResponsive(time.Second) {
-		t.Error("mainThreadResponsive reported false for a UI goroutine that services its queue normally")
-	}
-}
-
 // The update dialog must surface only ONCE per distinct version: the badge and
 // menu item update on every 6-hourly check (cheap), but re-prompting the same
 // version every 6h would nag. shouldPromptUpdate is the pure decision behind the
-// thin promptUpdate wrapper (a headless fyne dialog is impractical to drive in a
+// thin promptUpdate wrapper (a real update dialog is impractical to drive in a
 // test); this pins its once-per-version contract.
 func TestShouldPromptUpdateOncePerVersion(t *testing.T) {
 	a := &app{}
@@ -1067,5 +1084,98 @@ func TestGatewayLabelAndDTLSLabel(t *testing.T) {
 				t.Errorf("DTLSLabel() = %q, want %q", got, tc.wantDTLS)
 			}
 		})
+	}
+}
+
+// TestSetCtxCtxSnapshotRoundTrip proves the mu-guarded ctx accessors
+// round-trip (Finding 6): a fresh app's ctx is nil, and whatever setCtx
+// records is exactly what ctxSnapshot returns.
+func TestSetCtxCtxSnapshotRoundTrip(t *testing.T) {
+	a := &app{}
+	if got := a.ctxSnapshot(); got != nil {
+		t.Fatalf("expected a fresh app's ctxSnapshot() to be nil, got %v", got)
+	}
+
+	ctx := context.Background()
+	a.setCtx(ctx)
+	if got := a.ctxSnapshot(); got != ctx {
+		t.Errorf("ctxSnapshot() = %v, want the context set by setCtx", got)
+	}
+}
+
+// TestCtxSnapshotConcurrentWithSetCtx exercises the exact hazard Finding 6
+// describes: go a.pump() (or any other goroutine) reading a.ctx while
+// OnStartup's goroutine writes it via setCtx. Run with -race to confirm
+// a.mu genuinely serializes the two.
+func TestCtxSnapshotConcurrentWithSetCtx(t *testing.T) {
+	a := &app{}
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		a.setCtx(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = a.ctxSnapshot()
+		}
+	}()
+	wg.Wait()
+
+	if got := a.ctxSnapshot(); got != ctx {
+		t.Errorf("ctxSnapshot() after setCtx = %v, want %v", got, ctx)
+	}
+}
+
+// TestOnTrayClickTogglesVisibility proves Finding 9's fix: a tray-icon click
+// positions+reveals the window when it is hidden, and hides it (rather than
+// re-showing it) when it is already visible — a Tailscale-style toggle,
+// instead of the old always-show behaviour that raced the frontend's
+// blur-to-hide handler. a.ctx stays nil here (no live Wails runtime in a
+// test), so positionWindow/WindowHide are no-ops, but the windowVisible
+// bookkeeping onTrayClick drives is exercised directly.
+func TestOnTrayClickTogglesVisibility(t *testing.T) {
+	a := &app{}
+
+	if a.windowVisibleSnapshot() {
+		t.Fatal("expected a fresh app to start not-visible")
+	}
+
+	a.onTrayClick() // hidden -> position + reveal (ShowStatus)
+	if !a.windowVisibleSnapshot() {
+		t.Error("onTrayClick from hidden must mark the window visible")
+	}
+
+	a.onTrayClick() // visible -> hide
+	if a.windowVisibleSnapshot() {
+		t.Error("onTrayClick from visible must mark the window hidden, not show it again")
+	}
+}
+
+// TestShowSettingsShowStatusHideWindowTrackVisibility proves the other half
+// of Finding 9: any path that shows or hides the window — not just the tray
+// icon click — keeps windowVisible in sync, so a window opened via the
+// "Open"/Settings… tray menu items is still correctly "visible" for the next
+// tray-icon click's toggle decision.
+func TestShowSettingsShowStatusHideWindowTrackVisibility(t *testing.T) {
+	a := &app{}
+
+	a.ShowStatus()
+	if !a.windowVisibleSnapshot() {
+		t.Error("ShowStatus must mark the window visible")
+	}
+
+	b := &Bridge{a: a}
+	b.HideWindow()
+	if a.windowVisibleSnapshot() {
+		t.Error("HideWindow (the frontend's blur handler) must mark the window not-visible")
+	}
+
+	a.ShowSettings()
+	if !a.windowVisibleSnapshot() {
+		t.Error("ShowSettings must mark the window visible")
 	}
 }
