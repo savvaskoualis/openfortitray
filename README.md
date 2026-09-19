@@ -64,7 +64,8 @@ OPENFORTITRAY_GATEWAY=vpn.example.com:10443 bash scripts/install.sh
 Run as your normal user (it calls `sudo` itself). It installs `openconnect` (apt/dnf/
 pacman) if missing, the binary to `/usr/local/bin/openfortitray`, the root-owned helper +
 a scoped `sudoers` rule, and a starter `config.json`. Then `openfortitray &`. Needs a
-StatusNotifierItem-capable tray and a working OpenGL stack.
+StatusNotifierItem-capable tray and `webkit2gtk` (4.1 on current distros, 4.0 on older
+ones) + GTK3, which render the app's window.
 
 ### Windows
 
@@ -79,15 +80,11 @@ The login task launches it elevated without a prompt. Open **Settings…** to se
 gateway. The app uses the bundled `openconnect` automatically; to point it at a different
 build, set `"openconnect_path"` to its full path in `%APPDATA%\openfortitray\config.json`.
 
-The Windows build bundles a software OpenGL renderer (Mesa's llvmpipe — `opengl32.dll` +
-`libgallium_wgl.dll`, installed beside the exe), so the tray works on VMs, RDP sessions,
-and other GPU-less Windows where there is no OpenGL driver (otherwise the app dies at
-launch with `WGL: driver does not support OpenGL`). Windows loads the app-directory
-`opengl32.dll` before the system one, so this affects only OpenFortiTray; the light UI
-renders fine in software. The `Setup.exe` installs both DLLs for you — if you download the
-bare `openfortitray-windows-amd64.exe` instead, also download `opengl32.dll` and
-`libgallium_wgl.dll` from the same release and keep all three in the same folder. Mesa is
-MIT-licensed; see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).
+The app's window renders inside the Microsoft Edge WebView2 Runtime, which ships by
+default on Windows 11 and most updated Windows 10 machines. The `Setup.exe` installs it
+for you if it is missing (via Microsoft's own WebView2 bootstrapper); if you run the bare
+`openfortitray-windows-amd64.exe` on a machine without WebView2, install it yourself from
+[Microsoft's WebView2 page](https://developer.microsoft.com/microsoft-edge/webview2/).
 
 > **Before you connect (all platforms):** quit FortiClient — or any other client for this
 > gateway — and disable its login item. FortiGate allows only one SSL-VPN session per
@@ -215,10 +212,12 @@ Remove-Item -Recurse -Force "$env:ProgramFiles\openfortitray","$env:APPDATA\open
 
 ## Building from source
 
-Fyne renders through cgo + OpenGL, so each OS builds on its own native toolchain (macOS:
-Xcode CLT; Linux: `gcc` + `libgl1-mesa-dev` + `xorg-dev`; Windows: MinGW `gcc`). CI builds
-the full three-OS release matrix; a `v*` tag publishes signed-per-runner `SHA256SUMS`, the
-`.dmg`, and the `Setup.exe`.
+The UI (Wails v2) renders through cgo + a native webview on macOS and Linux, so those two
+build on their own native toolchain (macOS: Xcode CLT; Linux: `gcc` + `libgtk-3-dev` +
+`libwebkit2gtk-4.0-dev`, Wails' default). Windows needs no cgo at all (its webview binding
+and the tray backend are pure Go) and builds with `CGO_ENABLED=0`. CI builds the full
+three-OS release matrix; a `v*` tag publishes signed-per-runner `SHA256SUMS`, the `.dmg`,
+and the `Setup.exe`.
 
 ```sh
 make build    # go build -o openfortitray ./cmd/openfortitray
@@ -226,6 +225,11 @@ make test     # go vet ./... && go test -race ./...
 make app      # macOS: assemble dist/OpenFortiTray.app
 make dmg      # macOS: build the drag-to-Applications .dmg
 ```
+
+On distros that no longer ship `libwebkit2gtk-4.0-dev` (Ubuntu 24.04+ and others), install
+`libwebkit2gtk-4.1-dev` instead and pass `-tags webkit2_41` yourself — `make build`/`make
+test` do not add it automatically: `go build -tags webkit2_41 ./cmd/openfortitray`, or
+`GOFLAGS='-tags=webkit2_41' make build` / `GOFLAGS='-tags=webkit2_41' make test`.
 
 ## License
 

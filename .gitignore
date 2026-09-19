@@ -1,4 +1,6 @@
 dist/
+!frontend/dist/
+!frontend/dist/**
 *.log
 /openfortitray
 

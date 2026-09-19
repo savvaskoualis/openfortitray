@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"log"
@@ -20,7 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	qt "github.com/mappu/miqt/qt6"
+	"github.com/wailsapp/wails/v2"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/savvaskoualis/openfortitray/internal/auth"
 	"github.com/savvaskoualis/openfortitray/internal/autostart"
@@ -28,15 +30,22 @@ import (
 	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/ipsec"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
-	"github.com/savvaskoualis/openfortitray/internal/shell"
-	"github.com/savvaskoualis/openfortitray/internal/status"
 	"github.com/savvaskoualis/openfortitray/internal/tray"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
-	"github.com/savvaskoualis/openfortitray/internal/uidispatch"
-	"github.com/savvaskoualis/openfortitray/internal/uitheme"
+	"github.com/savvaskoualis/openfortitray/internal/uistate"
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
 )
+
+// frontendAssets embeds the Wails frontend built by Task 1
+// (cmd/openfortitray/frontend/dist). It lives here, not at the repo root,
+// because a //go:embed pattern may not contain ".." path elements — it can
+// only reach into subdirectories of the package that declares it — so the
+// frontend/ and wails.json Task 1 placed at the repo root were moved under
+// cmd/openfortitray/ in this task to make this embeddable at all.
+//
+//go:embed all:frontend/dist
+var frontendAssets embed.FS
 
 // supervisor is the slice of *tunnel.Supervisor the app drives. Naming it as an
 // interface lets the tests substitute a fake that records the teardown calls the
@@ -80,23 +89,22 @@ type app struct {
 	events        chan tunnel.Event
 	logPath       string
 
-	// dispatch marshals background-goroutine work onto the Qt UI thread — the
-	// replacement for fyne.Do/fyne.DoAndWait. A QTimer drains it on the Qt
-	// main thread (see main).
-	dispatch *uidispatch.Queue
-	tray     *tray.Controller
-	settings *settings.Controller
-	// status is the connection panel; the shell decides when it is on screen.
-	status *status.Controller
-	// shell owns the single window and which section of it is visible.
-	shell *shell.Shell
-	// stopTick stops the 1 Hz uptime ticker that drives the status window's clock.
-	// nil until the ticker is started in OnStarted; called once during teardown so
-	// the goroutine cannot outlive the UI it posts to.
-	stopTick func()
-	// win is the (initially hidden) single window, reused as the parent for the
-	// first-run bootstrap dialogs. Set once in main after the window is built.
-	win *qt.QMainWindow
+	tray *tray.Controller
+	// ctx is the Wails runtime context, captured by buildAppOptions' OnStartup
+	// callback once wails.Run has created the webview. It is written once
+	// (OnStartup) but read from many goroutines (pump, the signal handler,
+	// prepareUpdate's goroutine, positionWindow, every Bridge method) — the
+	// same cross-goroutine hazard tp/lastEvent/activity above have, so it is
+	// guarded by the same a.mu via setCtx/ctxSnapshot below. Every read site
+	// nil-checks the ctxSnapshot() result, since it stays nil until startup
+	// completes and in every test that never calls wails.Run. Never read this
+	// field directly outside setCtx/ctxSnapshot.
+	ctx context.Context
+	// lastEvent is the most recent tunnel.Event, guarded by mu like tp/ipsecTP
+	// above so Bridge.CurrentView — invoked on whatever goroutine Wails
+	// dispatches a bound JS call on, not necessarily the pump goroutine — can
+	// read the live state without racing pump's write of it.
+	lastEvent tunnel.Event
 	// connectBootstrap, when non-nil, runs the macOS first-run helper-install gate
 	// before dialing: a passwordless-helper readiness probe, and — if the helper is
 	// not yet installed — an admin-password prompt that installs it, then a dial. It
@@ -115,8 +123,8 @@ type app struct {
 	onConnectIssue func(*settings.Issue)
 	// quitting stops the event pump touching a tearing-down UI. It is set once,
 	// on the UI goroutine, at the start of Quit; the pump reads it and, once set,
-	// drains events without posting to a.dispatch — so no UI work is ever queued
-	// against a UI that qt.QCoreApplication_Quit() is about to destroy.
+	// drains events without emitting any further UI events — so no UI work is
+	// ever dispatched against a UI that wailsruntime.Quit is about to destroy.
 	quitting atomic.Bool
 	// shutdownDone is closed once the teardown goroutine has finished, so
 	// awaitShutdown can hold the process open until the tunnel is really down. It
@@ -137,6 +145,22 @@ type app struct {
 	// newly edited settings (Connect re-snapshots the now-updated active profile).
 	mu sync.Mutex
 	tp tunnelParams
+	// activity is a short history of recent tunnel events for the status
+	// window's activity log (Bridge.RecentActivity). Guarded by mu, the same
+	// lock as tp/lastEvent above: pump() appends to it (see pump), while
+	// Bridge.RecentActivity reads it from whatever goroutine Wails' JS bridge
+	// calls it on, which is not necessarily the pump goroutine. uistate.Ring
+	// itself is explicitly not safe for concurrent use, so this mutex is load
+	// bearing, not decorative.
+	activity *uistate.Ring
+	// windowVisible tracks whether the Wails window is currently on screen,
+	// guarded by mu like tp/lastEvent/activity above. It is the state
+	// onTrayClick's toggle decision reads, and ShowSettings/ShowStatus/
+	// HideWindow (called from the "Open"/Settings… tray menu items and the
+	// frontend's blur-to-hide handler, not just the tray icon click) all keep
+	// it in sync — so a window shown via any of those paths is still
+	// considered "visible" for the next tray-icon click's toggle decision.
+	windowVisible bool
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -153,9 +177,9 @@ type app struct {
 	// only state.
 	wantConnected atomic.Bool
 	// lastWakeReconnectAt is when onSystemWake last forced a Disconnect+Connect.
-	// It is read and written only inside onSystemWake's a.dispatch.Post closure
-	// (the UI goroutine), so it needs no synchronization of its own — like
-	// lastNotified, it is dispatch-goroutine-only state.
+	// It is read and written only inside onSystemWake's internal goroutine, so
+	// it needs no synchronization of its own — like lastNotified, it is
+	// confined to that one goroutine's sequential execution.
 	lastWakeReconnectAt time.Time
 	// cookieGet/cookieSet/cookieDelete are the credstore seam. They default to the
 	// package funcs in main(); tests substitute an in-memory fake so the cache-first
@@ -201,6 +225,13 @@ type app struct {
 	// updateMu; consulted via shouldPromptUpdate.
 	lastPromptedTag string
 
+	// pendingUpdateMu guards pendingUpdate: the release prepareUpdate has
+	// finished downloading and is waiting for the user to confirm the restart
+	// (see update.go). nil until prepareUpdate succeeds; read once by
+	// Bridge.RestartAndInstall.
+	pendingUpdateMu sync.Mutex
+	pendingUpdate   *pendingUpdate
+
 	// ipsecRunFunc builds the platform IPsec RunFunc for a profile/PSK — the
 	// package's newIPsecRunFunc (ipsecrun_unix.go / ipsecrun_windows.go) when
 	// nil, which is what production leaves it as. Tests substitute a fake here
@@ -228,6 +259,92 @@ func (a *app) setSnapshot(tp tunnelParams) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.tp = tp
+}
+
+// setLastEvent records the most recent tunnel.Event for lastEventSnapshot to
+// read. Called from pump on every event, on the pump goroutine.
+func (a *app) setLastEvent(e tunnel.Event) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.lastEvent = e
+}
+
+// lastEventSnapshot returns the most recent tunnel.Event pump has seen, for
+// Bridge.CurrentView. See lastEvent's doc comment for why this is mu-guarded
+// rather than pump-goroutine-only like lastNotified.
+func (a *app) lastEventSnapshot() tunnel.Event {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastEvent
+}
+
+// setCtx records the Wails runtime context. Called once, from
+// buildAppOptions' OnStartup callback, on whatever goroutine Wails invokes
+// OnStartup on.
+func (a *app) setCtx(ctx context.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ctx = ctx
+}
+
+// ctxSnapshot returns the Wails runtime context set by setCtx, or nil before
+// startup completes (and in every test that never calls wails.Run). See
+// ctx's doc comment for why this is mu-guarded rather than a direct field
+// read — go a.pump() starts before wails.Run, so the write and reads
+// genuinely race at startup without this.
+func (a *app) ctxSnapshot() context.Context {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ctx
+}
+
+// setWindowVisible records whether the Wails window is currently on screen.
+// Called from ShowSettings/ShowStatus (true), HideWindow (false) and
+// onTrayClick (both directions) — every path that shows or hides the window
+// — so onTrayClick's toggle decision is never stale.
+func (a *app) setWindowVisible(v bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.windowVisible = v
+}
+
+// windowVisibleSnapshot reports whether the window is currently visible, per
+// the last setWindowVisible call. See windowVisible's doc comment.
+func (a *app) windowVisibleSnapshot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.windowVisible
+}
+
+// onTrayClick is the tray icon's own click handler (wired as tray.Setup's
+// onIconClick callback). It toggles the window: hide if already visible,
+// otherwise position + reveal — matching a Tailscale-style tray icon. This
+// also fixes a race with the frontend's blur-to-hide handler (frontend/dist/
+// app.js): without this check, clicking the icon while the window was
+// already visible would steal focus (blur fires -> HideWindow), then this
+// handler would show it again — an observable flicker, or a click that
+// appeared to do nothing.
+func (a *app) onTrayClick() {
+	if a.windowVisibleSnapshot() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.WindowHide(ctx)
+		}
+		a.setWindowVisible(false)
+		return
+	}
+	a.positionWindow()
+	a.ShowStatus()
+}
+
+// recentActivity returns a snapshot of the activity ring, safe to call from
+// any goroutine (guarded by a.mu, the same lock pump() uses to Add).
+func (a *app) recentActivity() []uistate.Entry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activity == nil {
+		return nil
+	}
+	return a.activity.Entries()
 }
 
 // ipsecParams is the IPsec counterpart of tunnelParams: the profile and PSK
@@ -433,14 +550,11 @@ const wakeReconnectCooldown = 5 * time.Minute
 // goroutine) — never the pump.
 func (a *app) onSystemWake() {
 	wantConnected := a.wantConnected.Load()
-	// Post, not PostAndWait: this callback is invoked by NSWorkspace's
-	// notification center on the main queue (see wake_darwin.m), which is
-	// the SAME thread Drain runs on via the dispatch-drain QTimer. Waiting
-	// here would block forever, since Drain can never run while this
-	// function has not yet returned control to that thread's event loop —
-	// there is nothing in this handler that needs the mutation to be
-	// visibly complete before returning to the OS.
-	a.dispatch.Post(func() {
+	// Spawn a goroutine, don't block: this callback is invoked by NSWorkspace's
+	// notification center on the main queue (see wake_darwin.m), and the OS
+	// expects the callback to return promptly. There is nothing here that
+	// needs the mutation to be visibly complete before returning to the OS.
+	go func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
@@ -455,7 +569,7 @@ func (a *app) onSystemWake() {
 		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
 		a.Connect()
-	})
+	}()
 }
 
 // onScreenWake re-asserts the tray icon and menu every time the display
@@ -468,15 +582,15 @@ func (a *app) onSystemWake() {
 // already guard against, just on a much more frequent trigger.
 func (a *app) onScreenWake() {
 	log.Print("openfortitray: display woke; re-asserting tray")
-	// Post, not PostAndWait — same reasoning as onSystemWake: this callback
-	// already runs on the main queue/thread that Drain itself runs on, so
-	// waiting for Drain to run it would deadlock forever.
-	a.dispatch.Post(func() {
+	// Spawn a goroutine, don't block — same reasoning as onSystemWake: this
+	// callback is invoked by the OS on its own thread and must return
+	// promptly.
+	go func() {
 		if a.tray != nil {
 			a.tray.ReassertTray()
 		}
 		log.Print("openfortitray: tray re-assert after display wake done")
-	})
+	}()
 }
 
 // cookieKey namespaces the stored SVPNCOOKIE by gateway host, so different
@@ -644,24 +758,25 @@ var version = "dev"
 // Version returns the build version string shown in the tray header.
 func (a *app) Version() string { return version }
 
-// ShowSettings reveals the settings window (tray.App). It is built once at
-// startup; this only shows the existing, hidden window.
+// ShowSettings reveals the Wails window and asks the frontend to navigate to
+// the settings page (tray.App / Bridge.ShowSettings). It replaces the old
+// Qt shell/settings-controller pair, which main() no longer constructs.
 func (a *app) ShowSettings() {
-	if a.settings == nil || a.shell == nil {
-		return
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:settings", nil)
 	}
-	// Re-sync the form from the live config before it is shown, discarding edits
-	// abandoned last time.
-	a.settings.Show()
-	a.shell.Reveal(shell.SectionConnection)
+	a.setWindowVisible(true)
 }
 
-// ShowStatus reveals the status window (tray.App / the Status… item). Like the
-// settings window it is built once at startup and hidden.
+// ShowStatus reveals the Wails window and asks the frontend to navigate to
+// the status page (tray.App / the Status… item / Bridge.ShowStatus).
 func (a *app) ShowStatus() {
-	if a.shell != nil {
-		a.shell.Reveal(shell.SectionStatus)
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowShow(ctx)
+		wailsruntime.EventsEmit(ctx, "nav:status", nil)
 	}
+	a.setWindowVisible(true)
 }
 
 // OpenLog opens the log file in the platform's default handler (status.Host). The
@@ -703,6 +818,10 @@ func (a *app) DTLSLabel() string {
 // Config returns the live configuration for the settings window to clone
 // (settings.Host). It runs on the UI goroutine.
 func (a *app) Config() *config.Config { return a.cfg }
+
+// settingsHost exposes a as a settings.Host to Bridge, so it does not need to
+// know app satisfies that interface structurally.
+func (a *app) settingsHost() settings.Host { return a }
 
 // Commit takes the settings window's edited config, syncs the OS autostart login
 // item to c.Autostart, persists c, and makes it the live config (settings.Host).
@@ -916,17 +1035,12 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 		return
 	}
 	prompt := manual || a.shouldPromptUpdate(rel.Tag)
-	a.dispatch.Post(func() {
-		if a.quitting.Load() {
-			return
-		}
-		if a.tray != nil {
-			a.tray.SetUpdateAvailable(rel.Tag)
-		}
-		if prompt {
-			a.promptUpdate(rel)
-		}
-	})
+	if a.tray != nil {
+		a.tray.SetUpdateAvailable(rel.Tag)
+	}
+	if prompt {
+		a.promptUpdate(rel)
+	}
 }
 
 // shouldPromptUpdate reports whether the update dialog should be shown for tag,
@@ -945,33 +1059,23 @@ func (a *app) shouldPromptUpdate(tag string) bool {
 	return true
 }
 
-// promptUpdate opens the update flow: the offer, then the download, then the
-// request to restart. See updateflow.go.
-func (a *app) promptUpdate(rel *update.Release) {
-	if a.dispatch == nil {
-		return
-	}
-	newUpdateFlow(a, rel, a.dispatch).start()
-}
-
 // reportCheckResult answers a MANUAL check for updates. A click has to produce a
 // visible result whatever the answer — "no update" reported as silence is
 // indistinguishable from a menu item that does nothing, which is precisely how this
-// one read. A plain modal QMessageBox is enough for a one-shot heading+message
-// result — there is no multi-state flow here the way the update offer/download/
-// restart dialog (updateflow.go) needs a persistent QDialog for.
+// one read. It emits an event that frontend/dist/status.js currently renders via
+// a plain alert() — simpler than the old QMessageBox, and dismissed the same
+// way, but still a blocking JS dialog rather than the dismissible banner this
+// comment once described; that upgrade is left for later if it turns out to
+// matter.
 func (a *app) reportCheckResult(heading, body string) {
-	if a.dispatch == nil {
+	ctx := a.ctxSnapshot()
+	if ctx == nil {
 		return
 	}
-	a.dispatch.Post(func() {
-		if a.quitting.Load() {
-			return
-		}
-		mb := qt.NewQMessageBox3(qt.QMessageBox__Information, heading, body)
-		mb.SetStandardButtons(qt.QMessageBox__Ok)
-		mb.Exec()
-	})
+	wailsruntime.EventsEmit(ctx, "update:check-result", struct {
+		Heading string `json:"heading"`
+		Body    string `json:"body"`
+	}{heading, body})
 }
 
 // UpdateClicked is the tray update item's action (UI goroutine). With a pending
@@ -1002,49 +1106,11 @@ func windowsUpdateAssets(rel *update.Release) (setup, sums *update.Asset) {
 	return setup, sums
 }
 
-// startUptimeTicker drives the status window's session clock, the one thing on
-// screen that changes without a tunnel event.
-//
-// It posts through a.dispatch, and is stopped during teardown: a ticker
-// goroutine that outlived the UI would queue work against a driver Quit is
-// destroying — the same hazard the pump's quitting flag guards against, so it
-// reads that flag too.
-//
-// status.Tick returns on a branch when no session is up, so an idle app pays for
-// a channel receive per second and nothing else.
-func (a *app) startUptimeTicker() {
-	if a.status == nil || a.stopTick != nil {
-		return
-	}
-	t := time.NewTicker(time.Second)
-	done := make(chan struct{})
-	a.stopTick = func() { close(done) }
-	go func() {
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if a.quitting.Load() {
-					return
-				}
-				a.dispatch.Post(func() {
-					if a.quitting.Load() || a.status == nil {
-						return
-					}
-					a.status.Tick()
-				})
-			}
-		}
-	}()
-}
-
-// pump is the one goroutine that reads tunnel events and drives the UI. Qt
-// owns the main thread, so every mutation of a Qt object from here is
-// marshalled onto the UI goroutine via a.dispatch. Once quitting is set the
-// pump keeps draining the channel (so the supervisor's teardown events never
-// block) but stops touching the UI, which qt.QCoreApplication_Quit() is
+// pump is the one goroutine that reads tunnel events and drives the UI.
+// Wails' runtime calls are safe from any goroutine, so this runs everything
+// inline rather than marshalling onto a separate UI goroutine. Once quitting
+// is set the pump keeps draining the channel (so the supervisor's teardown
+// events never block) but stops touching the UI, which wailsruntime.Quit is
 // about to destroy.
 func (a *app) pump() {
 	for e := range a.events {
@@ -1052,42 +1118,30 @@ func (a *app) pump() {
 			continue
 		}
 		e := e
-		// Notify before the UI hop: notifyFor is pure bookkeeping plus one
-		// notification post, both safe off the UI goroutine, and doing it here
-		// keeps it out of the a.dispatch.Post closure that a teardown can skip.
+		// Record the live event for Bridge.CurrentView before anything else —
+		// mu-guarded, so it is safe to read from a goroutine outside this pump.
+		a.setLastEvent(e)
+		a.mu.Lock()
+		a.activity.Add(e, time.Now())
+		a.mu.Unlock()
+		// Notify before emitting the UI event: notifyFor is pure bookkeeping
+		// plus one notification post.
 		a.notifyFor(e)
-		a.dispatch.Post(func() {
-			// Re-check inside the closure: the pre-check above is not atomic with
-			// a.dispatch.Post, and once the queue is drained the closure runs
-			// inline on the UI goroutine, so an event slipping past the pre-check
-			// just as Quit tears the driver down could otherwise call Apply
-			// against a terminated UI (§7.8). Belt-and-suspenders with the
-			// pre-check.
-			if a.quitting.Load() {
-				return
-			}
-			a.tray.Apply(e)
-			// Same consumer, same a.dispatch.Post: mirror the status onto the
-			// settings window's live strip. Safe whether the window is shown or
-			// hidden.
-			if a.settings != nil {
-				a.settings.Apply(e)
-			}
-			// And onto the status window, in the SAME closure as the other two, so
-			// all three surfaces render one event or none of them do. Updating a
-			// hidden window's widgets is safe and cheap.
-			if a.status != nil {
-				a.status.Apply(e)
-			}
-			// A terminal, broken-install failure (tunnel.ErrPermanent, whose
-			// Error() text carries "install is broken") means the privileged path
-			// is not set up — on macOS, offer the same one-prompt install rather
-			// than leaving the user staring at a red Error. onPermanentError is nil
-			// off darwin and in tests, so this is a no-op there.
-			if a.onPermanentError != nil && e.State == tunnel.Error && strings.Contains(e.Detail, "install is broken") {
-				a.onPermanentError()
-			}
-		})
+		if a.quitting.Load() {
+			continue
+		}
+		a.tray.Apply(e)
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "tunnel:event", uistate.ViewFor(e))
+		}
+		// A terminal, broken-install failure (tunnel.ErrPermanent, whose
+		// Error() text carries "install is broken") means the privileged path
+		// is not set up — on macOS, offer the same one-prompt install rather
+		// than leaving the user staring at a red Error. onPermanentError is nil
+		// off darwin and in tests, so this is a no-op there.
+		if a.onPermanentError != nil && e.State == tunnel.Error && strings.Contains(e.Detail, "install is broken") {
+			a.onPermanentError()
+		}
 	}
 }
 
@@ -1189,9 +1243,14 @@ func (a *app) notifyFor(e tunnel.Event) {
 }
 
 // Quit is invoked from the tray's Quit item on the UI goroutine. It routes to the
-// shared graceful shutdown, which quits the Qt application once the tunnel is down.
+// shared graceful shutdown, which quits the Wails application once the tunnel is
+// down.
 func (a *app) Quit() {
-	a.shutdown(func() { a.dispatch.Post(func() { qt.QCoreApplication_Quit() }) })
+	a.shutdown(func() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
+		}
+	})
 }
 
 // shutdown tears the tunnel down and then calls done to leave the process. It is
@@ -1221,15 +1280,6 @@ func (a *app) shutdown(done func()) {
 	a.shutdownOnce.Do(func() {
 		a.shutdownDone = make(chan struct{})
 		a.quitting.Store(true)
-		// Stop the uptime ticker before the teardown begins, so it cannot queue
-		// work against a driver that is about to be destroyed. quitting is
-		// already set, so an in-flight tick returns without touching the UI
-		// either way; this just stops the goroutine rather than leaving it
-		// running to no purpose.
-		if a.stopTick != nil {
-			a.stopTick()
-			a.stopTick = nil
-		}
 		go func() {
 			// Signal completion no matter how this returns, so awaitShutdown (which
 			// keeps the process alive for exactly this work) can never wait out its
@@ -1315,7 +1365,7 @@ func (a *app) awaitShutdown() {
 // a root openconnect the unprivileged parent cannot signal. It loops rather than
 // returning after the first signal so a second signal is observed too — though
 // shutdown is once-guarded, so the second is a no-op. quit is what leaves the
-// process (qt.QCoreApplication_Quit, posted via a.dispatch, in production).
+// process (wailsruntime.Quit, in production).
 func (a *app) watchSignals(sigs <-chan os.Signal, quit func()) {
 	for s := range sigs {
 		log.Printf("openfortitray: received signal %s, tearing down", s)
@@ -1521,10 +1571,11 @@ func main() {
 
 	events := make(chan tunnel.Event, 16)
 	a := &app{
-		cfg:     cfg,
-		cfgDir:  cfgDir,
-		events:  events,
-		logPath: logPath,
+		cfg:      cfg,
+		cfgDir:   cfgDir,
+		events:   events,
+		logPath:  logPath,
+		activity: uistate.NewRing(50),
 		// The credstore seam: real platform-native store in production, an
 		// in-memory fake in tests.
 		cookieGet:    credstore.Get,
@@ -1535,11 +1586,6 @@ func main() {
 		cookieRetryInterval: cookieRetryInterval,
 		cookieRetryWindow:   cookieRetryWindow,
 	}
-	// a.dispatch marshals every cross-goroutine UI mutation onto the Qt UI
-	// thread — the replacement for fyne.Do/fyne.DoAndWait. Constructed before
-	// anything that might post to it (the auth/run funcs' goroutines never do,
-	// but Connect and the update checker, wired below, do).
-	a.dispatch = uidispatch.New()
 
 	// The auth/run funcs read a.snapshot() rather than a value captured at
 	// startup, so a Connect that follows a settings Save (Save & Reconnect) dials
@@ -1615,38 +1661,7 @@ func main() {
 
 	a.sup = tunnel.New(authFn, runFn, events)
 
-	// The one QApplication instance for the process. Qt's native platform
-	// integration (NSApp on macOS, etc.) is constructed synchronously here, in
-	// the constructor — unlike fyne/glfw, which deferred that to Run() — so
-	// anything that needs it (setDockActivationPolicy, below) can run right
-	// after this, with no OnStarted-style lifecycle callback needed.
-	qtApp := newQApplication(os.Args)
-	qt.QCoreApplication_SetOrganizationName("io.github.savvaskoualis")
-	qt.QCoreApplication_SetApplicationName("OpenFortiTray")
-
-	// Fusion replaces Qt's native macOS widget style, which paints its own
-	// chrome (focus rings, combo box arrows, control edges) underneath QSS
-	// and only partially honors it — the reason heavy styling still read as
-	// "native" rather than "designed". Fusion is a pure-QSS style with no
-	// native painting to fight, giving uitheme.StyleSheet full control.
-	qt.QApplication_SetStyleWithStyle("Fusion")
-
-	// The app theme, applied once at the QApplication level before any window
-	// is built so nothing is ever laid out against an unstyled widget and then
-	// re-laid out. Qt propagates a QApplication-level stylesheet to every
-	// widget unless overridden locally.
-	//
-	// miqt v0.14.0's QStyleHints has no ColorScheme accessor (verified
-	// against gen_qstylehints.go), so isDarkMode reads the OS setting
-	// directly (NSUserDefaults on macOS; always false elsewhere — see
-	// darkmode_other.go). This matters in practice, not just cosmetically:
-	// rendering the light palette under a dark system vibrancy material
-	// (or vice versa) produces near-invisible text and a muddy, flat
-	// appearance rather than merely "the wrong colors".
-	dark := isDarkMode()
-	qtApp.SetStyleSheet(uitheme.StyleSheet(dark))
-
-	ctrl, err := tray.Setup(a)
+	ctrl, err := tray.Setup(a, a.onTrayClick)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1661,72 +1676,25 @@ func main() {
 	// Assert the Dock-visible (Regular) activation policy. No-op off darwin.
 	setDockActivationPolicy()
 
-	// ONE window, built once and left hidden. It is never explicitly Exec'd, so
-	// it cannot be the master window whose close quits the app; the shell
-	// intercepts its close to Hide.
-	//
-	// Status and Settings were two separate windows: two things to find, two to
-	// arrange, and — once the app grew a Dock icon — an ambiguous answer to "bring
-	// this app up". The controllers still take the window, because dialogs and focus
-	// need one, but they no longer decide what it contains or when it appears.
-	//
-	// WA_TranslucentBackground is the direct replacement for the old
-	// glfw.WindowHint(TransparentFramebuffer, true) + the fyne theme's alpha
-	// background: it tells Qt this widget's own paint may leave native
-	// vibrancy (NSVisualEffectView / DWM Acrylic / X11 blur) showing through.
-	// The alpha-bearing background itself comes from the QApplication-level
-	// stylesheet applied above (uitheme.StyleSheet's `QWidget { background:
-	// rgba(...) }` rule cascades to this window's central widget).
-	win := qt.NewQMainWindow2()
-	win.SetAttribute2(qt.WA_TranslucentBackground, true)
-	a.win = win
-	// Hide rather than quit on close — mirrors newUpdateFlow's dlg.OnCloseEvent.
-	// Without this, Qt's default quitOnLastWindowClosed behavior tears the whole
-	// app down when the user clicks the window's close button, contradicting the
-	// "shell intercepts its close to Hide" comment below and killing an active
-	// tunnel's tray icon along with it.
-	win.OnCloseEvent(func(_ func(event *qt.QCloseEvent), event *qt.QCloseEvent) {
-		event.Ignore()
-		win.Hide()
-	})
-	a.settings = settings.New(a, win)
-	a.status = status.New(a, win)
+	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
+	// where the manual scripts/install.sh path is unchanged).
+	a.installBootstrapHooks()
 
-	a.shell = shell.New(win, shell.Parts{
-		Status:     a.status.Content(),
-		Connection: a.settings.ConnectionContent(),
-		Advanced:   a.settings.AdvancedContent(),
-		ProfileBar: a.settings.ProfileBar(),
-		Banner:     a.settings.Banner(),
-		Footer:     a.settings.Footer(),
-	})
-	// shell.Shell.AttachGlass takes the *qt.QMainWindow it reveals; attachGlass
-	// (Task 8) takes the *qt.QWidget WinId() needs. QMainWindow promotes its
-	// embedded *QWidget as a field, so the adapter is just that field access.
-	a.shell.AttachGlass = func(w *qt.QMainWindow) { attachGlass(w.QWidget) }
-	// Settings asks the shell to navigate when a refused Connect points at a field.
-	a.settings.SetNavigator(func(tab string) {
-		if tab == settings.TabAdvanced {
-			a.shell.Reveal(shell.SectionAdvanced)
-			return
-		}
-		a.shell.Reveal(shell.SectionConnection)
-	})
-	// Revealing the activity history needs a taller window: status.Controller
-	// resizes a.win itself (win.AdjustSize()), so there is nothing to wire here
-	// — see toggleActivity's doc comment.
-
-	// Route a refused Connect (invalid active profile) to the settings window,
-	// which opens on the offending field with a banner naming the fix.
+	// Route a blocking config issue (Connect refused: no gateway configured,
+	// an invalid host/port, ...) to the settings window with a visible error,
+	// replacing the deleted Qt settings controller's ShowIssue. Without this,
+	// Connect (from the tray OR the frontend's primary button) just logs one
+	// line and returns on a fresh install — no banner, no navigation, no
+	// visible feedback at all. frontend/dist/settings.js listens for the
+	// "settings:issue" event and renders it into #settings-error, the same
+	// element SaveConfig's validation-failure path already populates.
 	a.onConnectIssue = func(i *settings.Issue) {
 		log.Print("onConnectIssue: showing settings window")
-		a.settings.ShowIssue(i)
-		log.Print("onConnectIssue: settings window shown")
+		a.ShowSettings()
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.EventsEmit(ctx, "settings:issue", i.Message)
+		}
 	}
-	// Wire the first-run privileged-helper install (macOS only; a no-op elsewhere,
-	// where the manual scripts/install.sh path is unchanged). Must be after a.win
-	// and a.settings are set — the bootstrap dialogs parent on a.win.
-	a.installBootstrapHooks()
 
 	// Give the Dock icon an effect. Qt has no reopen-delegate hook of its own on
 	// macOS either, so without this the icon is inert: clicking it does nothing
@@ -1746,11 +1714,10 @@ func main() {
 		log.Print("dock: activated — showing the status window")
 		a.ShowStatus()
 	})
-	a.startUptimeTicker()
 
 	// The one event pump. Started before the event loop so events emitted by
-	// the connect-on-launch below queue onto a.dispatch and render as soon as
-	// the drain timer (below) starts ticking.
+	// the connect-on-launch below are ready to render as soon as the window
+	// exists.
 	go a.pump()
 
 	// Signal-driven exit. launchd's stop (SIGTERM), Ctrl-C (SIGINT), a hangup
@@ -1760,7 +1727,11 @@ func main() {
 	// signal is never dropped before the handler is scheduled.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go a.watchSignals(sigs, func() { a.dispatch.Post(func() { qt.QCoreApplication_Quit() }) })
+	go a.watchSignals(sigs, func() {
+		if ctx := a.ctxSnapshot(); ctx != nil {
+			wailsruntime.Quit(ctx)
+		}
+	})
 
 	// Sleep/wake-driven reconnect: a laptop resuming from sleep is the one drop
 	// openconnect's own dead-peer detection is slowest to notice (this gateway
@@ -1773,20 +1744,18 @@ func main() {
 	// a separate hook from watchSystemSleep, not a duplicate of it.
 	//
 	// No watchMainThreadFreeze here, unlike the old fyne/glfw build: this is
-	// the core point of the Qt migration. The old watchdog existed because
+	// the core point of the Wails migration. The old watchdog existed because
 	// glfw.PollEvents() could block the UI goroutine forever after a display
-	// sleep/wake cycle, wedging every fyne.Do queued after it. The
-	// uidispatch+QTimer architecture (below) removes that failure class rather
-	// than detecting and recovering from it: nothing here ever blocks on a
-	// call into Qt from another goroutine.
+	// sleep/wake cycle, wedging every fyne.Do queued after it. Wails' runtime
+	// calls are documented safe from any goroutine, which removes that failure
+	// class rather than detecting and recovering from it: nothing here ever
+	// blocks on a call into the UI from another goroutine.
 	watchScreenWake(a.onScreenWake)
 
 	// Startup self-heal, then connect-on-launch — off the UI thread and in that
 	// order. Reaping a tunnel orphaned by a previous unclean exit BEFORE minting a
 	// new cookie clears the stale FortiGate session that would otherwise reject
 	// the cookie in a loop. On the direct path (Windows) ReapStale is a no-op.
-	// The connect is marshalled back onto the UI goroutine (a.Connect touches the
-	// settings window when the active profile is unconfigured) via a.dispatch.
 	// resumed is a SEPARATE question from cfg.Autostart: it is set for exactly one
 	// launch, right after an update restart that tore down a tunnel which was
 	// actually connected — see consumeResumeMarker. Without it, a user who
@@ -1797,7 +1766,7 @@ func main() {
 		log.Print("openfortitray: resuming the VPN session that was up before this update restart")
 	}
 	reapOpts := tunnel.Options{HelperPath: cfg.HelperPath, UseSudo: runtime.GOOS != "windows"}
-	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, func() { a.dispatch.Post(a.Connect) })
+	go a.selfHealThenConnect(reapOpts.ReapStale, cfg.Autostart || resumed, a.Connect)
 
 	// Background update checker: polls GitHub for a newer release and, if found,
 	// surfaces a one-click "Update … & Restart" item on the tray. Fully best-effort
@@ -1805,28 +1774,14 @@ func main() {
 	// checker treats as never-newer, so local runs never prompt.
 	go a.startUpdateChecker(context.Background())
 
-	// The drain timer is what actually pumps a.dispatch's queued work onto the
-	// Qt main thread — the one piece with no fyne.Do-era counterpart. 30ms is
-	// frequent enough that a posted UI mutation renders as though synchronous
-	// to a human, while staying cheap when idle.
-	// drain is intentionally never freed (no DeleteLater/GoGC call anywhere)
-	// — it lives for the whole process, ticking until qt.QCoreApplication_Quit()
-	// stops the event loop below. Freeing it while Exec's loop is still
-	// running would risk a use-after-free the next time the loop tries to
-	// fire its already-registered timeout, for no benefit: the process is
-	// exiting either way once Exec returns.
-	drain := qt.NewQTimer2(nil)
-	drain.SetInterval(30)
-	drain.OnTimeout(a.dispatch.Drain)
-	drain.Start(30)
-
-	// Exec blocks the main goroutine until qt.QCoreApplication_Quit(), which the
-	// tray's Quit item and the signal handler both drive only after the tunnel
-	// has been torn down (see app.shutdown). A tray-only app (no window ever
-	// shown) stays alive here and exits cleanly on Quit.
-	log.Print("entering Qt event loop")
-	execQApplication()
-	log.Print("Qt event loop returned; waiting for the tunnel teardown")
+	// wails.Run blocks the main goroutine until wailsruntime.Quit(a.ctx), which
+	// the tray's Quit item and the signal handler both drive only after the
+	// tunnel has been torn down (see app.shutdown).
+	log.Print("entering Wails event loop")
+	if err := wails.Run(buildAppOptions(a, frontendAssets)); err != nil {
+		log.Fatalf("wails run: %v", err)
+	}
+	log.Print("Wails event loop returned; waiting for the tunnel teardown")
 	// Quit can be driven from outside app.shutdown (e.g. a desktop session
 	// logout), so arriving here does NOT by itself mean the tunnel is down.
 	// Block until it is (see awaitShutdown) — otherwise the process exits

@@ -3,14 +3,12 @@
 package main
 
 import (
-	"errors"
-	"fmt"
 	"log"
 	"os"
 
-	qt "github.com/mappu/miqt/qt6"
-
 	oft "github.com/savvaskoualis/openfortitray"
+
+	"github.com/savvaskoualis/openfortitray/internal/tray"
 )
 
 // installBootstrapHooks wires the first-run privileged-helper install into the
@@ -24,13 +22,13 @@ func (a *app) installBootstrapHooks() {
 
 // connectWithBootstrap is the Connect gate on macOS. It probes helper readiness
 // OFF the UI thread (the probe spawns `sudo -n`), then either dials or offers the
-// one-time install — both marshalled back onto the UI goroutine via a.dispatch.
-// Called on the UI goroutine from Connect (after the config-issue check has
-// passed).
+// one-time install directly — no cross-thread marshaling is needed any more,
+// since nothing here touches a Qt widget tree. Called on the UI goroutine from
+// Connect (after the config-issue check has passed).
 func (a *app) connectWithBootstrap() {
 	go func() {
 		if oft.HelperReady() {
-			a.dispatch.Post(a.startTunnel)
+			a.startTunnel()
 			return
 		}
 		// Say why Connect did not dial. Without this the app simply sits there
@@ -38,57 +36,26 @@ func (a *app) connectWithBootstrap() {
 		// app with no explanation is indistinguishable from a hang.
 		log.Printf("helper: not ready for this build (need ABI %d); offering to install it",
 			oft.RequiredHelperABI)
-		a.dispatch.Post(a.offerBootstrapInstall)
+		a.offerBootstrapInstall()
 	}()
 }
 
-// offerBootstrapInstall shows the confirm dialog and, on OK, runs the privileged
-// install off the UI thread, then dials on success or explains the failure and
-// points at the manual installer. It runs on the UI goroutine (it mutates
-// widgets). A dismissed password prompt (ErrUserCancelled) is intentionally
-// silent — the user chose not to install. QMessageBox.Exec() is a blocking
-// modal, which is fine here: this closure already runs on the Qt UI thread (via
-// a.dispatch's drain timer), and a nested Qt event loop during exec() is
-// standard practice, exactly as internal/settings' delete-profile confirm
-// already does.
+// offerBootstrapInstall tells the user a privileged helper install/update is
+// needed, via a native OS notification, and points at the manual install
+// script. It does NOT attempt an automated install or show a confirmation
+// dialog — that UX decision (a real one-click install flow through the
+// Wails UI) is out of scope here; this only keeps the existing "tell them
+// to run scripts/install-helper.sh" behavior working now that the Qt
+// dialog it used to show cannot exist anymore.
 func (a *app) offerBootstrapInstall() {
-	// Bring the window forward so the dialog has a visible parent (Connect can be
-	// invoked from the tray while the window is hidden).
-	a.win.Show()
-	a.win.Raise()
-	a.win.ActivateWindow()
-	// The same gate covers a first install and an upgrade of an existing helper, so
-	// the wording has to fit both: telling someone who has used the app for weeks
-	// that it "needs to install" a helper reads like a mistake.
-	title, body := "Install VPN helper",
-		"OpenFortiTray needs to install a small helper to run the VPN.\n"+
-			"This will ask for your Mac password. Install now?"
+	title, body := "VPN helper needed",
+		"OpenFortiTray needs to install a small helper to run the VPN. "+
+			"Run scripts/install-helper.sh in a Terminal, then try connecting again."
 	if _, err := os.Stat(oft.HelperPath); err == nil {
-		title = "Update VPN helper"
-		body = "OpenFortiTray needs to update its VPN helper before it can connect.\n" +
-			"This will ask for your Mac password. Update now?"
+		title = "VPN helper needs updating"
+		body = "OpenFortiTray needs to update its VPN helper before it can connect. " +
+			"Run scripts/install-helper.sh in a Terminal, then try connecting again."
 	}
-
-	mb := qt.NewQMessageBox3(qt.QMessageBox__Question, title, body)
-	mb.SetStandardButtons(qt.QMessageBox__Yes | qt.QMessageBox__No)
-	if mb.Exec() != int(qt.QMessageBox__Yes) {
-		return
-	}
-
-	go func() {
-		err := oft.Install()
-		a.dispatch.Post(func() {
-			switch {
-			case err == nil:
-				a.startTunnel()
-			case errors.Is(err, oft.ErrUserCancelled):
-				// User dismissed the password prompt; nothing to report.
-			default:
-				errBox := qt.NewQMessageBox3(qt.QMessageBox__Critical, "Could not install the VPN helper",
-					fmt.Sprintf("%v\n\nYou can install it manually by running scripts/install-helper.sh in a Terminal.", err))
-				errBox.SetStandardButtons(qt.QMessageBox__Ok)
-				errBox.Exec()
-			}
-		})
-	}()
+	log.Printf("bootstrap: %s — %s", title, body)
+	tray.ShowMessage(title, body)
 }

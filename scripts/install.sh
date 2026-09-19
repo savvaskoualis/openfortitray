@@ -432,26 +432,35 @@ install_openconnect() {
 	esac
 }
 
-# install_qt6_runtime installs the Qt6 runtime libraries the Linux binary
-# links against (miqt migration; see cmd/openfortitray/qtapp.go). This runs
-# unconditionally on Linux — deliberately NOT folded into install_openconnect,
-# which returns early when openconnect is already present. Every EXISTING
-# Linux user upgrading already has openconnect installed by definition, so
-# nesting the Qt6 install inside install_openconnect would mean upgraders
-# never get it and the new Qt6-linked binary fails to start with a dynamic-
-# linker error. macOS needs no equivalent step: the .app bundle carries its
-# own Qt6 frameworks (see `make app`).
-install_qt6_runtime() {
+# install_webview_runtime installs the GTK3/WebKit2GTK runtime libraries the
+# Linux binary links against (Wails migration; see
+# cmd/openfortitray/wailsapp.go). This runs unconditionally on Linux —
+# deliberately NOT folded into install_openconnect, which returns early when
+# openconnect is already present. Every EXISTING Linux user upgrading already
+# has openconnect installed by definition, so nesting this install inside
+# install_openconnect would mean upgraders never get it and the new
+# Wails-linked binary fails to start with a dynamic-linker error — the exact
+# hazard the old Qt6 runtime step (miqt migration) existed to prevent, now
+# reapplied to libwebkit2gtk/libgtk-3. macOS needs no equivalent step:
+# WebKit/Cocoa are system frameworks.
+install_webview_runtime() {
 	[[ "$OS" == Linux ]] || return
-	# qt6-base-dev/qt6-qtbase-devel/qt6-base also installs the Qt6 runtime
-	# libraries this binary links against — there is no separate minimal
-	# runtime-only package on most of these distros, and qt6-base-dev
-	# matches what CI already installs to build the binary, so build-time
-	# and install-time Qt6 are less likely to mismatch.
-	if command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y qt6-base-dev
-	elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y qt6-qtbase-devel
-	elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --noconfirm qt6-base
-	else die "no supported package manager found; install the Qt6 runtime manually"
+	# Prefer the 4.1 runtime package (matches what CI/release builds link
+	# against — see .github/workflows/release.yml's build-linux job; Ubuntu
+	# 24.04+ dropped the 4.0 dev package entirely, and current Fedora/Arch
+	# package 4.1 too), falling back to the 4.0-named runtime package for
+	# older distros (e.g. Ubuntu 22.04/Debian 11, older Fedora) that don't
+	# package 4.1.
+	if command -v apt-get >/dev/null 2>&1; then
+		sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.1-0 \
+			|| sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.0-37
+	elif command -v dnf >/dev/null 2>&1; then
+		sudo dnf install -y gtk3 webkit2gtk4.1 \
+			|| sudo dnf install -y gtk3 webkit2gtk3
+	elif command -v pacman >/dev/null 2>&1; then
+		sudo pacman -S --noconfirm gtk3 webkit2gtk-4.1 \
+			|| sudo pacman -S --noconfirm gtk3 webkit2gtk
+	else die "no supported package manager found; install the GTK3/WebKit2GTK runtime manually"
 	fi
 }
 
@@ -653,7 +662,7 @@ validate_helper_dir
 install_config
 preflight_paths
 install_openconnect
-install_qt6_runtime
+install_webview_runtime
 resolve_openconnect
 install_binary
 install_helper

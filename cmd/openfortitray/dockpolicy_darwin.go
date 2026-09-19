@@ -29,13 +29,10 @@ func oftDockActivated() {
 // activation policy to Regular.
 //
 // It has to be asserted at runtime rather than left to Info.plist because
-// Qt's own Cocoa platform integration sets its own policy while initializing
-// NSApp — constructed synchronously inside the QApplication constructor (see
-// main.go's newQApplication call), unlike the old fyne/glfw build, which
-// deferred that to Run() behind an OnStarted-style lifecycle hook. This must
-// therefore run after the QApplication is constructed and on the main/UI
-// thread; main() calls it directly, right after that constructor returns —
-// no lifecycle callback needed today.
+// Wails' own webview sets up its own Cocoa/NSApp integration when wails.Run
+// starts, and that integration may assert its own activation policy. main()
+// calls this directly on the main/UI thread, before calling wails.Run, so
+// this policy is the one that ends up set.
 func setDockActivationPolicy() {
 	C.oft_set_regular_policy()
 }

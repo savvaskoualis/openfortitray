@@ -1,16 +1,16 @@
 name: CI
 
-# Runs on every branch push and on pull requests. cmd/openfortitray is a cgo
-# build on EVERY OS: the UI is Qt6 via miqt (see cmd/openfortitray/qtapp.go),
-# a cgo+C++ dependency (Fyne was fully removed from this codebase — see the
-# migration history). That kills the old "type-check windows on ubuntu" trick
-# (cgo windows cannot cross-compile from Linux), so the matrix spans all three
-# real runners: linux installs Qt6's dev headers via apt (below), macOS uses
-# the system frameworks + Xcode CLT plus Homebrew Qt6, and windows uses the
-# runner's bundled MinGW gcc plus an MSYS2-installed Qt6. Each runner does the
-# full gofmt / vet / test -race / build pass against its own native toolchain,
-# with CGO_CXXFLAGS=-std=c++17 (job env, below) so Qt6's C++17-only headers
-# compile under cgo's C++ front end.
+# Runs on every branch push and on pull requests. cmd/openfortitray is a Wails
+# v2 app (see cmd/openfortitray/wailsapp.go) — Qt/miqt and Fyne were both fully
+# removed from this codebase (see the migration history). Wails' darwin and
+# linux frontends need cgo (Cocoa/WebKit on darwin, GTK3/WebKit2GTK on linux),
+# so those two run on their own native runners with CGO_ENABLED=1. windows is
+# different: Wails' windows webview binding (wailsapp/go-webview2) and
+# energye/systray's windows backend are both pure Go (no `import "C"` in
+# either), so windows runs with CGO_ENABLED=0 and needs no C toolchain at all
+# — see release.yml's build-windows job, which established this. Each runner
+# does the full gofmt / vet / test -race / build pass against its own native
+# toolchain.
 on:
   push:
     branches: ['**']
@@ -35,15 +35,14 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # cgo is mandatory on all three OSes (Qt6 via miqt). Setting it at the
-    # job level covers vet, test -race and build in one place.
-    env:
-      CGO_ENABLED: '1'
-      CGO_CXXFLAGS: '-std=c++17'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
+    # cgo is needed on darwin (Cocoa/WebKit) and linux (GTK3/WebKit2GTK) for
+    # Wails' frontend, but not on windows (see the job header comment above).
+    env:
+      CGO_ENABLED: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
     steps:
       # Third-party actions are pinned to full commit SHAs, not floating tags: a
       # tag can be repointed at new code, so `@v4` is a standing write into every
@@ -59,47 +58,13 @@ jobs:
           # go.sum; no separate actions/cache step needed.
           cache: true
 
-      - name: Install Qt6 (Homebrew)
-        if: runner.os == 'macOS'
-        run: |
-          brew install qt pkg-config
-
-      # windows-latest ships MinGW-w64 but does NOT put it on PATH
-      # (actions/runner-images #6103/#8399), so a CGO=1 vet/test/build would
-      # fail for want of a C compiler. Install a known-good gcc via a pinned
-      # setup-msys2 and prepend its bin to PATH ourselves. Linux uses the apt
-      # deps below; macOS uses system frameworks (+ Homebrew Qt6 above) —
-      # neither needs this.
-      #
-      # UCRT64 (not MINGW64): miqt's README documents UCRT64 + qt6-base as a
-      # tested native-Windows recipe for Qt6.
-      - name: Set up MinGW-w64 + Qt6 (MSYS2 UCRT64)
-        if: runner.os == 'Windows'
-        id: msys2
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
-        with:
-          msystem: UCRT64
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config mingw-w64-ucrt-x86_64-qt6-base
-
-      - name: Put MinGW-w64 gcc on PATH
-        if: runner.os == 'Windows'
-        # setup-msys2 exposes gcc only inside its own `msys2 {0}` shell, but the
-        # steps below run in Git Bash (defaults.run.shell: bash). Prepend the
-        # UCRT64 bin dir to PATH so cgo's go toolchain finds gcc, then confirm.
-        run: |
-          printf '%s\n' "${{ steps.msys2.outputs.msys2-location }}\\ucrt64\\bin" >> "$GITHUB_PATH"
-
-      - name: Verify C toolchain
-        if: runner.os == 'Windows'
-        run: gcc --version
-
       # Windows only: generate the *.syso from the app manifest so `go vet` /
       # `go build` below link it, proving the requireAdministrator manifest
       # embeds without error on every push. Go auto-links the GOOS/GOARCH-scoped
       # resource in the main package dir into the windows exe only; the .syso is
       # a build artifact (gitignored), regenerated here from the checked-in
       # manifest with the pinned, pure-Go rsrc tool. -arch amd64 matches the
-      # windows runner's GOARCH.
+      # windows runner's GOARCH. This needs no cgo/C toolchain (rsrc is pure Go).
       - name: Embed Windows manifest (generate .syso)
         if: runner.os == 'Windows'
         run: |
@@ -108,16 +73,22 @@ jobs:
             -arch amd64 \
             -o cmd/openfortitray/resource_windows_amd64.syso
 
-      # cmd/openfortitray links against Qt6 (miqt; see qtapp.go), which needs
-      # the Qt6 dev headers/pkg-config files (qt6-base-dev) to even
-      # compile-check, let alone build. macOS uses system frameworks +
-      # Homebrew Qt6, and windows uses the runner's bundled MinGW gcc + MSYS2
-      # Qt6 above, so neither needs this step.
-      - name: Install Qt6 build deps
+      # cmd/openfortitray links against Wails v2 (see cmd/openfortitray/main.go,
+      # wailsapp.go), whose linux frontend cgo-imports gtk+-3.0 and
+      # webkit2gtk-4.x via pkg-config to build. ubuntu-latest is now 24.04
+      # (Noble), which dropped libwebkit2gtk-4.0-dev entirely — only
+      # libwebkit2gtk-4.1-dev is packaged there — so this installs the 4.1 dev
+      # package and every Linux vet/test/build invocation below passes
+      # -tags webkit2_41 to select it (the cgo pkg-config directive defaults to
+      # webkit2gtk-4.0 without that tag). This is Wails' own documented fix for
+      # Ubuntu 24.04+ (wailsapp/wails#3465, #3513), mirroring release.yml's
+      # build-linux job. macOS uses system frameworks (Cocoa/WebKit); windows
+      # needs no cgo at all (see the job header comment above).
+      - name: Install webkit2gtk/GTK3 build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc pkg-config qt6-base-dev
+          sudo apt-get install -y gcc pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
 
       - name: Check gofmt
         # `gofmt -l` first so a failure names the offending files in the log,
@@ -127,13 +98,34 @@ jobs:
           test -z "$(gofmt -l cmd internal)"
 
       - name: go vet
-        run: go vet ./...
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            go vet -tags webkit2_41 ./...
+          else
+            go vet ./...
+          fi
 
+      # -race requires cgo, and windows runs with CGO_ENABLED=0 (see the note
+      # above this job's env block) — go build/test itself would refuse a
+      # -race invocation there ("go: -race requires cgo"), not just skip it
+      # silently, so windows runs the plain (non-race) suite instead.
       - name: go test -race
-        run: go test -race ./...
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            go test -race -tags webkit2_41 ./...
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            go test ./...
+          else
+            go test -race ./...
+          fi
 
       - name: go build
-        run: go build ./...
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            go build -tags webkit2_41 ./...
+          else
+            go build ./...
+          fi
 
       # Shell syntax gate for the installer and the privileged helper. Linux
       # only: these are parse checks, not execution, so one platform suffices.

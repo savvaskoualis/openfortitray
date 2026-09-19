@@ -5,8 +5,10 @@
 ;     %ProgramFiles%\openfortitray\openfortitray.exe,
 ;   - installs the bundled openconnect + its DLL closure + wintun.dll into
 ;     {app}\openconnect (there is no reliable way to get openconnect onto a
-;     locked-down Cloud PC — winget is a dead stub there — so it is shipped, the
-;     same pattern used for Mesa; the app resolves this binary at runtime),
+;     locked-down Cloud PC — winget is a dead stub there — so it is shipped;
+;     the app resolves this binary at runtime),
+;   - installs the Microsoft Edge WebView2 Runtime if it is not already
+;     present (most Windows 10/11 machines already have it),
 ;   - creates the elevated ONLOGON scheduled task "OpenFortiTray"
 ;     (/RL HIGHEST) — the same task internal/autostart toggles from the tray and
 ;     the same command install.ps1 runs, so the task name stays byte-identical,
@@ -22,12 +24,13 @@
 ; The bundled openconnect dir is expected at ..\dist\openconnect (override with
 ; /DMyOcDir=...); CI's "Bundle openconnect + DLL closure + wintun" step fills it.
 ;
-; This installer redistributes third-party binaries: Mesa 3D
-; (https://mesa3d.org/) — the llvmpipe software OpenGL driver (opengl32.dll +
-; libgallium_wgl.dll), MIT-style — so the tray renders on GPU-less Windows
-; (VMs/RDP); and openconnect (LGPL-2.1) with its dependency DLLs and Wintun. See
-; THIRD_PARTY_LICENSES in the repository root for full attribution and the LGPL
-; written-offer / relink notice.
+; This installer redistributes third-party binaries: openconnect (LGPL-2.1)
+; with its dependency DLLs and Wintun. See THIRD_PARTY_LICENSES in the
+; repository root for full attribution and the LGPL written-offer / relink
+; notice. It also stages (but does not permanently install) the Microsoft
+; Edge WebView2 Runtime bootstrapper — Wails' UI renders inside WebView2,
+; which ships by default on Windows 11 and most updated Windows 10 machines,
+; so this only runs the bootstrapper when the runtime is not already present.
 ;
 ; UNVERIFIED: authored on a non-Windows host and never run through ISCC or on a
 ; real Windows machine. Review by inspection only.
@@ -46,21 +49,25 @@
   #define MyAppExe "..\dist\openfortitray-windows-amd64.exe"
 #endif
 
-; Directory holding the Qt6 runtime DLLs + platform plugin that CI's "Bundle
-; Qt6 runtime DLLs" step (windeployqt6) drops next to the exe (miqt
-; migration; the exe now links Qt6 at runtime, unlike the old static-binary
-; fyne build). windeployqt6 places the Qt*.dll files flat in this directory
-; and the platform plugin (qwindows.dll) in a platforms\ subdirectory below
-; it. Override with /DMyQtDir if it lives elsewhere.
-#ifndef MyQtDir
-  #define MyQtDir "..\dist"
-#endif
-
 ; Directory holding the bundled openconnect binary, its full transitive DLL
 ; closure, and wintun.dll. CI's "Bundle openconnect + DLL closure + wintun" step
 ; collects them into dist/openconnect/ before ISCC runs. Override with /DMyOcDir.
 #ifndef MyOcDir
   #define MyOcDir "..\dist\openconnect"
+#endif
+
+; The Microsoft Edge WebView2 Runtime "Evergreen" bootstrapper: a small
+; (~2 MB) stub that, when run, downloads and installs the current WebView2
+; Runtime from Microsoft's servers if it is not already present. Wails'
+; window renders inside WebView2, an OS-provided component (it ships by
+; default on Windows 11 and most updated Windows 10 machines via Edge), so
+; this only covers the gap on machines without it. CI's "Download WebView2
+; Bootstrapper" step fetches it fresh from Microsoft's documented evergreen
+; URL into dist/ before ISCC runs (not sha256-pinned like openconnect: this
+; stub is *meant* to be Microsoft's latest at any given time — pinning it
+; would defeat its purpose). Override with /DMyWebView2Bootstrapper.
+#ifndef MyWebView2Bootstrapper
+  #define MyWebView2Bootstrapper "..\dist\MicrosoftEdgeWebview2Setup.exe"
 #endif
 
 ; Where the finished OpenFortiTray-<version>-Setup.exe lands. Defaults to the
@@ -106,25 +113,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; The CI-built tray exe, renamed to openfortitray.exe at the install target
 ; (matches install.ps1's %ProgramFiles%\openfortitray\openfortitray.exe).
 Source: "{#MyAppExe}"; DestDir: "{app}"; DestName: "openfortitray.exe"; Flags: ignoreversion
-; Every DLL CI leaves flat in dist\: Mesa's llvmpipe software OpenGL
-; (opengl32.dll + libgallium_wgl.dll — Windows loads an app-directory
-; opengl32.dll before the system one, so the tray renders in software on
-; GPU-less machines with no GL driver; Mesa is MIT-style, see
-; THIRD_PARTY_LICENSES), the Qt6 runtime windeployqt6 drops beside the exe,
-; and the full transitive MinGW/UCRT64 dependency closure CI's "Bundle
-; transitive Qt6/MinGW DLL closure" step walks and copies there (compiler
-; runtime like libgcc_s_seh-1.dll, and Qt's own third-party deps like
-; libdouble-conversion.dll, libpcre2-*.dll, libharfbuzz-0.dll, ... — Qt6 on
-; this MSYS2 build links these as separate shared packages rather than
-; privately bundling them, and neither windeployqt6 nor --compiler-runtime
-; know to bundle any of them). One wildcard instead of naming each
-; individually: the exact set has already changed twice as new transitive
-; deps surfaced as real "$X.dll was not found" crashes, and will again.
-; Tracked by Inno, so uninstall removes them.
-Source: "{#MyQtDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
-; The Qt platform plugin (qwindows.dll), required at runtime now that the
-; exe links Qt6 (see cmd/openfortitray/qtapp.go).
-Source: "{#MyQtDir}\platforms\*"; DestDir: "{app}\platforms"; Flags: ignoreversion
+; The WebView2 Evergreen bootstrapper, staged into {tmp} for the [Run] step
+; below rather than permanently installed into {app} — it is a one-shot
+; installer, not a runtime component the app itself loads. deleteafterinstall
+; (not dontcopy) is what actually extracts the file into DestDir during the
+; normal install sequence — dontcopy embeds the file in the installer but
+; never extracts it without an explicit ExtractTemporaryFile call in [Code],
+; which this script has none of, so the [Run] step below could never
+; actually find the file. deleteafterinstall removes it again once install
+; finishes, matching dontcopy's "don't leave it behind" intent.
+Source: "{#MyWebView2Bootstrapper}"; DestDir: "{tmp}"; Flags: deleteafterinstall
 ; Bundled openconnect.exe + its full transitive DLL closure + wintun.dll,
 ; installed into {app}\openconnect. The tray resolves this path at runtime
 ; (resolveOpenconnectPath: <exeDir>\openconnect\openconnect.exe) when the config
@@ -139,6 +137,16 @@ Source: "{#MyOcDir}\*"; DestDir: "{app}\openconnect"; Flags: recursesubdirs igno
 Name: "{autoprograms}\OpenFortiTray"; Filename: "{app}\openfortitray.exe"; WorkingDir: "{app}"; Comment: "OpenFortiTray - FortiGate SSL-VPN tray client"
 
 [Run]
+; Install the WebView2 Runtime first, if it is not already present (Check:
+; below), so the app's window has something to render into on first launch.
+; /silent /install runs the bootstrapper's own silent, non-interactive mode
+; (Microsoft's documented flags for the Evergreen Bootstrapper).
+Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; \
+  Parameters: "/silent /install"; \
+  StatusMsg: "Installing Microsoft Edge WebView2 Runtime..."; \
+  Flags: waituntilterminated; \
+  Check: not IsWebView2Installed
+
 ; Elevated ONLOGON scheduled task. Byte-identical command to install.ps1:
 ;    schtasks /Create /TN "OpenFortiTray" /SC ONLOGON /RL HIGHEST /TR "<quoted exe>" /F
 ;    The /TR value is wrapped in literal double quotes so Task Scheduler keeps
@@ -167,3 +175,20 @@ Filename: "{sys}\schtasks.exe"; \
   Parameters: "/Delete /TN ""OpenFortiTray"" /F"; \
   Flags: runhidden waituntilterminated; \
   RunOnceId: "DelOpenFortiTrayTask"
+
+[Code]
+// IsWebView2Installed checks WebView2's well-known runtime-detection registry
+// key (the "Clients" GUID Microsoft documents for exactly this purpose) so
+// the [Run] bootstrapper above is skipped on the many machines that already
+// have WebView2 (bundled with Windows 11, or installed alongside Edge on
+// Windows 10). The app is x64-only (ArchitecturesInstallIn64BitMode=x64), so
+// Inno already reads the native 64-bit registry view here — no HKLM64/WOW6432
+// handling needed.
+function IsWebView2Installed: Boolean;
+var
+  Version: string;
+begin
+  Result := RegQueryStringValue(HKLM,
+    'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+    'pv', Version) and (Version <> '');
+end;

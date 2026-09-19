@@ -53,11 +53,11 @@ winres:
 
 build:
 	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
-	CGO_CXXFLAGS=-std=c++17 go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
+	go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
 
 test:
-	CGO_CXXFLAGS=-std=c++17 go vet ./...
-	CGO_CXXFLAGS=-std=c++17 go test -race ./...
+	go vet ./...
+	go test -race ./...
 
 # Size trim for release builds: -s -w (strip symbol table + DWARF) trims the
 # release binary.
@@ -68,39 +68,50 @@ LDFLAGS_TRIM := -s -w
 # the tag in CI via `make ... VERSION=$GITHUB_REF_NAME`).
 LDFLAGS_VER := -X main.version=$(VERSION)
 
-# Build/CI reality: the UI is Qt6 via miqt, so cmd/openfortitray is a cgo
-# build on EVERY OS. That kills the old pure cross-compile model
-# (CGO_ENABLED=0 for linux/windows from any host). Each OS must now build on
-# its own native toolchain:
-#   - darwin: cgo via the Xcode CLT, arm64 only. Intel (amd64) macOS support
-#     was dropped: it required a second, x86_64 Homebrew/Qt6 install
-#     cross-built under Rosetta, and Homebrew has stopped shipping precompiled
-#     Intel bottles for some of Qt6's own dependencies (confirmed live:
-#     "openssl@3: no bottle available!", Tier 3/community-support-only) — the
-#     x86_64 leg can no longer reliably build in CI at all, independent of
-#     anything in this repo.
-#   - linux: cgo needs gcc + the Qt6 dev headers (qt6-base-dev).
-#   - windows: cgo needs a MinGW gcc; -H=windowsgui suppresses the console
-#     window. Cannot be cross-built from a non-windows host without a MinGW
-#     cross-toolchain.
+# Build/CI reality (post Qt6->Wails migration): the UI is now Wails v2, whose
+# Go-side webview binding needs cgo (and OS-native dev libraries) on darwin
+# and linux, but NOT on windows:
+#   - darwin: cgo via the Xcode CLT drives the Cocoa glue in this repo's own
+#     darkmode_darwin.go/dockpolicy_darwin.go/wake_darwin.go, and Wails'
+#     darwin frontend itself links Cocoa/WebKit through cgo too. arm64 only —
+#     Intel (amd64) macOS support was dropped earlier in the Qt6->Wails
+#     migration, back when darwin still built via a Homebrew Qt6 install: that
+#     required a second, x86_64 Homebrew install cross-built under Rosetta,
+#     and Homebrew had stopped shipping precompiled Intel bottles for some of
+#     Qt6's own dependencies (confirmed live: "openssl@3: no bottle
+#     available!", Tier 3/community-support-only). This task removed the
+#     Homebrew/Qt6 install from the darwin path entirely, so that specific
+#     blocker is now gone — but re-adding Intel/amd64 macOS support is a
+#     separate decision this task doesn't make, so darwin stays arm64-only
+#     pending that future call.
+#   - linux: cgo needs gcc + GTK3/WebKitGTK dev headers (libgtk-3-dev,
+#     libwebkit2gtk-4.1-dev on current distros) — Wails' linux frontend embeds
+#     GTK/WebKit2GTK via cgo+pkg-config directives.
+#   - windows: verified cgo-free. Wails' windows webview binding
+#     (wailsapp/go-webview2) and github.com/energye/systray's Windows backend
+#     are both pure Go (win32 via syscall, no `import "C"`), confirmed by
+#     `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./cmd/openfortitray`
+#     succeeding. -H=windowsgui suppresses the console window; it needs no C
+#     toolchain, so it can even be cross-built from a non-windows host.
 #
 # Consequently a LOCAL `make release` can only build what THIS host's toolchain
-# supports: on macOS the darwin/arm64 binary, on linux the linux binary, on
-# windows the windows exe. The full OS matrix is produced by CI
+# supports for darwin/linux: on macOS the darwin/arm64 binary, on linux the
+# linux binary. windows can (and in CI does) build from any host since it
+# needs no cgo. The full OS matrix is produced by CI
 # (.github/workflows/release.yml), one native runner per OS. This target
 # builds the host-appropriate subset and says so.
 release: clean
 	mkdir -p $(DIST)
 ifeq ($(shell uname -s),Darwin)
-	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
 	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
 	@echo "make release: built darwin arm64. linux/windows come from CI (native runners)."
 else ifeq ($(shell uname -s),Linux)
-	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
 else
 	$(MAKE) winres
-	CGO_CXXFLAGS=-std=c++17 CGO_ENABLED=1 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+	CGO_ENABLED=0 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
 	@echo "make release: built windows amd64 (manifest embedded, runs elevated). darwin/linux come from CI (native runners)."
 endif
 	@ls -l $(DIST)
@@ -117,21 +128,10 @@ endif
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	cp $(BIN) $(APP_BUNDLE)/Contents/MacOS/$(BIN)
 	cp $(APP_PLIST) $(APP_BUNDLE)/Contents/Info.plist
-# Bundle the Qt6 runtime (miqt migration): unlike fyne's static Go binary, Qt6
-# links against real shared libraries at runtime. macdeployqt copies the
-# needed .framework bundles into Contents/Frameworks and rewrites the binary's
-# load commands to find them there, so the .app runs on a machine without a
-# matching Qt6 install. This MUST run before the codesign step below —
-# codesigning after macdeployqt modifies the binary would invalidate the
-# signature.
-	@QT_PREFIX="$$(brew --prefix qt 2>/dev/null)"; \
-	if [ -n "$$QT_PREFIX" ] && [ -x "$$QT_PREFIX/bin/macdeployqt" ]; then \
-		"$$QT_PREFIX/bin/macdeployqt" "$(APP_BUNDLE)"; \
-		echo "make app: bundled Qt6 frameworks via macdeployqt"; \
-	else \
-		echo "make app: macdeployqt not found at $$QT_PREFIX/bin — the .app will only run on machines with a matching Qt6 install" >&2; \
-		exit 1; \
-	fi
+# No Qt6-runtime bundling step here anymore (Wails migration): the binary no
+# longer links Qt6 at all. Wails' darwin frontend links Cocoa/WebKit, both
+# system frameworks present on every Mac, so there is nothing third-party to
+# bundle into Contents/Frameworks — the binary is ready to codesign as-is.
 	@if command -v iconutil >/dev/null 2>&1 && command -v rsvg-convert >/dev/null 2>&1; then \
 		set -e; \
 		work="$$(mktemp -d)"; iconset="$$work/AppIcon.iconset"; mkdir -p "$$iconset"; \
