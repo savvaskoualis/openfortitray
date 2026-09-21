@@ -758,13 +758,77 @@ var version = "dev"
 // Version returns the build version string shown in the tray header.
 func (a *app) Version() string { return version }
 
+// emitEvent is the ONLY way this app is allowed to publish a Wails event. It
+// exists to work around a use-after-free in Wails' macOS frontend that makes a
+// direct wailsruntime.EventsEmit crash the process outright whenever the call
+// happens to be made on the OS main thread.
+//
+// The bug, for the next person who has to touch this (verified against
+// v2.9.2 and v2.16.0 — it is present, unchanged, in both):
+//
+//	// internal/frontend/desktop/darwin/Application.m
+//	void ExecJS(void* inctx, const char *script) {
+//	    WailsContext *ctx = (__bridge WailsContext*) inctx;
+//	    NSString *nsscript = safeInit(script);   // [NSString stringWithUTF8String:] — AUTORELEASED
+//	    ON_MAIN_THREAD(                          // dispatch_async(dispatch_get_main_queue(), ^{ ... })
+//	       [ctx ExecJS:nsscript];
+//	       [nsscript release];                   // ← one release too many
+//	    );
+//	}
+//
+// None of Wails' .m files are compiled with -fobjc-arc, so they are manual
+// retain/release. Copying a block onto the heap (which dispatch_async does)
+// already retains every Objective-C object the block captures and releases it
+// again when the block is disposed of. The explicit [nsscript release] is
+// therefore an over-release of a string the block does not own.
+//
+// Whether that over-release is fatal depends entirely on whether the *calling*
+// thread had an autorelease pool in place:
+//
+//   - Called from an ordinary goroutine, there is no pool (Wails installs none,
+//     and cgo does not either), so the autorelease is a silent leak, the counts
+//     happen to balance, and nothing visibly breaks.
+//   - Called on the OS main thread while AppKit's run loop is spinning, there IS
+//     a pool — one per run-loop iteration. It drains, the block's own release
+//     takes the string to zero and deallocates it, and then the block is
+//     disposed of and releases a freed object. That lands as
+//     "SIGSEGV: segmentation violation / signal arrived during cgo execution"
+//     on goroutine 1 inside _Cfunc_RunMainLoop, crash PC objc_release+16.
+//
+// Wails itself never hits this because every one of its own ExecJS calls is
+// fanned out onto a goroutine through a buffered channel (see
+// startMessageProcessor / startBindingsMessageProcessor in its frontend.go) —
+// the bug is only reachable by an app like this one, which drives the Wails
+// runtime from native main-thread callbacks: the Dock-activation observer in
+// dock_darwin.m and energye/systray's menu/click callbacks, both of which run
+// the Go handler synchronously on the main thread.
+//
+// So: hand the emit to a fresh goroutine, which can never be the main thread
+// (Wails locks goroutine 1 to it for the lifetime of the event loop, and a
+// locked M runs nothing else), and block until it has finished so that callers
+// keep exactly the ordering and synchronous semantics of a direct call.
+//
+// If Wails ever fixes ExecJS upstream this whole detour can collapse back into
+// a plain wailsruntime.EventsEmit — nothing else depends on it.
+func emitEvent(ctx context.Context, name string, data ...interface{}) {
+	if ctx == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wailsruntime.EventsEmit(ctx, name, data...)
+	}()
+	<-done
+}
+
 // ShowSettings reveals the Wails window and asks the frontend to navigate to
 // the settings page (tray.App / Bridge.ShowSettings). It replaces the old
 // Qt shell/settings-controller pair, which main() no longer constructs.
 func (a *app) ShowSettings() {
 	if ctx := a.ctxSnapshot(); ctx != nil {
 		wailsruntime.WindowShow(ctx)
-		wailsruntime.EventsEmit(ctx, "nav:settings", nil)
+		emitEvent(ctx, "nav:settings", nil)
 	}
 	a.setWindowVisible(true)
 }
@@ -774,7 +838,7 @@ func (a *app) ShowSettings() {
 func (a *app) ShowStatus() {
 	if ctx := a.ctxSnapshot(); ctx != nil {
 		wailsruntime.WindowShow(ctx)
-		wailsruntime.EventsEmit(ctx, "nav:status", nil)
+		emitEvent(ctx, "nav:status", nil)
 	}
 	a.setWindowVisible(true)
 }
@@ -1072,7 +1136,7 @@ func (a *app) reportCheckResult(heading, body string) {
 	if ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(ctx, "update:check-result", struct {
+	emitEvent(ctx, "update:check-result", struct {
 		Heading string `json:"heading"`
 		Body    string `json:"body"`
 	}{heading, body})
@@ -1132,7 +1196,7 @@ func (a *app) pump() {
 		}
 		a.tray.Apply(e)
 		if ctx := a.ctxSnapshot(); ctx != nil {
-			wailsruntime.EventsEmit(ctx, "tunnel:event", uistate.ViewFor(e))
+			emitEvent(ctx, "tunnel:event", uistate.ViewFor(e))
 		}
 		// A terminal, broken-install failure (tunnel.ErrPermanent, whose
 		// Error() text carries "install is broken") means the privileged path
@@ -1666,8 +1730,7 @@ func main() {
 		log.Fatal(err)
 	}
 	a.tray = ctrl
-	log.Print("tray: system tray menu installed")
-	tray.SetTooltip("OpenFortiTray")
+	log.Print("tray: registered, awaiting Start from Wails' OnStartup")
 
 	// Desktop notifications for the transitions worth interrupting for (see
 	// notifyFor), via the tray icon's own native balloon/banner.
@@ -1692,7 +1755,7 @@ func main() {
 		log.Print("onConnectIssue: showing settings window")
 		a.ShowSettings()
 		if ctx := a.ctxSnapshot(); ctx != nil {
-			wailsruntime.EventsEmit(ctx, "settings:issue", i.Message)
+			emitEvent(ctx, "settings:issue", i.Message)
 		}
 	}
 

@@ -111,55 +111,66 @@ type Controller struct {
 	// the window or hide it, based on the window's current visibility — see
 	// cmd/openfortitray's onTrayClick.
 	onIconClick func()
+
+	// start and end are systray.RunWithExternalLoop's returned closures.
+	// They MUST be invoked from the host toolkit's own main-thread lifecycle
+	// (Wails' OnStartup/OnShutdown, via Start/End below) rather than from a
+	// spawned goroutine: energye/systray's package init() calls
+	// runtime.LockOSThread() with no matching Unlock, permanently pinning
+	// whichever goroutine runs it (main.main()'s own goroutine) to OS thread
+	// 0. On Catalina+, nativeLoop's `[NSApp run]` (invoked by systray.Run,
+	// the non-external-loop entry point) hard-traps (SIGTRAP) if it isn't
+	// called from that exact thread — which a plain `go systray.Run(...)`
+	// can never guarantee. RunWithExternalLoop's nativeStart, by contrast,
+	// never calls `[NSApp run]` at all: it only sets the Cocoa delegate and
+	// fires applicationDidFinishLaunching directly. That call itself is
+	// NOT thread-marshalled, though (only some of systray's OTHER native
+	// calls, e.g. SetIcon, go through performSelectorOnMainThread) — it
+	// creates the NSStatusItem right there, so it still needs to actually
+	// run on the real main thread, which is what Start's runOnMainThread
+	// wrapper is for. Both of these were real, shipped v0.3.0 crashes — see
+	// git history for the postmortem.
+	start, end func()
+
+	// ready and readyErr let Start block until onReady (spawned on its own
+	// goroutine by systray.Register, independent of start's caller — see
+	// Start's comment) has actually finished building the menu, matching the
+	// synchronous contract Setup used to provide directly.
+	ready    chan struct{}
+	readyErr error
 }
 
-// Setup builds the tray icon and menu. energye/systray's Run(onReady, onExit)
-// blocks the calling goroutine until systray.Quit() is called, so it is run
-// in its own goroutine here and Setup blocks only until the menu has been
-// built, matching the synchronous contract callers (cmd/openfortitray) already
-// depend on: `ctrl, err := tray.Setup(a)` returns once the tray exists, not
-// once the process quits.
-//
-// The error return is kept for API compatibility with the pre-Wails shape;
-// systray has no construction-time failure mode analogous to fyne's headless
-// driver, so this never actually fails today.
-//
-// onIconClick is called (if non-nil) whenever the tray icon itself is
-// clicked, in place of the show-then-reveal sequence a menu item like "Open"
-// uses — it lets the caller own the full toggle decision (position+reveal,
-// or hide) without internal/tray importing Wails to do so itself, or
-// tracking window-visibility state that belongs to the caller (see
+// Setup registers the tray icon and menu's callbacks but does not start
+// anything native yet — see Start's doc comment for why. onIconClick is
+// called (if non-nil) whenever the tray icon itself is clicked, in place of
+// the show-then-reveal sequence a menu item like "Open" uses — it lets the
+// caller own the full toggle decision (position+reveal, or hide) without
+// internal/tray importing Wails to do so itself, or tracking
+// window-visibility state that belongs to the caller (see
 // cmd/openfortitray's onTrayClick/windowVisible). A nil onIconClick (e.g. in
 // tests) means the tray icon click does nothing.
 func Setup(app App, onIconClick func()) (*Controller, error) {
-	c := &Controller{app: app, currentKind: uistate.KindIdle, onIconClick: onIconClick}
+	c := &Controller{
+		app:         app,
+		currentKind: uistate.KindIdle,
+		onIconClick: onIconClick,
+		ready:       make(chan struct{}),
+	}
 
-	ready := make(chan struct{})
-	var setupErr error
-	go systray.Run(func() {
+	onReady := func() {
 		// The recover MUST live here, inside onReady itself, rather than
-		// wrapped around this `go systray.Run(...)` call. Verified by reading
-		// systray.go's Register (which systray.Run calls internally):
+		// wrapped around Start's call to c.start(). Verified by reading
+		// systray.go's Register (which RunWithExternalLoop calls internally):
 		// `// Run onReady on separate goroutine to avoid blocking event loop
 		// go func() { <-readyCh; onReady() }()` — onReady is invoked on a
-		// goroutine spawned inside Register, independent of whatever
-		// goroutine is executing systray.Run/Register's own body (which, by
-		// the time onReady runs, is blocked deeper inside Run's nativeLoop
-		// call). A recover() around the `go systray.Run(...)` call would sit
-		// on the WRONG goroutine and never see a panic thrown from in here.
-		//
-		// If onReady panics before reaching close(ready) below (a native cgo
-		// issue, a bad app.Version() call, some future platform quirk), an
-		// unrecovered panic on its goroutine would otherwise be process-fatal
-		// in Go, or — absent that — leave Setup's caller blocked on <-ready
-		// forever. Recovering here turns either outcome into an ordinary
-		// error return, which is what Setup's signature already promises
-		// callers.
+		// goroutine Register spawns itself, independent of whatever goroutine
+		// called c.start(). A recover() around that call would sit on the
+		// WRONG goroutine and never see a panic thrown from in here.
 		defer func() {
 			if r := recover(); r != nil {
-				setupErr = fmt.Errorf("tray: panic during setup: %v", r)
-				close(ready) // unblock Setup's caller even though onReady never finished
+				c.readyErr = fmt.Errorf("tray: panic during setup: %v", r)
 			}
+			close(c.ready)
 		}()
 
 		c.icons = make(map[uistate.Kind][]byte, 4)
@@ -185,20 +196,47 @@ func Setup(app App, onIconClick func()) (*Controller, error) {
 				c.onIconClick()
 			}
 		})
+	}
 
-		close(ready)
-	}, func() {})
-	<-ready
+	c.start, c.end = systray.RunWithExternalLoop(onReady, func() {})
 
-	return c, setupErr
+	return c, nil
 }
 
-// SetTooltip sets the menu-bar icon's hover tooltip. Kept as a free function
-// (matching the shape callers already use) since energye/systray's
-// SetTooltip is itself a package-level function, not a method on some
-// returned icon handle.
-func SetTooltip(text string) {
-	systray.SetTooltip(text)
+// Start actually installs the tray icon. It should be called from the host
+// toolkit's own startup lifecycle hook — cmd/openfortitray wires this into
+// Wails' OnStartup — never from a bare `go` statement: see the
+// Controller.start field comment for the crash that avoids. That alone is
+// NOT sufficient on darwin, though: Wails' own OnStartup callback itself
+// runs on a goroutine ITS frontend spawns (Frontend.Run.func1), not on the
+// goroutine Go's runtime actually has locked to OS thread 0 — confirmed by a
+// second real shipped crash, AppKit's own "NSWindow should only be
+// instantiated on the main thread!" assertion, thrown from inside
+// energye/systray's nativeStart. runOnMainThread (mainthread_darwin.go)
+// closes that gap by dispatching the call onto the real main thread via
+// libdispatch regardless of which goroutine Start runs on; see its own doc
+// comment for the mechanism, and mainthread_other.go for why other
+// platforms don't need it.
+//
+// Start blocks until onReady has finished building the menu, matching the
+// synchronous guarantee Setup used to provide directly, and returns any
+// panic onReady recovered from.
+func (c *Controller) Start() error {
+	defer func() {
+		if r := recover(); r != nil {
+			c.readyErr = fmt.Errorf("tray: panic during start: %v", r)
+		}
+	}()
+	runOnMainThread(c.start)
+	<-c.ready
+	return c.readyErr
+}
+
+// End tears the tray icon down. It MUST be called from the same main-thread
+// lifecycle the host toolkit calls Start from — cmd/openfortitray wires this
+// into Wails' OnShutdown.
+func (c *Controller) End() {
+	c.end()
 }
 
 // ShowMessage posts a desktop notification via beeep, the cross-platform

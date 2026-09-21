@@ -9,6 +9,13 @@
 }
 
 * { box-sizing: border-box; }
+/* Author CSS always wins over the UA stylesheet's `[hidden] { display: none }`
+   rule, regardless of selector specificity -- so any element here with its
+   own `display` declaration (.page's `display: flex`, .status-ring's flex
+   children) silently ignores the native `hidden` attribute the JS toggles.
+   !important restores it globally, for every element, rather than patching
+   each one individually as the bug is found. */
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -68,7 +75,14 @@ input { font-family: inherit; }
 .btn-primary.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
 
 .card { border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); }
-.details-card { padding: 14px 16px; display: grid; grid-template-columns: auto 1fr; row-gap: 10px; column-gap: 14px; font-size: 13px; }
+/* The grid belongs on each .row, not on .details-card itself: .details-card's
+   direct children are the .row divs, not the .k/.v spans, so a grid here
+   mapped .row items across a 2-column grid (Gateway's row next to Protocol's
+   row) instead of laying out each row's own label/value pair -- collapsing
+   the label straight into its value with no gap, and letting the value
+   overflow the card's right edge instead of wrapping inside its own column. */
+.details-card { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.details-card .row { display: grid; grid-template-columns: auto 1fr; column-gap: 14px; }
 .details-card .k { color: var(--secondary); }
 .details-card .v { color: var(--text); text-align: right; }
 
