@@ -51,9 +51,30 @@ winres:
 	go run $(RSRC) -manifest $(MANIFEST) -ico $(WIN_ICO) -arch amd64 -o $(SYSO_AMD64)
 	go run $(RSRC) -manifest $(MANIFEST) -ico $(WIN_ICO) -arch arm64 -o $(SYSO_ARM64)
 
+# -tags production selects Wails' real internal/app CreateApp/Run
+# implementation. Without it, wails.Run() fails immediately at startup with
+# "Wails applications will not build without the correct build tags." — every
+# platform, since the default (no-tags) build compiles in a stub that always
+# returns that error. See release.yml's darwin build step for the full
+# postmortem (v0.3.0 shipped without this tag, masked by an unrelated crash
+# that always hit first).
+WAILS_TAGS := production
+
+# Wails' darwin frontend (WailsContext.m) references UTType, which lives in
+# UniformTypeIdentifiers.framework — but none of that frontend's own cgo
+# LDFLAGS directives link it (upstream gap in wails v2.9.2), so a darwin
+# build under -tags production fails at link time with "Undefined symbols
+# ... _OBJC_CLASS_$_UTType" unless this is supplied from outside. darwin-only:
+# `-framework` is clang/ld64 syntax that a linux or windows cgo link would
+# reject.
+DARWIN_CGO_LDFLAGS := -framework UniformTypeIdentifiers
+
 build:
 	@case "$$(uname -s)" in MINGW*|MSYS*|CYGWIN*|Windows*) $(MAKE) winres ;; esac
-	go build -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG)
+	@case "$$(uname -s)" in \
+		Darwin*) CGO_LDFLAGS="$(DARWIN_CGO_LDFLAGS)" go build -tags $(WAILS_TAGS) -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG) ;; \
+		*) go build -tags $(WAILS_TAGS) -ldflags="$(LDFLAGS_VER)" -o $(BIN) $(PKG) ;; \
+	esac
 
 test:
 	go vet ./...
@@ -103,15 +124,15 @@ LDFLAGS_VER := -X main.version=$(VERSION)
 release: clean
 	mkdir -p $(DIST)
 ifeq ($(shell uname -s),Darwin)
-	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CGO_LDFLAGS="$(DARWIN_CGO_LDFLAGS)" go build -tags $(WAILS_TAGS) -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-darwin-arm64 $(PKG)
 	@file $(DIST)/$(BIN)-darwin-arm64 | grep -q 'arm64'
 	@echo "make release: built darwin arm64. linux/windows come from CI (native runners)."
 else ifeq ($(shell uname -s),Linux)
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags $(WAILS_TAGS) -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER)" -o $(DIST)/$(BIN)-linux-amd64 $(PKG)
 	@echo "make release: built linux amd64. darwin/windows come from CI (native runners)."
 else
 	$(MAKE) winres
-	CGO_ENABLED=0 GOARCH=amd64 go build -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
+	CGO_ENABLED=0 GOARCH=amd64 go build -tags $(WAILS_TAGS) -ldflags="$(LDFLAGS_TRIM) $(LDFLAGS_VER) -H=windowsgui" -o $(DIST)/$(BIN)-windows-amd64.exe $(PKG)
 	@echo "make release: built windows amd64 (manifest embedded, runs elevated). darwin/linux come from CI (native runners)."
 endif
 	@ls -l $(DIST)

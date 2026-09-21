@@ -76,11 +76,22 @@ jobs:
         # -s -w strips the symbol table and DWARF to trim the binary's size.
         # No PKG_CONFIG_PATH/Qt pkg-config wiring needed: Wails' darwin
         # frontend links Cocoa/WebKit, both system frameworks with no
-        # pkg-config lookup required.
+        # pkg-config lookup required. -tags production selects Wails'
+        # internal/app real CreateApp/Run implementation; without it every
+        # platform's build falls back to a stub that fails wails.Run() at
+        # startup with "Wails applications will not build without the
+        # correct build tags." (v0.3.0 shipped without this tag on all three
+        # platforms — masked there by tray.Setup's now-fixed startup crash,
+        # which always hit first). CGO_LDFLAGS supplies
+        # UniformTypeIdentifiers.framework, which Wails' darwin frontend
+        # (WailsContext.m, UTType) needs but doesn't link itself under
+        # -tags production — an upstream gap in wails v2.9.2 — so the plain
+        # `go build` here would otherwise fail at link time with "Undefined
+        # symbols ... _OBJC_CLASS_$_UTType".
         run: |
           mkdir -p dist
-          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CGO_LDFLAGS="-framework UniformTypeIdentifiers" \
+            go build -tags production -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-darwin-arm64 ./cmd/openfortitray
           ls -l dist
 
       - name: Verify architecture
@@ -168,7 +179,7 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-            go build -tags webkit2_41 -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
+            go build -tags webkit2_41,production -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/openfortitray-linux-amd64 ./cmd/openfortitray
           ls -l dist
 
       - name: Checksum linux binary
@@ -238,7 +249,7 @@ jobs:
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOARCH=amd64 \
-            go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
+            go build -tags production -ldflags="-s -w -X main.version=${GITHUB_REF_NAME} -H=windowsgui" -o dist/openfortitray-windows-amd64.exe ./cmd/openfortitray
           ls -l dist
 
       # No Mesa/software-OpenGL bundling and no Qt6 runtime/DLL-closure

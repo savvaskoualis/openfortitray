@@ -9,7 +9,6 @@ import (
 
 	"github.com/savvaskoualis/openfortitray/internal/update"
 	"github.com/savvaskoualis/openfortitray/internal/xopen"
-	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // pendingUpdate is what's been downloaded and is waiting for the user to
@@ -29,7 +28,7 @@ func (a *app) promptUpdate(rel *update.Release) {
 	if ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(ctx, "update:offer", rel.Tag)
+	emitEvent(ctx, "update:offer", rel.Tag)
 }
 
 // prepareUpdate downloads the update with the app still running (replacing
@@ -47,7 +46,7 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		if err != nil {
 			log.Printf("update: prepare failed: %v", err)
 			if wctx := a.ctxSnapshot(); wctx != nil {
-				wailsruntime.EventsEmit(wctx, "update:failed", err.Error())
+				emitEvent(wctx, "update:failed", err.Error())
 			}
 			return
 		}
@@ -56,7 +55,7 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		a.pendingUpdate = &pendingUpdate{method: method, prepared: p, rel: rel}
 		a.pendingUpdateMu.Unlock()
 		if wctx := a.ctxSnapshot(); wctx != nil {
-			wailsruntime.EventsEmit(wctx, "update:ready", rel.Tag)
+			emitEvent(wctx, "update:ready", rel.Tag)
 		}
 	}()
 }

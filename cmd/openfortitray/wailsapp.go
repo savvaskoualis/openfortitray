@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"embed"
+	"log"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
+	"github.com/wailsapp/wails/v2/pkg/options/mac"
+	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -139,11 +143,34 @@ func buildAppOptions(a *app, assets embed.FS) *options.App {
 		// tray click (see main.go's dock-activation comment for the same
 		// design intent, carried over from the Qt era).
 		StartHidden: true,
+		// The frontend (main.css: `.page { border-radius: 14px; box-shadow:
+		// ...; }`, `body { background: transparent; }`) is authored as a
+		// floating rounded card over the desktop, Tailscale-style -- it
+		// assumes the native window itself is fully transparent outside the
+		// card's own rounded rect. Without these, the native window/webview
+		// paint opaque (white or black) behind the card, so the four corners
+		// between the card's curve and the window's actual square edge show
+		// as solid blocks instead of see-through -- a real, previously-missed
+		// wiring gap from the Wails migration (the frontend always assumed
+		// this; buildAppOptions never actually asked Wails for it).
+		BackgroundColour: &options.RGBA{R: 0, G: 0, B: 0, A: 0},
+		Mac:              &mac.Options{WebviewIsTransparent: true},
+		Windows:          &windows.Options{WebviewIsTransparent: true},
+		Linux:            &linux.Options{WindowIsTranslucent: true},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
 		OnStartup: func(ctx context.Context) {
 			a.setCtx(ctx)
+			// The tray's native install MUST happen from here, not from
+			// tray.Setup itself — see internal/tray.Controller.Start's doc
+			// comment for why a bare goroutine crashes.
+			if err := a.tray.Start(); err != nil {
+				log.Fatal(err)
+			}
+		},
+		OnShutdown: func(ctx context.Context) {
+			a.tray.End()
 		},
 		Bind: []interface{}{bridge},
 	}
