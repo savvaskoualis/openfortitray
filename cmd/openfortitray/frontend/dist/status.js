@@ -85,23 +85,23 @@ window.addEventListener("DOMContentLoaded", () => {
     });
 
     window.runtime.EventsOn("update:check-result", (r) => {
-      alert(r.heading + "\n\n" + r.body);
+      OFT.alertBox(r.heading + "\n\n" + r.body);
     });
 
     window.runtime.EventsOn("update:offer", (tag) => {
       document.getElementById("update-badge").hidden = false;
-      if (confirm("OpenFortiTray " + tag + " is available. Download it now? (The VPN stays connected during download.)")) {
-        OFT.call("DownloadUpdate");
-      }
+      OFT.confirm("OpenFortiTray " + tag + " is available. Download it now? (The VPN stays connected during download.)").then((ok) => {
+        if (ok) OFT.call("DownloadUpdate");
+      });
     });
     window.runtime.EventsOn("update:ready", (tag) => {
       document.getElementById("update-badge").hidden = false;
-      if (confirm("OpenFortiTray " + tag + " is ready to install. Restart now? (The app will close and reopen automatically.)")) {
-        OFT.call("RestartAndInstall");
-      }
+      OFT.confirm("OpenFortiTray " + tag + " is ready to install. Restart now? (The app will close and reopen automatically.)").then((ok) => {
+        if (ok) OFT.call("RestartAndInstall");
+      });
     });
     window.runtime.EventsOn("update:failed", (err) => {
-      alert("The update could not be downloaded. Nothing has changed.\n\n" + err);
+      OFT.alertBox("The update could not be downloaded. Nothing has changed.\n\n" + err);
     });
   }
 });

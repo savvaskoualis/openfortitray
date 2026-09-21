@@ -46,6 +46,16 @@ func CursorPosition() (x, y int, ok bool) {
 	return int(pt.X), int(pt.Y), true
 }
 
+// CursorScreenFrame is not implemented on Windows yet -- ok is always false,
+// so positionWindow falls back to its existing primary-screen-sized clamp
+// (see cmd/openfortitray/position.go). This means the multi-monitor fix
+// (clamping against the screen the cursor is actually on, not always
+// primary) is darwin-only for now; unlike SetWindowPosition, a Windows
+// MonitorFromPoint/GetMonitorInfo equivalent has not been added here.
+func CursorScreenFrame() (originX, originY, w, h int, ok bool) {
+	return 0, 0, 0, 0, false
+}
+
 // SetWindowPosition moves the top-level window whose exact title matches
 // title (found via FindWindowW, no class-name filter) to an absolute
 // virtual-screen position (x, y) -- the same coordinate space

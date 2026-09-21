@@ -23,6 +23,35 @@ int oft_cursor_position(double *x, double *y) {
     return 1;
 }
 
+int oft_cursor_screen_frame(double *originX, double *originY, double *width, double *height) {
+    NSArray<NSScreen *> *screens = [NSScreen screens];
+    if (screens.count == 0) {
+        return 0;
+    }
+    NSScreen *primary = screens[0];
+    NSPoint loc = [NSEvent mouseLocation];
+
+    NSScreen *target = primary;
+    for (NSScreen *s in screens) {
+        if (NSMouseInRect(loc, s.frame, NO)) {
+            target = s;
+            break;
+        }
+    }
+
+    // Convert target's TOP-LEFT corner (AppKit's bottom-left-origin global
+    // space has that at (origin.x, origin.y + height), since y increases
+    // upward there) into primary-relative, top-left-origin space -- the
+    // exact same conversion oft_cursor_position applies to the cursor point
+    // itself, so callers can compare the two directly.
+    *originX = target.frame.origin.x - primary.frame.origin.x;
+    *originY = primary.frame.size.height -
+        ((target.frame.origin.y + target.frame.size.height) - primary.frame.origin.y);
+    *width = target.frame.size.width;
+    *height = target.frame.size.height;
+    return 1;
+}
+
 int oft_set_window_position(const char *title, double topLeftX, double topLeftY) {
     NSArray<NSScreen *> *screens = [NSScreen screens];
     if (screens.count == 0) {
@@ -47,6 +76,14 @@ int oft_set_window_position(const char *title, double topLeftX, double topLeftY)
         double bottomLeftX = primary.frame.origin.x + topLeftX;
         double bottomLeftY = primary.frame.origin.y + primary.frame.size.height - topLeftY - f.size.height;
         [w setFrameOrigin:NSMakePoint(bottomLeftX, bottomLeftY)];
+        // AppKit auto-generates its own drop shadow following the window's
+        // real (square) frame, since Frameless doesn't turn that off by
+        // itself. With WebviewIsTransparent making everything outside the
+        // CSS card's rounded corners see-through, that square native shadow
+        // shows through past the rounded corners -- worst at the bottom,
+        // where a downward-biased shadow is strongest. The CSS box-shadow on
+        // .page is the only shadow this window should have.
+        [w setHasShadow:NO];
         return 1;
     }
     return 0;

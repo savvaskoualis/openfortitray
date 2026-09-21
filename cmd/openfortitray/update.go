@@ -23,7 +23,14 @@ type pendingUpdate struct {
 // promptUpdate emits the update offer to the frontend, replacing the old
 // Qt QDialog's offer state. The frontend (frontend/dist/status.js) shows a
 // confirm() and, on yes, calls Bridge.DownloadUpdate.
+//
+// ShowStatus first: confirm() is a modal sheet on the native window, and this
+// can fire from a background check while the window is StartHidden or has
+// auto-hidden itself (app.js hides it on blur). A confirm() attached to a
+// hidden window is not visibly interactive -- clicks land nowhere, which is
+// exactly what silently swallowed "update and restart" clicks in testing.
 func (a *app) promptUpdate(rel *update.Release) {
+	a.ShowStatus()
 	ctx := a.ctxSnapshot()
 	if ctx == nil {
 		return
@@ -45,6 +52,7 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		p, err := update.Prepare(ctx, method, a.downloaderFor(rel))
 		if err != nil {
 			log.Printf("update: prepare failed: %v", err)
+			a.ShowStatus()
 			if wctx := a.ctxSnapshot(); wctx != nil {
 				emitEvent(wctx, "update:failed", err.Error())
 			}
@@ -54,6 +62,9 @@ func (a *app) prepareUpdate(rel *update.Release) {
 		a.pendingUpdateMu.Lock()
 		a.pendingUpdate = &pendingUpdate{method: method, prepared: p, rel: rel}
 		a.pendingUpdateMu.Unlock()
+		// Same reasoning as promptUpdate: this confirm() needs a visible
+		// window to actually be clickable.
+		a.ShowStatus()
 		if wctx := a.ctxSnapshot(); wctx != nil {
 			emitEvent(wctx, "update:ready", rel.Tag)
 		}
