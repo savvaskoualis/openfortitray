@@ -46,6 +46,15 @@ func (b *Bridge) SaveConfig(cfg config.Config) *settings.Issue {
 	return nil
 }
 
+// NewProfileTemplate returns a fresh profile shaped by config.NewProfile —
+// the frontend's "+ Add profile" appends this to its working copy rather
+// than hand-building a blank profile object in JS, so its defaults (port
+// 10443, SAML auth, DTLS on, warn-on-invalid-certificate, ...) never drift
+// from the ones Load already synthesises for a fresh install.
+func (b *Bridge) NewProfileTemplate(name string) config.Profile {
+	return config.NewProfile(name)
+}
+
 func (b *Bridge) Connect()    { b.a.Connect() }
 func (b *Bridge) Disconnect() { b.a.Disconnect() }
 
