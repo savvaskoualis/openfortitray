@@ -137,4 +137,63 @@ input { font-family: inherit; }
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal-box { width: 300px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 18px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
 .modal-message { font-size: 13px; color: var(--text); white-space: pre-wrap; line-height: 1.4; margin-bottom: 16px; }
+.modal-input {
+  width: 100%; height: 34px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--card-bg); color: var(--text); padding: 0 10px; font-size: 13px;
+  margin-bottom: 16px;
+}
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Profile switcher: replaces the plain "Settings" title with a clickable
+   pill showing the active profile, opening a short dropdown list. */
+.profile-switcher { position: relative; }
+.profile-pill {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600; color: var(--text);
+  padding: 4px 8px; border-radius: 7px;
+}
+.profile-pill:hover { background: var(--card-bg); }
+.profile-pill svg { color: var(--secondary); }
+/* right: 0 (not left: 0) -- the pill sits near the titlebar's right edge
+   (title bar is space-between with the back button), so a menu anchored to
+   the pill's LEFT edge extends further right than the 380px window itself
+   and gets clipped by .page's overflow:hidden. Anchoring to the pill's
+   right edge instead grows the menu leftward, which fits. */
+.profile-menu {
+  position: absolute; top: 32px; right: 0; z-index: 10;
+  width: 200px; background: var(--card-bg); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); padding: 6px;
+}
+.profile-item {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 8px 10px; border-radius: 7px; font-size: 13px; color: var(--text); text-align: left;
+}
+.profile-item:hover { background: var(--bg); }
+.profile-item .check { color: var(--accent); }
+.profile-menu hr { border: none; border-top: 1px solid var(--border); margin: 6px 2px; }
+.profile-item.add { color: var(--accent); font-weight: 600; }
+
+/* Advanced disclosure: collapsed by default, keeps Connection's common case
+   exactly as short as it was before this was added. */
+.disclosure {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; color: var(--secondary);
+  padding: 6px 2px;
+}
+.disclosure svg { transition: transform 0.15s; }
+.disclosure.open svg { transform: rotate(90deg); }
+.disclosure-body { display: flex; flex-direction: column; gap: 14px; padding-top: 4px; }
+
+.radio-group { display: flex; gap: 6px; }
+.radio-chip {
+  flex: 1; text-align: center; font-size: 12px; font-weight: 600; color: var(--secondary);
+  padding: 7px 0; border-radius: 8px; border: 1px solid var(--border); background: var(--card-bg);
+}
+.radio-chip.active { color: #FFFFFF; background: var(--accent); border-color: var(--accent); }
+
+.field textarea {
+  border-radius: 8px; border: 1px solid var(--border);
+  background: var(--card-bg); color: var(--text); padding: 8px 10px; font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace; resize: none; height: 56px; width: 100%;
+}
+.field .hint-inline { font-weight: 400; text-transform: none; letter-spacing: normal; }

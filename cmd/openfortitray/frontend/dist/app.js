@@ -22,6 +22,7 @@ OFT.modal = function (message, { showCancel = false } = {}) {
   return new Promise((resolve) => {
     const overlay = document.getElementById("modal-overlay");
     document.getElementById("modal-message").textContent = message;
+    document.getElementById("modal-input").hidden = true;
     const okBtn = document.getElementById("modal-ok");
     const cancelBtn = document.getElementById("modal-cancel");
     cancelBtn.hidden = !showCancel;
@@ -39,6 +40,39 @@ OFT.modal = function (message, { showCancel = false } = {}) {
 };
 OFT.confirm = (message) => OFT.modal(message, { showCancel: true });
 OFT.alertBox = (message) => OFT.modal(message, { showCancel: false });
+
+// OFT.promptText is OFT.modal's text-input sibling, replacing
+// window.prompt() for the same reason (silent no-op in this webview).
+// Resolves to the trimmed entered text, or null on Cancel/empty.
+OFT.promptText = function (message, { placeholder = "" } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById("modal-overlay");
+    document.getElementById("modal-message").textContent = message;
+    const input = document.getElementById("modal-input");
+    input.value = "";
+    input.placeholder = placeholder;
+    input.hidden = false;
+    const okBtn = document.getElementById("modal-ok");
+    const cancelBtn = document.getElementById("modal-cancel");
+    cancelBtn.hidden = false;
+
+    const done = (result) => {
+      overlay.hidden = true;
+      input.hidden = true;
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+      input.onkeydown = null;
+      resolve(result);
+    };
+    okBtn.onclick = () => done(input.value.trim() || null);
+    cancelBtn.onclick = () => done(null);
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") done(input.value.trim() || null);
+    };
+    overlay.hidden = false;
+    input.focus();
+  });
+};
 
 window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-open-settings").addEventListener("click", () => OFT.showPage("page-settings"));

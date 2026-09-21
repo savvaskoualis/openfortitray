@@ -57,7 +57,13 @@
     <button id="btn-back" class="icon-btn" aria-label="Back" style="--wails-draggable: no-drag;">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
     </button>
-    <span>Settings</span>
+    <div id="profile-switcher" class="profile-switcher" style="--wails-draggable: no-drag;">
+      <button id="profile-pill" class="profile-pill" aria-haspopup="true" aria-expanded="false">
+        <span id="profile-pill-label">Settings</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div id="profile-menu" class="profile-menu" hidden></div>
+    </div>
   </div>
 
   <div class="tabs">
@@ -73,12 +79,40 @@
       <label class="field">Port
         <input id="f-port" type="text" style="width: 90px;">
       </label>
+
+      <button id="disclosure-advanced" class="disclosure" aria-expanded="false">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+        Show advanced
+      </button>
+      <div id="advanced-body" class="disclosure-body" hidden>
+        <label class="field">Server certificate
+          <div id="cert-mode-group" class="radio-group">
+            <button type="button" class="radio-chip" data-mode="warn">Warn</button>
+            <button type="button" class="radio-chip" data-mode="trust">Trust</button>
+            <button type="button" class="radio-chip" data-mode="pin">Pin</button>
+          </div>
+        </label>
+        <label id="cert-pin-field" class="field" hidden>Certificate fingerprint (sha256)
+          <input id="f-cert-pin" type="text" placeholder="AA:BB:CC:…">
+        </label>
+        <label class="field">Split DNS <span class="hint-inline">(one domain per line, optional)</span>
+          <textarea id="f-split-dns" placeholder="corp.internal&#10;vpn.local"></textarea>
+        </label>
+      </div>
     </div>
 
     <div id="pane-advanced" class="pane" hidden>
       <div class="toggle-row">
         <div class="toggle-text"><span>Auto-connect on launch</span><span class="hint">Connect automatically when the app starts</span></div>
         <button id="t-autostart" class="switch" role="switch"><span class="knob"></span></button>
+      </div>
+      <div class="toggle-row">
+        <div class="toggle-text"><span>DTLS</span><span class="hint">Faster tunnel when the network allows UDP</span></div>
+        <button id="t-dtls" class="switch" role="switch"><span class="knob"></span></button>
+      </div>
+      <div class="toggle-row">
+        <div class="toggle-text"><span>Remember session</span><span class="hint">Skip SAML sign-in on reconnect until it expires</span></div>
+        <button id="t-remember-session" class="switch" role="switch"><span class="knob"></span></button>
       </div>
     </div>
 
@@ -98,6 +132,7 @@
 <div id="modal-overlay" class="modal-overlay" hidden>
   <div class="modal-box">
     <div id="modal-message" class="modal-message"></div>
+    <input id="modal-input" class="modal-input" type="text" hidden>
     <div class="modal-actions">
       <button id="modal-cancel" class="btn-secondary" hidden>Cancel</button>
       <button id="modal-ok" class="btn-accent">OK</button>
