@@ -31,7 +31,13 @@ input { font-family: inherit; }
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.28);
+  /* A big blur radius here is expensive to recomposite on a transparent
+     window (WebviewIsTransparent) every frame of a drag -- the window server
+     has to reblend the shadow against whatever's on screen behind it, not
+     just redraw an opaque rect. Kept small on purpose; see also
+     oft_set_window_position's setHasShadow:NO, which removes AppKit's own
+     (redundant, square, more expensive) auto-shadow entirely. */
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
   border: 1px solid var(--border);
 }
 
@@ -127,3 +133,8 @@ input { font-family: inherit; }
 .settings-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px; padding: 14px; border-top: 1px solid var(--border); }
 .btn-secondary { height: 32px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--border); color: var(--text); font-size: 13px; font-weight: 600; }
 .btn-accent { height: 32px; padding: 0 16px; border-radius: 8px; background: var(--accent); color: #FFFFFF; font-size: 13px; font-weight: 600; }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-box { width: 300px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 18px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+.modal-message { font-size: 13px; color: var(--text); white-space: pre-wrap; line-height: 1.4; margin-bottom: 16px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }

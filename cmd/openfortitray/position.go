@@ -73,7 +73,7 @@ func (a *app) positionWindow() {
 	// returns no screens, or marks none as primary — so a lookup failure
 	// still places the window sanely rather than leaving it off-screen or
 	// crashing.
-	screenW, screenH := 1440, 900
+	screenX, screenY, screenW, screenH := 0, 0, 1440, 900
 	if screens, err := wailsruntime.ScreenGetAll(ctx); err == nil {
 		for _, s := range screens {
 			if s.IsPrimary {
@@ -82,9 +82,20 @@ func (a *app) positionWindow() {
 			}
 		}
 	}
+	// tray.CursorScreenFrame (darwin only for now) reports the bounds of the
+	// screen the cursor is ACTUALLY on, which is neither necessarily primary
+	// nor rooted at (0,0). Without this, clamping below always used
+	// primary's own size starting at (0,0) — which, on a multi-monitor Mac,
+	// silently dragged the window back onto primary any time the click that
+	// triggered this happened on a different screen. Falls back to
+	// (0, 0, primary size) — today's existing behaviour — when unavailable.
+	if ox, oy, w, h, ok := tray.CursorScreenFrame(); ok {
+		screenX, screenY, screenW, screenH = ox, oy, w, h
+	}
 
 	if cx, cy, ok := tray.CursorPosition(); ok {
-		x, y := tray.ClampToScreen(cx-windowW/2, cy+positionMargin, screenW, screenH, windowW, windowH, positionMargin)
+		x, y := tray.ClampToScreen(cx-windowW/2-screenX, cy+positionMargin-screenY, screenW, screenH, windowW, windowH, positionMargin)
+		x, y = x+screenX, y+screenY
 		if tray.SetWindowPosition(windowTitle, x, y) {
 			return
 		}

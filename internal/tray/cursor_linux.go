@@ -25,6 +25,15 @@ func CursorPosition() (x, y int, ok bool) {
 	return int(cx), int(cy), true
 }
 
+// CursorScreenFrame is not implemented on Linux yet -- ok is always false,
+// so positionWindow falls back to its existing primary-screen-sized clamp
+// (see cmd/openfortitray/position.go). The multi-monitor fix (clamping
+// against the screen the cursor is actually on, not always primary) is
+// darwin-only for now.
+func CursorScreenFrame() (originX, originY, w, h int, ok bool) {
+	return 0, 0, 0, 0, false
+}
+
 // SetWindowPosition moves the top-level window whose title matches title
 // to an absolute root-window position (x, y) -- the same coordinate space
 // CursorPosition already returns -- via the EWMH _NET_MOVERESIZE_WINDOW

@@ -24,6 +24,20 @@ func CursorPosition() (x, y int, ok bool) {
 	return int(cx), int(cy), true
 }
 
+// CursorScreenFrame returns the frame of whichever screen currently contains
+// the cursor -- top-left origin (originX, originY) and size (w, h) -- in the
+// same primary-relative, top-left-origin space CursorPosition reports in.
+// On a multi-monitor Mac, a screen to the left of or above primary reports a
+// negative origin here; that's correct and the caller must not clamp it
+// away. ok is false only if AppKit reports zero screens.
+func CursorScreenFrame() (originX, originY, w, h int, ok bool) {
+	var ox, oy, cw, ch C.double
+	if C.oft_cursor_screen_frame(&ox, &oy, &cw, &ch) == 0 {
+		return 0, 0, 0, 0, false
+	}
+	return int(ox), int(oy), int(cw), int(ch), true
+}
+
 // SetWindowPosition moves the NSWindow whose title matches title so its
 // top-left corner sits at (x, y) -- pixels from the top-left of the
 // primary screen, the same frame CursorPosition reports in -- by setting

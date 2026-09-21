@@ -1775,6 +1775,11 @@ func main() {
 			return
 		}
 		log.Print("dock: activated — showing the status window")
+		// Unlike onTrayClick, this path never called positionWindow -- the
+		// window just reappeared wherever it last was, which on a
+		// multi-monitor setup is not necessarily the screen the Dock click
+		// happened on. Match onTrayClick's cursor-relative placement here too.
+		a.positionWindow()
 		a.ShowStatus()
 	})
 

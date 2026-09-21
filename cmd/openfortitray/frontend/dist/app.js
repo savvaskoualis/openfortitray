@@ -13,6 +13,33 @@ OFT.showPage = function (id) {
   document.querySelectorAll(".page").forEach((el) => (el.hidden = el.id !== id));
 };
 
+// OFT.modal replaces window.confirm/alert: Wails' darwin WKUIDelegate never
+// implements the JS alert/confirm/prompt panel methods, so those calls are
+// silent no-ops in this webview -- no dialog ever appears, and confirm()
+// returns false immediately, so the code path it guards just never runs.
+// Resolves to true on OK, false on Cancel/dismiss.
+OFT.modal = function (message, { showCancel = false } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById("modal-overlay");
+    document.getElementById("modal-message").textContent = message;
+    const okBtn = document.getElementById("modal-ok");
+    const cancelBtn = document.getElementById("modal-cancel");
+    cancelBtn.hidden = !showCancel;
+
+    const done = (result) => {
+      overlay.hidden = true;
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+      resolve(result);
+    };
+    okBtn.onclick = () => done(true);
+    cancelBtn.onclick = () => done(false);
+    overlay.hidden = false;
+  });
+};
+OFT.confirm = (message) => OFT.modal(message, { showCancel: true });
+OFT.alertBox = (message) => OFT.modal(message, { showCancel: false });
+
 window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-open-settings").addEventListener("click", () => OFT.showPage("page-settings"));
   document.getElementById("btn-back").addEventListener("click", () => OFT.showPage("page-main"));

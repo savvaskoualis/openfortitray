@@ -91,6 +91,20 @@
   </div>
 </div>
 
+<!-- Wails' darwin WKUIDelegate never implements the JS alert/confirm/prompt
+     panel methods, so window.confirm()/alert() are silent no-ops in this
+     webview -- they show nothing and return false immediately. OFT.confirm/
+     OFT.alertBox (app.js) render this instead. -->
+<div id="modal-overlay" class="modal-overlay" hidden>
+  <div class="modal-box">
+    <div id="modal-message" class="modal-message"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn-secondary" hidden>Cancel</button>
+      <button id="modal-ok" class="btn-accent">OK</button>
+    </div>
+  </div>
+</div>
+
 <script src="./app.js"></script>
 <script src="./status.js"></script>
 <script src="./settings.js"></script>
