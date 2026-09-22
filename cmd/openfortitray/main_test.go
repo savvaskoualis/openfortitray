@@ -377,6 +377,47 @@ func TestOnSystemWakeDebouncesRapidWakes(t *testing.T) {
 	}
 }
 
+// The overnight storm case: a tunnel already sitting in the terminal Error
+// state (an earlier forced reconnect needed a SAML login nobody was there to
+// complete) must not be forced into another one on the NEXT wake, even
+// outside wakeReconnectCooldown — diagnosed live from tens of SAML browser
+// tabs opened overnight, one per wake outside the cooldown, because each
+// forced Connect() starts a brand-new supervisor loop whose own give-up
+// counters (maxConnectRounds, sessionEndedThreshold) never accumulate across
+// separate wake-triggered calls.
+func TestOnSystemWakeSkipsWhenTunnelNeedsAttention(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+
+	// Simulate an earlier forced reconnect's own doomed, unattended SAML
+	// attempt already having timed out and landed the tunnel in the
+	// terminal Error state — the exact outcome Connect's "sign-in didn't
+	// complete — click Connect" path produces. Setting it directly (rather
+	// than driving a real supervisor to it) keeps this test scoped to what
+	// onSystemWake itself does with that state, not pump()'s unrelated
+	// wiring (activity ring, tray, which newTestApp's bare fixture has no
+	// use for).
+	a.setLastEvent(tunnel.Event{State: tunnel.Error, Detail: "sign-in didn't complete — click Connect"})
+
+	// A wake outside the cooldown would normally force a reconnect (see
+	// TestOnSystemWakeForcesReconnectWhenWantConnected) — but with the
+	// tunnel already needing the user's attention, it must not.
+	a.lastWakeReconnectAt = time.Now().Add(-wakeReconnectCooldown - time.Second)
+	a.onSystemWake()
+
+	select {
+	case <-authCalled:
+		t.Error("onSystemWake forced another reconnect while the tunnel was already in the terminal Error state")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // A display wake must never touch the tunnel — it exists purely to
 // re-assert the tray icon (a.tray stays nil in this test setup, so there's
 // nothing to observe there beyond "does not panic"), unlike onSystemWake,
