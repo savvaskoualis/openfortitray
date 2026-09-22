@@ -565,6 +565,25 @@ func (a *app) onSystemWake() {
 			log.Printf("openfortitray: woke %v after the last forced reconnect (Power Nap?); leaving the session alone", since.Round(time.Second))
 			return
 		}
+		// A tunnel already sitting in the terminal Error state (from an earlier
+		// forced reconnect that needed a SAML login nobody was there to
+		// complete) means unattended: forcing another Disconnect+Connect here
+		// would just reopen the browser and time out again. cooldown alone
+		// doesn't catch this -- it only protects against wakes CLOSER together
+		// than wakeReconnectCooldown, but a real wake cadence (Power Nap,
+		// backups, mail checks) landing every 6-15 minutes is still outside
+		// that window every time, and a corporate SSO session can expire
+		// faster than that cadence. Diagnosed live: tens of SAML browser tabs
+		// opened overnight, one per wake outside the cooldown, because each
+		// forced Connect() is a brand-new supervisor loop whose own give-up
+		// logic (maxConnectRounds, sessionEndedThreshold) never accumulates
+		// across separate wake-triggered calls. Leave it alone until the user
+		// manually clicks Connect — that clears the Error state and this
+		// resumes forcing reconnects on future wakes.
+		if a.lastEventSnapshot().State == tunnel.Error {
+			log.Print("openfortitray: already needs the user's attention (sign-in required) — not forcing another reconnect on wake")
+			return
+		}
 		a.lastWakeReconnectAt = time.Now()
 		log.Print("openfortitray: resumed from sleep; forcing a fresh reconnect")
 		a.Disconnect()
