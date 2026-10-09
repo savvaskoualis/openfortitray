@@ -245,8 +245,24 @@ func (c *Controller) End() {
 // swallowed: cmd/openfortitray wires this as the app's best-effort notify seam
 // (a.notify), which every caller already nil-checks — a failed notification
 // is not something any caller can usefully react to.
+//
+// On macOS it posts through UNUserNotificationCenter as the app itself, so
+// clicking the banner reaches OnNotificationClick; beeep (osascript there) is
+// only the fallback, since its banners belong to Script Editor and a click
+// never comes back to this app.
 func ShowMessage(title, body string) {
+	if postNative(title, body) {
+		return
+	}
 	_ = beeep.Notify(title, body, "")
+}
+
+// OnNotificationClick sets what clicking one of ShowMessage's banners does.
+// macOS only for now; elsewhere it is recorded but never called.
+func OnNotificationClick(fn func()) {
+	notifyClickMu.Lock()
+	notifyClickFn = fn
+	notifyClickMu.Unlock()
 }
 
 // buildMenu builds the menu items. It must run inside systray.Run's onReady

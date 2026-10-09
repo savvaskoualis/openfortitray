@@ -1836,6 +1836,13 @@ func main() {
 	// Desktop notifications for the transitions worth interrupting for (see
 	// notifyFor), via the tray icon's own native balloon/banner.
 	a.notify = tray.ShowMessage
+	// Clicking a notification opens the status window, like a tray click.
+	tray.OnNotificationClick(func() {
+		log.Print("notify: clicked — showing the status window")
+		a.positionWindow()
+		a.ShowStatus()
+	})
+	tray.InitNotifications()
 
 	// Assert the Dock-visible (Regular) activation policy. No-op off darwin.
 	setDockActivationPolicy()
