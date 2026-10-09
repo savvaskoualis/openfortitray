@@ -419,3 +419,16 @@ func mustRead(t *testing.T, dir string) []byte {
 	}
 	return b
 }
+
+// A profile switched to IPsec in Settings with the proposals and remote
+// identity left blank must get their defaults on save, not only on the next
+// Load — otherwise strongSwan is handed empty proposals until a restart.
+func TestNormalizeFillsBlankIPsecFields(t *testing.T) {
+	c := &Config{Profiles: []Profile{{Name: "P", Gateway: "vpn.example.com", Backend: BackendIPsec}}}
+	c.Normalize()
+	ic := c.Profiles[0].IPsec
+	if ic.AuthMethod != IPsecAuthPSK || ic.IKEProposal != defaultIPsecProposal ||
+		ic.ESPProposal != defaultIPsecProposal || ic.RemoteID != "vpn.example.com" {
+		t.Errorf("Normalize left IPsec fields unset: %+v", ic)
+	}
+}
