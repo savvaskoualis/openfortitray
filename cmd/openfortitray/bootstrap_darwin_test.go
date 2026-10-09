@@ -10,6 +10,14 @@ import "testing"
 // nil-guards itself), so a bare &app{} — as used here, and as main() would
 // never actually construct one — must still be safe to call this on.
 func TestOfferBootstrapInstallDoesNotPanicOnBareApp(t *testing.T) {
+	orig := showBootstrapMessage
+	t.Cleanup(func() { showBootstrapMessage = orig })
+	var posted string
+	showBootstrapMessage = func(title, body string) { posted = title }
+
 	a := &app{}
 	a.offerBootstrapInstall() // must not panic
+	if posted == "" {
+		t.Error("offerBootstrapInstall posted no notification")
+	}
 }

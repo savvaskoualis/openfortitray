@@ -40,6 +40,11 @@ func (a *app) connectWithBootstrap() {
 	}()
 }
 
+// showBootstrapMessage posts offerBootstrapInstall's notification. A var so
+// tests can stub it — otherwise every `go test` run on a Mac pops a real
+// "VPN helper needs updating" banner that looks exactly like the app's own.
+var showBootstrapMessage = tray.ShowMessage
+
 // offerBootstrapInstall tells the user a privileged helper install/update is
 // needed, via a native OS notification, and points at the manual install
 // script. It does NOT attempt an automated install or show a confirmation
@@ -57,5 +62,5 @@ func (a *app) offerBootstrapInstall() {
 			"Run scripts/install-helper.sh in a Terminal, then try connecting again."
 	}
 	log.Printf("bootstrap: %s — %s", title, body)
-	tray.ShowMessage(title, body)
+	showBootstrapMessage(title, body)
 }
