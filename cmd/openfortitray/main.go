@@ -196,6 +196,17 @@ type app struct {
 	cookieRetryInterval time.Duration
 	cookieRetryWindow   time.Duration
 
+	// userPresent reports whether someone is actually at the machine (display
+	// awake and screen unlocked) — userPresentNow on macOS, nil (always
+	// present) elsewhere. presencePoll is how often waitForUser re-checks it.
+	// See waitForUser for why the SAML browser flow is gated on it.
+	userPresent  func() bool
+	presencePoll time.Duration
+	// wakeWaiting dedupes onSystemWake's deferred reconnect: Power Nap wakes
+	// every couple of minutes while the user is away, and they must collapse
+	// into ONE reconnect when the user returns, not one waiter per wake.
+	wakeWaiting atomic.Bool
+
 	// notify posts a desktop notification. It is tray.ShowMessage (via the
 	// system tray icon's native balloon/banner) in production and a recorder
 	// in tests; nil means "no notifications" (the pump null-checks it). Only
@@ -561,6 +572,30 @@ func (a *app) onSystemWake() {
 		if !wantConnected {
 			return
 		}
+		// A dark wake (Power Nap: display off, screen locked) is not the user
+		// coming back. Defer the forced reconnect until they are — one waiter
+		// for however many wakes land in the meantime — and drop it if the
+		// user disconnects first.
+		if !a.isUserPresent() {
+			if !a.wakeWaiting.CompareAndSwap(false, true) {
+				return
+			}
+			defer a.wakeWaiting.Store(false)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				for ctx.Err() == nil {
+					if !a.wantConnected.Load() {
+						cancel()
+						return
+					}
+					time.Sleep(time.Second)
+				}
+			}()
+			if a.waitForUser(ctx, "before the wake reconnect") != nil {
+				return
+			}
+		}
 		if since := time.Since(a.lastWakeReconnectAt); !a.lastWakeReconnectAt.IsZero() && since < wakeReconnectCooldown {
 			log.Printf("openfortitray: woke %v after the last forced reconnect (Power Nap?); leaving the session alone", since.Round(time.Second))
 			return
@@ -680,6 +715,9 @@ func (a *app) authenticate(ctx context.Context) (string, error) {
 		}
 	}
 
+	if err := a.waitForUser(ctx, "before opening the sign-in page"); err != nil {
+		return "", err
+	}
 	cookie, err := a.samlAuth(ctx, prof)
 	if err != nil {
 		return "", err
@@ -692,6 +730,48 @@ func (a *app) authenticate(ctx context.Context) (string, error) {
 		}
 	}
 	return cookie, nil
+}
+
+// defaultPresencePoll is how often waitForUser re-checks userPresent.
+const defaultPresencePoll = 3 * time.Second
+
+// isUserPresent reports whether someone is at the machine; a nil userPresent
+// (platforms with no detection) always counts as present.
+func (a *app) isUserPresent() bool {
+	return a.userPresent == nil || a.userPresent()
+}
+
+// waitForUser blocks until someone is actually at the machine (display awake,
+// screen unlocked) or ctx is done. It gates everything that needs a human —
+// the interactive SAML browser flow and wake-forced reconnects — because a Mac
+// on AC power keeps "waking" all night (Power Nap dark wakes every ~2 min, with
+// the display off and the screen locked), the gateway drops the session during
+// each sleep, and every re-mint used to open a browser tab. With the browser's
+// IdP session still valid those tabs even complete on their own, so nothing
+// failed or gave up — diagnosed live: 183 SAML tabs in one night. Waiting here
+// means at most ONE tab, opened when the user is back in front of the screen.
+func (a *app) waitForUser(ctx context.Context, why string) error {
+	if a.isUserPresent() {
+		return nil
+	}
+	log.Printf("openfortitray: nobody at the machine (display asleep or screen locked); waiting for the user %s", why)
+	poll := a.presencePoll
+	if poll <= 0 {
+		poll = defaultPresencePoll
+	}
+	t := time.NewTicker(poll)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			if a.isUserPresent() {
+				log.Print("openfortitray: user is back")
+				return nil
+			}
+		}
+	}
 }
 
 // defaultSAMLAuth is the production SAML browser flow, unchanged from the inline
@@ -1665,6 +1745,8 @@ func main() {
 		cookieSet:    credstore.Set,
 		cookieDelete: credstore.Delete,
 		samlAuth:     defaultSAMLAuth,
+		userPresent:  userPresentFunc(),
+		presencePoll: defaultPresencePoll,
 
 		cookieRetryInterval: cookieRetryInterval,
 		cookieRetryWindow:   cookieRetryWindow,

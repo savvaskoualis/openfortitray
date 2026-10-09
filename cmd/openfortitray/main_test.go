@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1218,5 +1219,127 @@ func TestShowSettingsShowStatusHideWindowTrackVisibility(t *testing.T) {
 	a.ShowSettings()
 	if !a.windowVisibleSnapshot() {
 		t.Error("ShowSettings must mark the window visible")
+	}
+}
+
+// presenceFlag is a togglable userPresent seam for the overnight-tab tests.
+type presenceFlag struct{ v atomic.Bool }
+
+func (p *presenceFlag) get() bool { return p.v.Load() }
+
+// The overnight-tab case: with nobody at the machine (display asleep or screen
+// locked — e.g. a Power Nap dark wake), the SAML browser flow must NOT run.
+// Diagnosed live: 183 SAML tabs in one night, each one auto-completing against
+// the browser's still-valid IdP session, because every Power Nap wake found the
+// gateway session dead and re-minted through the browser. authenticate must wait
+// until the user is back and only then open ONE tab.
+func TestAuthenticateWaitsForUserBeforeSAML(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, _, saml := newCookieTestApp(prof)
+	var present presenceFlag
+	a.userPresent = present.get
+	a.presencePoll = time.Millisecond
+
+	type res struct {
+		cookie string
+		err    error
+	}
+	done := make(chan res, 1)
+	go func() {
+		a.storedCookieTried.Store(true) // stored cookie already tried and rejected
+		c, err := a.authenticate(context.Background())
+		done <- res{c, err}
+	}()
+
+	select {
+	case r := <-done:
+		t.Fatalf("authenticate returned %+v while the user was away; must wait", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if *saml != 0 {
+		t.Fatalf("SAML ran %d times while the user was away; want 0", *saml)
+	}
+
+	present.v.Store(true)
+	select {
+	case r := <-done:
+		if r.err != nil || r.cookie != "FRESH-1" {
+			t.Errorf("authenticate = %+v, want FRESH-1 once the user is back", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("authenticate never resumed after the user came back")
+	}
+}
+
+// A Disconnect (or a newer Connect) while waiting for the user must abandon the
+// wait without ever opening the browser.
+func TestAuthenticateAbsentUserCancelled(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com"}
+	a, _, saml := newCookieTestApp(prof)
+	a.userPresent = func() bool { return false }
+	a.presencePoll = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := a.authenticate(ctx); err == nil {
+		t.Fatal("authenticate succeeded with nobody present and a cancelled ctx")
+	}
+	if *saml != 0 {
+		t.Errorf("SAML ran %d times; want 0", *saml)
+	}
+}
+
+// The silent stored-cookie path needs no user, so it must not wait for one.
+func TestAuthenticateStoredCookieIgnoresPresence(t *testing.T) {
+	prof := config.Profile{Name: "P", Gateway: "vpn.example.com", RememberSession: true}
+	a, mem, _ := newCookieTestApp(prof)
+	a.userPresent = func() bool { return false }
+	mem.Set(cookieKey("vpn.example.com"), "STORED-COOKIE")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := a.authenticate(ctx)
+	if err != nil || got != "STORED-COOKIE" {
+		t.Errorf("authenticate = %q, %v; want the stored cookie without waiting", got, err)
+	}
+}
+
+// A wake with nobody at the machine (Power Nap dark wake) must not force a
+// reconnect then — it is deferred until the user is back, and many such wakes
+// while away collapse into a single reconnect.
+func TestOnSystemWakeDefersReconnectUntilUserReturns(t *testing.T) {
+	a, authCalled := newTestApp(t, "vpn.example.com", t.TempDir())
+	var present presenceFlag
+	present.v.Store(true)
+	a.userPresent = present.get
+	a.presencePoll = time.Millisecond
+
+	a.Connect()
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor never started authenticating")
+	}
+
+	present.v.Store(false)
+	a.onSystemWake()
+	a.onSystemWake()
+	a.onSystemWake()
+	select {
+	case <-authCalled:
+		t.Fatal("a dark wake forced a reconnect while nobody was at the machine")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	present.v.Store(true)
+	select {
+	case <-authCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the deferred wake reconnect never ran after the user came back")
+	}
+	select {
+	case <-authCalled:
+		t.Error("several away-wakes produced more than one reconnect")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
