@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
+	"github.com/savvaskoualis/openfortitray/internal/credstore"
 	"github.com/savvaskoualis/openfortitray/internal/tunnel"
 	"github.com/savvaskoualis/openfortitray/internal/uistate"
 )
@@ -177,5 +178,41 @@ func TestRecentActivityConcurrentAddAndRead(t *testing.T) {
 	}
 	if len(got) > 50 {
 		t.Errorf("expected at most 50 entries (ring capacity), got %d", len(got))
+	}
+}
+
+// The IPsec PSK never goes through config.json: the Settings page hands it to
+// SaveIPsecPSK, which writes it to the credstore under the gateway's IPsec key
+// (the same key startTunnel reads), and HasIPsecPSK lets the page show that a
+// key is already saved without ever reading the secret back.
+func TestBridgeIPsecPSKRoundTrip(t *testing.T) {
+	mem := credstore.NewMemory()
+	b := &Bridge{a: &app{cookieGet: mem.Get, cookieSet: mem.Set}}
+
+	if b.HasIPsecPSK("vpn.example.com") {
+		t.Fatal("HasIPsecPSK = true before anything was saved")
+	}
+	if msg := b.SaveIPsecPSK("vpn.example.com", "s3cret"); msg != "" {
+		t.Fatalf("SaveIPsecPSK: %s", msg)
+	}
+	if !b.HasIPsecPSK("vpn.example.com") {
+		t.Error("HasIPsecPSK = false after saving")
+	}
+	if got, _ := mem.Get(config.IPsecPSKCredstoreKey("vpn.example.com")); got != "s3cret" {
+		t.Errorf("stored PSK = %q under the IPsec key, want s3cret", got)
+	}
+	if b.HasIPsecPSK("other.example.com") {
+		t.Error("a PSK saved for one gateway must not count for another")
+	}
+}
+
+func TestBridgeSaveIPsecPSKRejectsEmpty(t *testing.T) {
+	mem := credstore.NewMemory()
+	b := &Bridge{a: &app{cookieGet: mem.Get, cookieSet: mem.Set}}
+	if b.SaveIPsecPSK("", "s3cret") == "" {
+		t.Error("SaveIPsecPSK accepted an empty gateway")
+	}
+	if b.SaveIPsecPSK("vpn.example.com", "") == "" {
+		t.Error("SaveIPsecPSK accepted an empty key")
 	}
 }

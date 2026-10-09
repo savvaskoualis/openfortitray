@@ -73,18 +73,65 @@
 
   <div class="body">
     <div id="pane-connection" class="pane">
+      <label class="field">Protocol
+        <div id="backend-group" class="radio-group">
+          <button type="button" class="radio-chip" data-backend="ssl">SSL VPN</button>
+          <button type="button" class="radio-chip" data-backend="ipsec">IPsec (IKEv2)</button>
+        </div>
+      </label>
       <label class="field">Gateway host
         <input id="f-gateway" type="text">
       </label>
-      <label class="field">Port
+      <label class="field ssl-only">Port
         <input id="f-port" type="text" style="width: 90px;">
       </label>
+
+      <div class="ipsec-only">
+        <label class="field">Authentication
+          <div id="ipsec-auth-group" class="radio-group">
+            <button type="button" class="radio-chip" data-auth="psk">Pre-shared key</button>
+            <button type="button" class="radio-chip" data-auth="cert">Certificate</button>
+          </div>
+        </label>
+        <label id="ipsec-psk-field" class="field">Pre-shared key <span id="ipsec-psk-status" class="hint-inline"></span>
+          <input id="f-ipsec-psk" type="password" autocomplete="off">
+        </label>
+        <div id="ipsec-cert-fields">
+          <label class="field">Client certificate
+            <div class="input-with-btn">
+              <input id="f-ipsec-cert" type="text" placeholder="/path/to/client.crt">
+              <button type="button" class="btn-secondary btn-browse" data-target="f-ipsec-cert" data-title="Choose client certificate">Browse…</button>
+            </div>
+          </label>
+          <label class="field">Private key
+            <div class="input-with-btn">
+              <input id="f-ipsec-key" type="text" placeholder="/path/to/client.key">
+              <button type="button" class="btn-secondary btn-browse" data-target="f-ipsec-key" data-title="Choose private key">Browse…</button>
+            </div>
+          </label>
+        </div>
+      </div>
 
       <button id="disclosure-advanced" class="disclosure" aria-expanded="false">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
         Show advanced
       </button>
       <div id="advanced-body" class="disclosure-body" hidden>
+        <div class="ipsec-only">
+          <label class="field">Local identity <span class="hint-inline">(optional)</span>
+            <input id="f-ipsec-local-id" type="text" placeholder="user@example.com">
+          </label>
+          <label class="field">Remote identity <span class="hint-inline">(defaults to gateway host)</span>
+            <input id="f-ipsec-remote-id" type="text">
+          </label>
+          <label class="field">IKE proposal
+            <input id="f-ipsec-ike" type="text" placeholder="aes256-sha256-modp2048">
+          </label>
+          <label class="field">ESP proposal
+            <input id="f-ipsec-esp" type="text" placeholder="aes256-sha256-modp2048">
+          </label>
+        </div>
+        <div class="ssl-only">
         <label class="field">Server certificate
           <div id="cert-mode-group" class="radio-group">
             <button type="button" class="radio-chip" data-mode="warn">Warn</button>
@@ -98,6 +145,7 @@
         <label class="field">Split DNS <span class="hint-inline">(one domain per line, optional)</span>
           <textarea id="f-split-dns" placeholder="corp.internal&#10;vpn.local"></textarea>
         </label>
+        </div>
       </div>
     </div>
 
@@ -106,11 +154,11 @@
         <div class="toggle-text"><span>Auto-connect on launch</span><span class="hint">Connect automatically when the app starts</span></div>
         <button id="t-autostart" class="switch" role="switch"><span class="knob"></span></button>
       </div>
-      <div class="toggle-row">
+      <div class="toggle-row ssl-only">
         <div class="toggle-text"><span>DTLS</span><span class="hint">Faster tunnel when the network allows UDP</span></div>
         <button id="t-dtls" class="switch" role="switch"><span class="knob"></span></button>
       </div>
-      <div class="toggle-row">
+      <div class="toggle-row ssl-only">
         <div class="toggle-text"><span>Remember session</span><span class="hint">Skip SAML sign-in on reconnect until it expires</span></div>
         <button id="t-remember-session" class="switch" role="switch"><span class="knob"></span></button>
       </div>

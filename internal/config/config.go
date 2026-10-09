@@ -209,6 +209,16 @@ func NewProfile(name string) Profile {
 	return p
 }
 
+// Normalize fills every profile's zero-valued fields with their defaults, the
+// same pass Load applies. The settings UI calls it before saving so a field
+// left blank (an IPsec proposal, the remote identity) takes its default right
+// away rather than only after the next restart's Load.
+func (c *Config) Normalize() {
+	for i := range c.Profiles {
+		normalizeProfile(&c.Profiles[i])
+	}
+}
+
 // normalizeProfile fills fields whose zero value is invalid with their default,
 // so every profile returned by migrate is usable regardless of which keys the
 // on-disk file supplied. It does not rely on json.Unmarshal reusing a

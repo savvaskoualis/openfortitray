@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"log"
+	"strings"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
@@ -37,6 +38,7 @@ func (b *Bridge) GetConfig() config.Config {
 // autostart/persist failure) reported the same way so the frontend has one
 // error shape to handle.
 func (b *Bridge) SaveConfig(cfg config.Config) *settings.Issue {
+	cfg.Normalize()
 	if issue := settings.Validate(&cfg); issue != nil {
 		return issue
 	}
@@ -53,6 +55,50 @@ func (b *Bridge) SaveConfig(cfg config.Config) *settings.Issue {
 // from the ones Load already synthesises for a fresh install.
 func (b *Bridge) NewProfileTemplate(name string) config.Profile {
 	return config.NewProfile(name)
+}
+
+// HasIPsecPSK reports whether a pre-shared key is already stored for
+// gateway's IPsec profile, so Settings can say "saved" without the secret
+// ever crossing back to the frontend.
+func (b *Bridge) HasIPsecPSK(gateway string) bool {
+	gateway = strings.TrimSpace(gateway)
+	if gateway == "" {
+		return false
+	}
+	psk, err := b.a.cookieGet(config.IPsecPSKCredstoreKey(gateway))
+	return err == nil && psk != ""
+}
+
+// SaveIPsecPSK stores psk in the OS credential store under gateway's IPsec
+// key — the one startTunnel reads — and never in config.json. It returns ""
+// on success or a user-facing error message.
+func (b *Bridge) SaveIPsecPSK(gateway, psk string) string {
+	gateway = strings.TrimSpace(gateway)
+	if gateway == "" {
+		return "Enter the gateway host before saving a pre-shared key."
+	}
+	if psk == "" {
+		return "The pre-shared key is empty."
+	}
+	if err := b.a.cookieSet(config.IPsecPSKCredstoreKey(gateway), psk); err != nil {
+		return "Could not save the pre-shared key: " + err.Error()
+	}
+	return ""
+}
+
+// ChooseFile shows a native open-file dialog and returns the picked path, or
+// "" if cancelled. Used for the IPsec certificate and private key fields.
+func (b *Bridge) ChooseFile(title string) string {
+	ctx := b.a.ctxSnapshot()
+	if ctx == nil {
+		return ""
+	}
+	path, err := wailsruntime.OpenFileDialog(ctx, wailsruntime.OpenDialogOptions{Title: title})
+	if err != nil {
+		log.Printf("settings: file dialog: %v", err)
+		return ""
+	}
+	return path
 }
 
 func (b *Bridge) Connect()    { b.a.Connect() }

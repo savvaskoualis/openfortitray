@@ -7,6 +7,8 @@ OFT.settingsState = {
   dtls: false,
   rememberSession: false,
   certMode: "warn",
+  backend: "ssl",
+  ipsecAuth: "psk",
 };
 
 OFT.activeProfile = function () {
@@ -82,6 +84,45 @@ OFT.setCertMode = function (mode) {
   document.getElementById("cert-pin-field").hidden = mode !== "pin";
 };
 
+// setBackend switches the page between SSL VPN and IPsec fields. The
+// SSL-only/IPsec-only sections are shown/hidden by CSS off
+// #page-settings[data-backend], so nothing here touches them one by one.
+OFT.setBackend = function (backend) {
+  OFT.settingsState.backend = backend;
+  document.getElementById("page-settings").dataset.backend = backend;
+  document.querySelectorAll("#backend-group .radio-chip").forEach((chip) => {
+    chip.classList.toggle("active", chip.dataset.backend === backend);
+  });
+};
+
+OFT.setIPsecAuth = function (auth) {
+  OFT.settingsState.ipsecAuth = auth;
+  document.querySelectorAll("#ipsec-auth-group .radio-chip").forEach((chip) => {
+    chip.classList.toggle("active", chip.dataset.auth === auth);
+  });
+  document.getElementById("ipsec-psk-field").hidden = auth !== "psk";
+  document.getElementById("ipsec-cert-fields").hidden = auth !== "cert";
+};
+
+// refreshPSKStatus asks the backend whether a pre-shared key is already
+// stored for the gateway currently typed in. The secret itself never comes
+// back to the page — the field stays empty and only gets sent on Save when
+// the user types a new one.
+OFT.refreshPSKStatus = function () {
+  const gw = document.getElementById("f-gateway").value.trim();
+  const status = document.getElementById("ipsec-psk-status");
+  const input = document.getElementById("f-ipsec-psk");
+  if (!gw) {
+    status.textContent = "";
+    input.placeholder = "";
+    return;
+  }
+  OFT.call("HasIPsecPSK", gw).then((has) => {
+    status.textContent = has ? "(saved — leave empty to keep)" : "(not set)";
+    input.placeholder = has ? "••••••••" : "";
+  });
+};
+
 OFT.setAdvancedOpen = function (open) {
   document.getElementById("disclosure-advanced").classList.toggle("open", open);
   document.getElementById("disclosure-advanced").setAttribute("aria-expanded", String(open));
@@ -109,6 +150,21 @@ OFT.renderActiveProfile = function () {
   document.getElementById("f-cert-pin").value = (p.server_cert && p.server_cert.pin) || "";
 
   document.getElementById("f-split-dns").value = (p.split_dns || []).join("\n");
+
+  const ic = p.ipsec || {};
+  OFT.setBackend(p.backend === "ipsec" ? "ipsec" : "ssl");
+  OFT.setIPsecAuth(ic.auth_method === "cert" ? "cert" : "psk");
+  document.getElementById("f-ipsec-psk").value = "";
+  document.getElementById("f-ipsec-cert").value = ic.cert_path || "";
+  document.getElementById("f-ipsec-key").value = ic.key_path || "";
+  document.getElementById("f-ipsec-local-id").value = ic.local_id || "";
+  // Load/Save default remote_id to the gateway host; show that default as
+  // blank so editing the gateway later re-defaults it instead of leaving the
+  // old host behind as the remote identity.
+  document.getElementById("f-ipsec-remote-id").value = ic.remote_id && ic.remote_id !== p.gateway ? ic.remote_id : "";
+  document.getElementById("f-ipsec-ike").value = ic.ike_proposal || "";
+  document.getElementById("f-ipsec-esp").value = ic.esp_proposal || "";
+  OFT.refreshPSKStatus();
 };
 
 OFT.loadSettings = function () {
@@ -175,6 +231,22 @@ window.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("#cert-mode-group .radio-chip").forEach((chip) => {
     chip.addEventListener("click", () => OFT.setCertMode(chip.dataset.mode));
   });
+  document.querySelectorAll("#backend-group .radio-chip").forEach((chip) => {
+    chip.addEventListener("click", () => OFT.setBackend(chip.dataset.backend));
+  });
+  document.querySelectorAll("#ipsec-auth-group .radio-chip").forEach((chip) => {
+    chip.addEventListener("click", () => OFT.setIPsecAuth(chip.dataset.auth));
+  });
+  document.querySelectorAll(".btn-browse").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      OFT.call("ChooseFile", btn.dataset.title).then((path) => {
+        if (path) document.getElementById(btn.dataset.target).value = path;
+      });
+    });
+  });
+  // The PSK is keyed by gateway, so the "saved" hint follows the host field.
+  document.getElementById("f-gateway").addEventListener("change", OFT.refreshPSKStatus);
 
   document.getElementById("profile-pill").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -192,7 +264,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btn-cancel").addEventListener("click", () => OFT.showPage("page-main"));
 
-  document.getElementById("btn-save").addEventListener("click", () => {
+  document.getElementById("btn-save").addEventListener("click", async () => {
     const cfg = OFT.settingsState.cfg;
     const p = OFT.activeProfile();
     p.gateway = document.getElementById("f-gateway").value;
@@ -207,8 +279,30 @@ window.addEventListener("DOMContentLoaded", () => {
       .value.split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
+    p.backend = OFT.settingsState.backend;
+    p.ipsec = Object.assign({}, p.ipsec, {
+      auth_method: OFT.settingsState.ipsecAuth,
+      cert_path: document.getElementById("f-ipsec-cert").value.trim(),
+      key_path: document.getElementById("f-ipsec-key").value.trim(),
+      local_id: document.getElementById("f-ipsec-local-id").value.trim(),
+      remote_id: document.getElementById("f-ipsec-remote-id").value.trim(),
+      ike_proposal: document.getElementById("f-ipsec-ike").value.trim(),
+      esp_proposal: document.getElementById("f-ipsec-esp").value.trim(),
+    });
     cfg.autostart = OFT.settingsState.autostart;
     cfg.activeProfile = p.name;
+
+    // The PSK goes to the OS keychain, never config.json. Store it first so
+    // the saved profile is immediately connectable.
+    const psk = document.getElementById("f-ipsec-psk").value;
+    if (p.backend === "ipsec" && p.ipsec.auth_method === "psk" && psk) {
+      const msg = await OFT.call("SaveIPsecPSK", p.gateway.trim(), psk);
+      if (msg) {
+        OFT.showSettingsError(msg);
+        return;
+      }
+      document.getElementById("f-ipsec-psk").value = "";
+    }
 
     OFT.call("SaveConfig", cfg).then((issue) => {
       if (issue) {

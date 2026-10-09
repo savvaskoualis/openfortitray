@@ -197,3 +197,11 @@ input { font-family: inherit; }
   font-family: ui-monospace, Menlo, monospace; resize: none; height: 56px; width: 100%;
 }
 .field .hint-inline { font-weight: 400; text-transform: none; letter-spacing: normal; }
+
+/* IPsec settings: SSL-only / IPsec-only sections toggled by #page-settings[data-backend]. */
+#page-settings[data-backend="ipsec"] .ssl-only { display: none; }
+#page-settings:not([data-backend="ipsec"]) .ipsec-only { display: none; }
+div.ipsec-only, .disclosure-body > div.ssl-only, #ipsec-cert-fields { display: flex; flex-direction: column; gap: 14px; }
+.input-with-btn { display: flex; gap: 6px; align-items: center; }
+.input-with-btn input { flex: 1; min-width: 0; }
+.btn-browse { flex: none; padding: 0 10px; font-size: 12px; }
