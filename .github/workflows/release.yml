@@ -437,3 +437,26 @@ jobs:
             dist/openfortitray-linux-amd64 \
             dist/openfortitray-windows-amd64.exe \
             dist/SHA256SUMS
+
+      - name: Bump the Homebrew cask now
+        # The Mac app updates through `brew upgrade --cask`, which can only
+        # install what the tap's cask points at — so until the cask is bumped,
+        # a published release is not installable. The tap's own bump workflow
+        # runs on a */15 cron, but GitHub throttles scheduled runs to hours in
+        # practice, so poke it directly (it listens for this event type).
+        # TAP_DISPATCH_TOKEN: a fine-grained PAT on savvaskoualis/homebrew-tap
+        # with Contents: read & write. Missing secret = warn, never fail the
+        # release; the cron still catches up eventually.
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::TAP_DISPATCH_TOKEN not set; the cask will only bump on the tap's cron"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TAP_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/savvaskoualis/homebrew-tap/dispatches \
+            -d '{"event_type":"openfortitray-released"}'
+          echo "Dispatched openfortitray-released to the tap"

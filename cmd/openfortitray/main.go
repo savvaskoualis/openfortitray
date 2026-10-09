@@ -230,6 +230,9 @@ type app struct {
 	// update and kicking off a fresh check.
 	updateMu  sync.Mutex
 	updateRel *update.Release
+	// caskRechecking is set while recheckWhileCaskLags is running, so repeated
+	// checks (manual + background) never stack up parallel recheck loops.
+	caskRechecking atomic.Bool
 	// lastPromptedTag is the release tag the update dialog was last shown for, so
 	// the 6-hourly re-check surfaces the popup only ONCE per distinct version (the
 	// badge + menu item update every check; the dialog does not nag). Guarded by
@@ -1152,6 +1155,43 @@ func (a *app) startUpdateChecker(ctx context.Context) {
 // (cheap, idempotent); the dialog shows once per new tag so the 6-hourly re-check
 // does not nag. All UI runs on the UI goroutine and honours the quitting gate.
 func (a *app) checkForUpdate(ctx context.Context, manual bool) {
+	if a.checkForUpdateOnce(ctx, manual) {
+		go a.recheckWhileCaskLags(ctx)
+	}
+}
+
+// caskRecheckInterval/caskRecheckAttempts bound recheckWhileCaskLags: every
+// 2 minutes for up to 2 hours.
+var (
+	caskRecheckInterval = 2 * time.Minute
+	caskRecheckAttempts = 60
+)
+
+// recheckWhileCaskLags re-runs the check on a short interval while a release
+// is published but the Homebrew cask has not caught up, so the update is
+// offered within minutes of the cask bump instead of at the next 6-hourly
+// check. One loop at a time (caskRechecking); it stops as soon as the cask is
+// ready, a check fails or finds nothing, or ctx is done.
+func (a *app) recheckWhileCaskLags(ctx context.Context) {
+	if !a.caskRechecking.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.caskRechecking.Store(false)
+	for i := 0; i < caskRecheckAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(caskRecheckInterval):
+		}
+		if !a.checkForUpdateOnce(ctx, false) {
+			return
+		}
+	}
+}
+
+// checkForUpdateOnce is one check; it reports true only when a newer release
+// exists but the Homebrew cask has not caught up to it yet.
+func (a *app) checkForUpdateOnce(ctx context.Context, manual bool) (caskPending bool) {
 	rel, err := updateChecker().Available(ctx, version)
 	if err != nil {
 		log.Printf("update: check failed: %v", err)
@@ -1161,14 +1201,14 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 		if manual {
 			a.reportCheckResult("Could not check for updates", err.Error())
 		}
-		return
+		return false
 	}
 	if rel == nil {
 		if manual {
 			a.reportCheckResult("You are up to date",
 				"OpenFortiTray "+version+" is the latest version.")
 		}
-		return
+		return false
 	}
 	// On the Homebrew path the check and the apply read different sources: this
 	// release exists on GitHub, but `brew upgrade --cask` can only install what the
@@ -1181,21 +1221,20 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 	if update.InstallMethod() == update.MethodHomebrew {
 		cc := update.CaskChecker{HTTPClient: &http.Client{Timeout: 30 * time.Second}}
 		if !update.CaskHasTag(ctx, cc, rel.Tag) {
-			log.Printf("update: %s is published but the Homebrew cask is not bumped yet; waiting", rel.Tag)
+			log.Printf("update: %s is published but the Homebrew cask is not bumped yet; rechecking every %v", rel.Tag, caskRecheckInterval)
 			if manual {
-				a.reportCheckResult("Update not ready yet",
-					"OpenFortiTray "+rel.Tag+" has been released, but the Homebrew cask has not "+
-						"caught up. It usually does within the hour, and the app will offer the "+
-						"update then.")
+				a.reportCheckResult("Update almost ready",
+					"OpenFortiTray "+rel.Tag+" has just been released and Homebrew is still "+
+						"picking it up. The app will offer the update automatically in a few minutes.")
 			}
-			return
+			return true
 		}
 	}
 	a.updateMu.Lock()
 	a.updateRel = rel
 	a.updateMu.Unlock()
 	if a.quitting.Load() {
-		return
+		return false
 	}
 	prompt := manual || a.shouldPromptUpdate(rel.Tag)
 	if a.tray != nil {
@@ -1204,6 +1243,7 @@ func (a *app) checkForUpdate(ctx context.Context, manual bool) {
 	if prompt {
 		a.promptUpdate(rel)
 	}
+	return false
 }
 
 // shouldPromptUpdate reports whether the update dialog should be shown for tag,
