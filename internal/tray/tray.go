@@ -177,8 +177,8 @@ func Setup(app App, onIconClick func()) (*Controller, error) {
 		c.badgedIcons = make(map[uistate.Kind][]byte, 4)
 		for _, k := range []uistate.Kind{uistate.KindIdle, uistate.KindBusy, uistate.KindOK, uistate.KindBad} {
 			base := iconFor(k)
-			c.icons[k] = padOrOriginal(base)
-			c.badgedIcons[k] = padOrOriginal(badgedPNG(base))
+			c.icons[k] = platformIcon(padOrOriginal(base))
+			c.badgedIcons[k] = platformIcon(padOrOriginal(badgedPNG(base)))
 		}
 
 		systray.SetIcon(c.iconForCurrent())
