@@ -217,29 +217,73 @@ func TestBridgeSaveIPsecPSKRejectsEmpty(t *testing.T) {
 	}
 }
 
-// Windows: a tray click shows the window and the taskbar/flyout takes focus
-// back a moment later. That blur must not hide the window; a blur after the
-// grace period (the user clicking away) must.
-func TestShouldHideOnBlurGrace(t *testing.T) {
-	orig := blurHideGrace
-	blurHideGrace = 700 * time.Millisecond
-	t.Cleanup(func() { blurHideGrace = orig })
+// fakeForeground scripts the foreground window watchFocusLoss sees.
+type fakeForeground struct {
+	mu        sync.Mutex
+	hwnd      uintptr
+	elsewhere bool
+}
 
-	a := &app{}
-	now := time.Now()
-	if a.shouldHideOnBlur(now) {
-		t.Error("hid a window that is not visible")
+func (f *fakeForeground) set(hwnd uintptr, elsewhere bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hwnd, f.elsewhere = hwnd, elsewhere
+}
+
+func (f *fakeForeground) get() (uintptr, bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hwnd, f.elsewhere, true
+}
+
+func waitHidden(t *testing.T, a *app, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !a.windowVisibleSnapshot() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	t.Fatalf("window hidden = %v, want %v", !a.windowVisibleSnapshot(), want)
+}
+
+// Windows: a tray click shows the window and the taskbar/flyout takes the
+// foreground back a moment later. That must not hide the window; switching
+// to another app afterwards must.
+func TestWatchFocusLossIgnoresTaskbar(t *testing.T) {
+	fg := &fakeForeground{}
+	fg.set(1, true) // the app the user was in before clicking the tray
+	a := &app{foreground: fg.get, focusPoll: time.Millisecond}
+	if a.hidesOnBlur() {
+		t.Fatal("frontend blur still hides the window while the watcher is active")
+	}
+
 	a.setWindowVisible(true)
-	shown := a.windowShownAt
-	if a.shouldHideOnBlur(shown.Add(100 * time.Millisecond)) {
-		t.Error("blur 100ms after show hid the window; that is the OS focus bounce")
-	}
-	if !a.shouldHideOnBlur(shown.Add(blurHideGrace + time.Millisecond)) {
-		t.Error("blur after the grace period did not hide the window")
-	}
-	a.setWindowVisible(true) // already visible: must not restart the grace period
-	if a.windowShownAt != shown {
-		t.Error("re-marking a visible window restarted the grace period")
+	fg.set(2, false) // our window
+	time.Sleep(20 * time.Millisecond)
+	fg.set(3, false) // taskbar / hidden-icons flyout reclaims the foreground
+	time.Sleep(50 * time.Millisecond)
+	waitHidden(t, a, false)
+
+	fg.set(4, true) // user clicks another app
+	waitHidden(t, a, true)
+}
+
+// A foreground that never changes — e.g. the window could not take focus —
+// leaves the window open rather than hiding it immediately.
+func TestWatchFocusLossNeedsAChange(t *testing.T) {
+	fg := &fakeForeground{}
+	fg.set(1, true)
+	a := &app{foreground: fg.get, focusPoll: time.Millisecond}
+	a.setWindowVisible(true)
+	time.Sleep(50 * time.Millisecond)
+	waitHidden(t, a, false)
+	a.setWindowVisible(false)
+}
+
+func TestHidesOnBlurWithoutWatcher(t *testing.T) {
+	if !(&app{}).hidesOnBlur() {
+		t.Error("without a foreground watcher the frontend blur must hide the window")
 	}
 }

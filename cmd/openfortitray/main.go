@@ -161,9 +161,14 @@ type app struct {
 	// it in sync — so a window shown via any of those paths is still
 	// considered "visible" for the next tray-icon click's toggle decision.
 	windowVisible bool
-	// windowShownAt is when windowVisible last went false→true; see
-	// shouldHideOnBlur. Guarded by mu like windowVisible.
-	windowShownAt time.Time
+	// foreground reports the OS foreground window and whether it belongs to
+	// something other than this app or the taskbar (tray.ForegroundWindow).
+	// Non-nil only on Windows, where it replaces the frontend's blur-to-hide:
+	// see watchFocusLoss. focusPoll is its polling interval; focusWatching
+	// keeps a single watcher running.
+	foreground    func() (hwnd uintptr, elsewhere bool, ok bool)
+	focusPoll     time.Duration
+	focusWatching atomic.Bool
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -318,35 +323,59 @@ func (a *app) ctxSnapshot() context.Context {
 // setWindowVisible records whether the Wails window is currently on screen.
 // Called from ShowSettings/ShowStatus (true), HideWindow (false) and
 // onTrayClick (both directions) — every path that shows or hides the window
-// — so onTrayClick's toggle decision is never stale.
+// — so onTrayClick's toggle decision is never stale. Showing the window also
+// starts watchFocusLoss where the platform uses it.
 func (a *app) setWindowVisible(v bool) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if v && !a.windowVisible {
-		a.windowShownAt = time.Now()
-	}
 	a.windowVisible = v
+	a.mu.Unlock()
+	if v && a.foreground != nil {
+		go a.watchFocusLoss()
+	}
 }
 
-// blurHideGrace is how long after the window is shown a blur is treated as
-// the OS taking focus back rather than the user clicking away. On Windows a
-// tray click — especially from the hidden-icons flyout — shows the window,
-// then the taskbar/flyout reclaims the foreground a moment later as it
-// closes; hiding on that blur made the window flash open and shut. Zero
-// elsewhere: macOS does not bounce focus, and keeps hide-on-blur instant.
-var blurHideGrace = func() time.Duration {
-	if runtime.GOOS == "windows" {
-		return 700 * time.Millisecond
-	}
-	return 0
-}()
+// hidesOnBlur reports whether the frontend's window-blur event should hide
+// the window. On Windows it must not: a tray click shows the window, then the
+// taskbar or hidden-icons flyout takes the foreground back as it closes, so a
+// blur-to-hide made the window flash open and shut. watchFocusLoss hides it
+// there instead.
+func (a *app) hidesOnBlur() bool { return a.foreground == nil }
 
-// shouldHideOnBlur reports whether a window blur at now should hide the
-// window: only when it is visible and has been for at least blurHideGrace.
-func (a *app) shouldHideOnBlur(now time.Time) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.windowVisible && now.Sub(a.windowShownAt) >= blurHideGrace
+// watchFocusLoss hides the window once the user switches to another app. It
+// polls the foreground window while the window is visible and hides it the
+// first time the foreground changes to a window that is neither this app's
+// nor the taskbar/tray flyout's. Switches to the taskbar are ignored, which is
+// what keeps a tray click from closing the window it just opened.
+func (a *app) watchFocusLoss() {
+	if !a.focusWatching.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.focusWatching.Store(false)
+	last, _, _ := a.foreground()
+	t := time.NewTicker(a.focusPoll)
+	defer t.Stop()
+	for range t.C {
+		if !a.windowVisibleSnapshot() {
+			return
+		}
+		hwnd, elsewhere, ok := a.foreground()
+		if !ok || hwnd == last {
+			continue
+		}
+		last = hwnd
+		if elsewhere {
+			a.hideWindow()
+			return
+		}
+	}
+}
+
+// hideWindow hides the Wails window and records it as hidden.
+func (a *app) hideWindow() {
+	if ctx := a.ctxSnapshot(); ctx != nil {
+		wailsruntime.WindowHide(ctx)
+	}
+	a.setWindowVisible(false)
 }
 
 // windowVisibleSnapshot reports whether the window is currently visible, per
@@ -367,10 +396,7 @@ func (a *app) windowVisibleSnapshot() bool {
 // appeared to do nothing.
 func (a *app) onTrayClick() {
 	if a.windowVisibleSnapshot() {
-		if ctx := a.ctxSnapshot(); ctx != nil {
-			wailsruntime.WindowHide(ctx)
-		}
-		a.setWindowVisible(false)
+		a.hideWindow()
 		return
 	}
 	a.positionWindow()
@@ -1814,6 +1840,8 @@ func main() {
 		samlAuth:     defaultSAMLAuth,
 		userPresent:  userPresentFunc(),
 		presencePoll: defaultPresencePoll,
+		foreground:   foregroundFunc(),
+		focusPoll:    150 * time.Millisecond,
 
 		cookieRetryInterval: cookieRetryInterval,
 		cookieRetryWindow:   cookieRetryWindow,
