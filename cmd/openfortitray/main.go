@@ -161,6 +161,9 @@ type app struct {
 	// it in sync — so a window shown via any of those paths is still
 	// considered "visible" for the next tray-icon click's toggle decision.
 	windowVisible bool
+	// windowShownAt is when windowVisible last went false→true; see
+	// shouldHideOnBlur. Guarded by mu like windowVisible.
+	windowShownAt time.Time
 
 	// storedCookieTried gates the cache-first auth path to ONE stored-cookie
 	// offer per Connect. startTunnel resets it to false before every
@@ -319,7 +322,31 @@ func (a *app) ctxSnapshot() context.Context {
 func (a *app) setWindowVisible(v bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if v && !a.windowVisible {
+		a.windowShownAt = time.Now()
+	}
 	a.windowVisible = v
+}
+
+// blurHideGrace is how long after the window is shown a blur is treated as
+// the OS taking focus back rather than the user clicking away. On Windows a
+// tray click — especially from the hidden-icons flyout — shows the window,
+// then the taskbar/flyout reclaims the foreground a moment later as it
+// closes; hiding on that blur made the window flash open and shut. Zero
+// elsewhere: macOS does not bounce focus, and keeps hide-on-blur instant.
+var blurHideGrace = func() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 700 * time.Millisecond
+	}
+	return 0
+}()
+
+// shouldHideOnBlur reports whether a window blur at now should hide the
+// window: only when it is visible and has been for at least blurHideGrace.
+func (a *app) shouldHideOnBlur(now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.windowVisible && now.Sub(a.windowShownAt) >= blurHideGrace
 }
 
 // windowVisibleSnapshot reports whether the window is currently visible, per
