@@ -5,7 +5,6 @@ import (
 	"embed"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/savvaskoualis/openfortitray/internal/config"
 	"github.com/savvaskoualis/openfortitray/internal/settings"
@@ -112,27 +111,14 @@ func (b *Bridge) Disconnect() { b.a.Disconnect() }
 // reason to reach it from the least-trusted boundary (arbitrary frontend JS)
 // when nothing legitimate needs to.
 
-func (b *Bridge) HideWindow() {
-	if ctx := b.a.ctxSnapshot(); ctx != nil {
-		wailsruntime.WindowHide(ctx)
-	}
-	b.a.setWindowVisible(false)
-}
+func (b *Bridge) HideWindow() { b.a.hideWindow() }
 
 // HideOnBlur is the frontend's window-blur hook: it hides the window like
-// HideWindow, except during blurHideGrace right after a show, when the blur is
-// the OS reclaiming focus (Windows tray click) — then it takes focus back
-// instead, so the window stays open and a later click-away still hides it.
+// HideWindow, except on Windows, where the blur is unreliable and
+// app.watchFocusLoss decides instead (see app.hidesOnBlur).
 func (b *Bridge) HideOnBlur() {
-	if b.a.shouldHideOnBlur(time.Now()) {
+	if b.a.hidesOnBlur() {
 		b.HideWindow()
-		return
-	}
-	if !b.a.windowVisibleSnapshot() {
-		return
-	}
-	if ctx := b.a.ctxSnapshot(); ctx != nil {
-		wailsruntime.WindowShow(ctx)
 	}
 }
 
