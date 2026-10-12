@@ -216,3 +216,30 @@ func TestBridgeSaveIPsecPSKRejectsEmpty(t *testing.T) {
 		t.Error("SaveIPsecPSK accepted an empty key")
 	}
 }
+
+// Windows: a tray click shows the window and the taskbar/flyout takes focus
+// back a moment later. That blur must not hide the window; a blur after the
+// grace period (the user clicking away) must.
+func TestShouldHideOnBlurGrace(t *testing.T) {
+	orig := blurHideGrace
+	blurHideGrace = 700 * time.Millisecond
+	t.Cleanup(func() { blurHideGrace = orig })
+
+	a := &app{}
+	now := time.Now()
+	if a.shouldHideOnBlur(now) {
+		t.Error("hid a window that is not visible")
+	}
+	a.setWindowVisible(true)
+	shown := a.windowShownAt
+	if a.shouldHideOnBlur(shown.Add(100 * time.Millisecond)) {
+		t.Error("blur 100ms after show hid the window; that is the OS focus bounce")
+	}
+	if !a.shouldHideOnBlur(shown.Add(blurHideGrace + time.Millisecond)) {
+		t.Error("blur after the grace period did not hide the window")
+	}
+	a.setWindowVisible(true) // already visible: must not restart the grace period
+	if a.windowShownAt != shown {
+		t.Error("re-marking a visible window restarted the grace period")
+	}
+}

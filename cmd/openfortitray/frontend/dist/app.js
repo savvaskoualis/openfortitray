@@ -82,7 +82,9 @@ window.addEventListener("DOMContentLoaded", () => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
   });
 
-  window.addEventListener("blur", () => OFT.call("HideWindow"));
+  // HideOnBlur (not HideWindow): it ignores the focus bounce Windows does
+  // right after a tray click, which otherwise closed the window instantly.
+  window.addEventListener("blur", () => OFT.call("HideOnBlur"));
 
   if (window.runtime && window.runtime.EventsOn) {
     window.runtime.EventsOn("nav:settings", () => {
